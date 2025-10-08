@@ -122,7 +122,7 @@ static bool verify_vote(master_nodes::quorum_vote_t const &vote,
                         master_nodes::quorum const &quorum)
 {
   bool result = master_nodes::verify_vote_age(vote, latest_height,vvc, cryptonote::hf::hf17_POS);
-  result &= master_nodes::verify_vote_signature(cryptonote::hf::hf20_bulletproof_plusplus, vote, vvc, quorum);
+  result &= master_nodes::verify_vote_signature(cryptonote::hf::hf20_bulletproof_plus, vote, vvc, quorum);
   return result;
 }
 

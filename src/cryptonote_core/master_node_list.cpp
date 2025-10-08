@@ -394,6 +394,7 @@ namespace master_nodes
           case rct::RCTType::Bulletproof:
           case rct::RCTType::Bulletproof2:
           case rct::RCTType::CLSAG:
+          case rct::RCTType::BulletproofPlus:
               money_transferred = rct::decodeRctSimple(tx.rct_signatures, rct::sk2rct(scalar1), i, mask, hwdev);
               break;
           case rct::RCTType::Full:

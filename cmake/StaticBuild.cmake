@@ -5,12 +5,12 @@
 
 set(LOCAL_MIRROR "" CACHE STRING "local mirror path/URL for lib downloads")
 
-set(BOOST_VERSION 1.87.0 CACHE STRING "boost version")
-set(BOOST_MIRROR ${LOCAL_MIRROR} https://boostorg.jfrog.io/artifactory/main/release/${BOOST_VERSION}/source
+set(BOOST_VERSION 1.83.0 CACHE STRING "boost version")
+set(BOOST_MIRROR ${LOCAL_MIRROR} https://archives.boost.io/release/${BOOST_VERSION}/source
     CACHE STRING "boost download mirror(s)")
 string(REPLACE "." "_" BOOST_VERSION_ ${BOOST_VERSION})
 set(BOOST_SOURCE boost_${BOOST_VERSION_}.tar.bz2)
-set(BOOST_HASH SHA256=af57be25cb4c4f4b413ed692fe378affb4352ea50fbe294a11ef548f4d527d89
+set(BOOST_HASH SHA256=6478edfe2f3305127cffe8caf73ea0176c53769f4bf1585be237eb30798c3b8e
     CACHE STRING "boost source hash")
 
 set(NCURSES_VERSION 6.2 CACHE STRING "ncurses version")
@@ -79,11 +79,11 @@ set(ZMQ_SOURCE zeromq-${ZMQ_VERSION}.tar.gz)
 set(ZMQ_HASH SHA512=e198ef9f82d392754caadd547537666d4fba0afd7d027749b3adae450516bcf284d241d4616cad3cb4ad9af8c10373d456de92dc6d115b037941659f141e7c0e
     CACHE STRING "libzmq source hash")
 
-set(ZLIB_VERSION 1.2.11 CACHE STRING "zlib version")
-set(ZLIB_MIRROR ${LOCAL_MIRROR} https://zlib.net/fossils
+set(ZLIB_VERSION 1.3.1 CACHE STRING "zlib version")
+set(ZLIB_MIRROR ${LOCAL_MIRROR} https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}
     CACHE STRING "zlib mirror(s)")
-set(ZLIB_SOURCE zlib-${ZLIB_VERSION}.tar.gz)
-set(ZLIB_HASH SHA512=73fd3fff4adeccd4894084c15ddac89890cd10ef105dd5e1835e1e9bbb6a49ff229713bd197d203edfa17c2727700fce65a2a235f07568212d820dca88b528ae
+set(ZLIB_SOURCE zlib-${ZLIB_VERSION}.tar.xz)
+set(ZLIB_HASH SHA256=38ef96b8dfe510d42707d9c781877914792541133e1870841463bfa73f883e32
     CACHE STRING "zlib source hash")
 
 set(CURL_VERSION 7.76.1 CACHE STRING "curl version")
@@ -479,6 +479,11 @@ endif()
 build_external(sodium)
 add_static_target(sodium sodium_external libsodium.a)
 
+
+if(CMAKE_CROSSCOMPILING AND ARCH_TRIPLET MATCHES mingw)
+  set(zmq_patch PATCH_COMMAND patch -p1 -i ${PROJECT_SOURCE_DIR}/utils/build_scripts/libzmq-mingw-closesocket.patch)
+endif()
+
 set(zmq_cross_host "${cross_host}")
 if(IOS AND cross_host MATCHES "-ios$")
   # zmq doesn't like "-ios" for the host, so replace it with -darwin
@@ -587,7 +592,7 @@ endif()
 add_static_target(CURL::libcurl curl_external libcurl.a)
 set(libcurl_link_libs zlib)
 if(CMAKE_CROSSCOMPILING AND ARCH_TRIPLET MATCHES mingw)
-  list(APPEND libcurl_link_libs ws2_32;bcrypt)
+  list(APPEND libcurl_link_libs ws2_32)
 elseif(APPLE)
   list(APPEND libcurl_link_libs "-framework SystemConfiguration")
 endif()

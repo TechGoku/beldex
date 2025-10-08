@@ -150,7 +150,7 @@ get_ideal_block_version(network_type nettype, uint64_t height)
       result.first = it->version;
       result.second = it->mnode_revision;
     }
-    if (result.first < hf::hf20_bulletproof_plusplus)
+    if (result.first < hf::hf20_bulletproof_plus)
       result.second = static_cast<uint8_t>(it->version);
 
   }

@@ -477,7 +477,7 @@ bool beldex_core_block_reward_unpenalized_pre_POS::generate(std::vector<test_eve
 
 bool beldex_core_block_reward_unpenalized_post_POS::generate(std::vector<test_event_entry>& events)
 {
-  std::vector<cryptonote::hard_fork> hard_forks = beldex_generate_hard_fork_table(cryptonote::hf::hf20_bulletproof_plusplus, 150 /*Proof Of Stake Delay*/);
+  std::vector<cryptonote::hard_fork> hard_forks = beldex_generate_hard_fork_table(cryptonote::hf::hf20_bulletproof_plus, 150 /*Proof Of Stake Delay*/);
   beldex_chain_generator gen(events, hard_forks);
 
   const cryptonote::hf newest_hf = hard_forks.back().version;
@@ -2070,7 +2070,7 @@ bool beldex_name_system_update_mapping_after_expiry_fails::generate(std::vector<
   return true;
 }
 
-cryptonote::hf beldex_name_system_update_mapping::hf() { return cryptonote::hf::hf20_bulletproof_plusplus; }
+cryptonote::hf beldex_name_system_update_mapping::hf() { return cryptonote::hf::hf20_bulletproof_plus; }
 cryptonote::hf beldex_name_system_update_mapping_argon2::hf() { return cryptonote::hf::hf16; }
 bool beldex_name_system_update_mapping::generate(std::vector<test_event_entry> &events)
 {

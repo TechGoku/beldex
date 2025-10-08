@@ -1367,7 +1367,7 @@ public:
 
 void                                      fill_nonce_with_beldex_generator          (struct beldex_chain_generator const *generator, cryptonote::block& blk, const cryptonote::difficulty_type& diffic, uint64_t height);
 void                                      beldex_register_callback                  (std::vector<test_event_entry> &events, std::string const &callback_name, beldex_callback callback);
-std::vector<cryptonote::hard_fork> beldex_generate_hard_fork_table(cryptonote::hf max_hf_version = cryptonote::hf::hf20_bulletproof_plusplus, uint64_t pos_delay = 60);
+std::vector<cryptonote::hard_fork> beldex_generate_hard_fork_table(cryptonote::hf max_hf_version = cryptonote::hf::hf20_bulletproof_plus, uint64_t pos_delay = 60);
 
 struct beldex_blockchain_entry
 {

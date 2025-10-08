@@ -109,7 +109,7 @@ release-static:
 
 release-full-static:
 	mkdir -p $(builddir)/release-static
-	cd $(builddir)/release-static && cmake -DBUILD_STATIC_DEPS=ON -DCMAKE_BUILD_TYPE=Release $(topdir) && $(MAKE)
+	cd $(builddir)/release-static && cmake -DBUILD_STATIC_DEPS=ON -DUSE_LTO=OFF -DRANDOMX_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Release $(topdir) && $(MAKE)
 
 release-full-static-archive: release-full-static
 	cd $(builddir)/release-static && $(MAKE) strip_binaries && $(MAKE) create_archive

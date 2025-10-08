@@ -55,6 +55,7 @@ inline constexpr uint64_t MINED_MONEY_UNLOCK_WINDOW            = 60;
 inline constexpr uint64_t DEFAULT_TX_SPENDABLE_AGE_V17         = 2;
 inline constexpr uint64_t TX_OUTPUT_DECOYS                     = 9;
 inline constexpr size_t   TX_BULLETPROOF_MAX_OUTPUTS           = 16;
+inline constexpr size_t   TX_BULLETPROOF_PLUS_MAX_OUTPUTS      = 16;
 inline constexpr uint64_t PUBLIC_ADDRESS_TEXTBLOB_VER          = 0;
 
 inline constexpr uint64_t FINAL_SUBSIDY_PER_MINUTE             = 500000000; // 3 * pow(10, 7)
@@ -103,6 +104,8 @@ inline constexpr size_t HASH_OF_HASHES_STEP = 256;
 // Hash domain separators
 namespace hashkey {
   inline constexpr std::string_view BULLETPROOF_EXPONENT = "bulletproof"sv;
+  inline constexpr std::string_view BULLETPROOF_PLUS_EXPONENT  = "bulletproof_plus"sv;
+  inline constexpr std::string_view BULLETPROOF_PLUS_TRANSCRIPT = "bulletproof_plus_transcript"sv;
   inline constexpr std::string_view RINGDB = "ringdsb\0"sv;
   inline constexpr std::string_view SUBADDRESS = "SubAddr\0"sv;
   inline constexpr unsigned char ENCRYPTED_PAYMENT_ID = 0x8d;
@@ -200,7 +203,7 @@ enum class hf : uint8_t
     hf17_POS, // Proof Of Stake, Batched Governance
     hf18_bns,
     hf19_enhance_bns, // provided EVM address in BNS
-    hf20_bulletproof_plusplus,
+    hf20_bulletproof_plus,
 
     _next,
     none = 0
@@ -231,6 +234,7 @@ namespace feature {
   constexpr auto POS                          = hf::hf17_POS;
   constexpr auto CLSAG                        = hf::hf15_flash;
   constexpr auto PROOF_BTENC                  = hf::hf18_bns;
+  constexpr auto BULLETPROOF_PLUS             = hf::hf20_bulletproof_plus;
 }
 
 enum network_type : uint8_t
@@ -333,7 +337,6 @@ namespace config
   inline constexpr auto UPTIME_PROOF_FREQUENCY = 1h; // How often to send proofs out to the network since the last proof we successfully sent.  (Approximately; this can be up to CHECK_INTERFACE/2 off in either direction).  The minimum accepted time between proofs is half of this.
   inline constexpr auto UPTIME_PROOF_VALIDITY = 2h + 5min; // The maximum time that we consider an uptime proof to be valid (i.e. after this time since the last proof we consider the MN to be down)
   inline constexpr auto REACHABLE_MAX_FAILURE_VALIDITY = 5min; // If we don't hear any SS ping/belnet bchat test failures for more than this long then we start considering the MN as passing for the purpose of obligation testing until we get another test result.  This should be somewhat larger than SS/belnet's max re-test backoff (2min).
-
   namespace testnet
   {
     inline constexpr uint64_t HEIGHT_ESTIMATE_HEIGHT = 169960;

@@ -1342,7 +1342,7 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
     }
   }
 
-  if (already_generated_coins != 0 && block_has_governance_output(nettype(), b) && version > hf::hf20_bulletproof_plusplus)
+  if (already_generated_coins != 0 && block_has_governance_output(nettype(), b) && version > hf::hf20_bulletproof_plus)
   {
     if (version >= hf::hf17_POS && reward_parts.governance_paid == 0)
     {
@@ -1372,7 +1372,7 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
   // TODO(beldex): eliminate all floating point math in reward calculations.
   uint64_t max_base_reward = reward_parts.base_miner + reward_parts.governance_paid + reward_parts.master_node_total + 1;
   uint64_t max_money_in_use = max_base_reward + reward_parts.miner_fee;
-  if (money_in_use > max_money_in_use && version > hf::hf20_bulletproof_plusplus)
+  if (money_in_use > max_money_in_use && version > hf::hf20_bulletproof_plus)
   {
     MERROR_VER("coinbase transaction spends too much money (" << print_money(money_in_use) << "). Maximum block reward is "
             << print_money(max_money_in_use) << " (= " << print_money(max_base_reward) << " base + " << print_money(reward_parts.miner_fee) << " fees)");
@@ -3189,6 +3189,32 @@ bool Blockchain::check_tx_outputs(const transaction& tx, tx_verification_context
     return false;
   }
 
+  // Don't allow bulletproofs plus before V20
+  if (hf_version < cryptonote::feature::BULLETPROOF_PLUS) {
+    if (tx.version >= txversion::v4_tx_types && tx.is_transfer()) {
+      const bool bulletproof_plus = rct::is_rct_bulletproof_plus(tx.rct_signatures.type);
+      if (bulletproof_plus || !tx.rct_signatures.p.bulletproofs_plus.empty())
+      {
+        MERROR_VER("Bulletproofs plus are not allowed before v" << std::to_string(static_cast<int>(cryptonote::feature::BULLETPROOF_PLUS)));
+        tvc.m_invalid_output = true;
+        return false;
+      }
+    }
+  }
+
+  // forbid bulletproofs from v20
+  if (hf_version >= cryptonote::feature::BULLETPROOF_PLUS) {
+    if (tx.version >= txversion::v4_tx_types && tx.is_transfer()) {
+      const bool bulletproof = rct::is_rct_bulletproof(tx.rct_signatures.type);
+      if (bulletproof)
+      {
+        MERROR_VER("Bulletproof range proofs are not allowed after v" << std::to_string(static_cast<int>(cryptonote::feature::BULLETPROOF_PLUS)));
+        tvc.m_invalid_output = true;
+        return false;
+      }
+    }
+  }
+
   return true;
 }
 //------------------------------------------------------------------
@@ -3229,7 +3255,7 @@ bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_pr
       }
     }
   }
-  else if (tools::equals_any(rv.type, rct::RCTType::Simple, rct::RCTType::Bulletproof, rct::RCTType::Bulletproof2, rct::RCTType::CLSAG))
+  else if (tools::equals_any(rv.type, rct::RCTType::Simple, rct::RCTType::Bulletproof, rct::RCTType::Bulletproof2, rct::RCTType::CLSAG, rct::RCTType::BulletproofPlus))
   {
     CHECK_AND_ASSERT_MES(!pubkeys.empty() && !pubkeys[0].empty(), false, "empty pubkeys");
     rv.mixRing.resize(pubkeys.size());
@@ -3264,7 +3290,7 @@ bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_pr
       rv.p.MGs[n].II[0] = rct::ki2rct(var::get<txin_to_key>(tx.vin[n]).k_image);
     }
   }
-  else if (rv.type == rct::RCTType::CLSAG)
+  else if (rv.type == rct::RCTType::CLSAG || rv.type == rct::RCTType::BulletproofPlus)
   {
     if (!tx.pruned)
     {
@@ -3446,6 +3472,7 @@ if (tx.version >= cryptonote::txversion::v2_ringct)
     case rct::RCTType::Bulletproof:
     case rct::RCTType::Bulletproof2:
     case rct::RCTType::CLSAG:
+    case rct::RCTType::BulletproofPlus:
     {
       // check all this, either reconstructed (so should really pass), or not
       {
@@ -3481,7 +3508,7 @@ if (tx.version >= cryptonote::txversion::v2_ringct)
         }
       }
 
-      const size_t n_sigs = rv.type == rct::RCTType::CLSAG ? rv.p.CLSAGs.size() : rv.p.MGs.size();
+      const size_t n_sigs = rct::is_rct_clsag(rv.type) ? rv.p.CLSAGs.size() : rv.p.MGs.size();
       if (n_sigs != tx.vin.size())
       {
         MERROR_VER("Failed to check ringct signatures: mismatched MGs/vin sizes");
@@ -3490,7 +3517,7 @@ if (tx.version >= cryptonote::txversion::v2_ringct)
       for (size_t n = 0; n < tx.vin.size(); ++n)
       {
         bool error;
-        if (rv.type == rct::RCTType::CLSAG)
+        if (rct::is_rct_clsag(rv.type))
           error = memcmp(&var::get<txin_to_key>(tx.vin[n]).k_image, &rv.p.CLSAGs[n].I, 32);
         else
           error = rv.p.MGs[n].II.empty() || memcmp(&var::get<txin_to_key>(tx.vin[n]).k_image, &rv.p.MGs[n].II[0], 32);
@@ -4180,7 +4207,7 @@ bool Blockchain::basic_block_checks(cryptonote::block const &blk, bool alt_block
 
     // this is a cheap test
     // HF20 TODO: remove the requirement that minor_version must be >= network version
-    if (auto v = get_network_version(blk_height); (v > hf::none) && (blk.major_version != v || (blk.major_version < hf::hf20_bulletproof_plusplus && blk.minor_version < static_cast<uint8_t>(v))))
+    if (auto v = get_network_version(blk_height); (v > hf::none) && (blk.major_version != v || (blk.major_version < hf::hf20_bulletproof_plus && blk.minor_version < static_cast<uint8_t>(v))))
     {
       LOG_PRINT_L1("Block with id: " << blk_hash << ", has invalid version " << static_cast<int>(blk.major_version) << "." << +blk.minor_version <<
               "; current: " << static_cast<int>(v) << "." << static_cast<int>(v) << " for height " << blk_height);
@@ -4224,7 +4251,7 @@ bool Blockchain::basic_block_checks(cryptonote::block const &blk, bool alt_block
     // HF20 TODO: remove the requirement that minor_version must be >= network version
     if ((required_major_version > hf::none) && 
         (blk.major_version != required_major_version ||
-          (blk.major_version < hf::hf20_bulletproof_plusplus &&
+          (blk.major_version < hf::hf20_bulletproof_plus &&
             blk.minor_version < static_cast<uint8_t>(required_major_version))))
     {
       MGINFO_RED("Block with id: " << blk_hash << ", has invalid version " << static_cast<int>(blk.major_version) << "." << +blk.minor_version <<

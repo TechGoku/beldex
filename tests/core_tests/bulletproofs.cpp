@@ -53,7 +53,7 @@ bool gen_bp_tx_validation_base::generate_with(std::vector<test_event_entry>& eve
   MAKE_GENESIS_BLOCK(events, blk_0, miner_account, ts_start);
 
   if (target_hf == cryptonote::hf::none)
-    target_hf = cryptonote::hf::hf20_bulletproof_plusplus;
+    target_hf = cryptonote::hf::hf20_bulletproof_plus;
   // NOTE: Monero tests use multiple null terminated entries in their arrays
   {
     int amounts_paid_len = 0;
