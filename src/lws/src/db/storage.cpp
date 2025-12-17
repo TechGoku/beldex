@@ -36,6 +36,9 @@ namespace db
 {
   namespace
   {
+    void complete_migration(MDB_txn& txn, tables_ const& tables, unsigned version);
+    void migrate_0_1(MDB_txn& txn, tables_ const& tables);
+    void migrate_1_2(MDB_txn& txn, tables_ const& tables);
     struct account_lookup
     {
       account_id id;
@@ -54,6 +57,7 @@ namespace db
 
     constexpr const unsigned blocks_version = 0;
     constexpr const unsigned by_address_version = 0;
+
 
     template<typename T>
     int less(epee::span<const std::uint8_t> left, epee::span<const std::uint8_t> right) noexcept
@@ -120,6 +124,21 @@ namespace db
       right_bytes.remove_prefix(sizeof(crypto::hash));
       return less<output_id>(left_bytes, right_bytes);
     }
+    // copied from /src/blockchain_db/lmdb/db_lmdb.cpp
+    int compare_string(const MDB_val *a, const MDB_val *b)
+    {
+      const char *va = (const char*) a->mv_data;
+      const char *vb = (const char*) b->mv_data;
+      const size_t sz = std::min(a->mv_size, b->mv_size);
+      int ret = strncmp(va, vb, sz);
+      if (ret)
+        return ret;
+      if (a->mv_size < b->mv_size)
+        return -1;
+      if (a->mv_size > b->mv_size)
+        return 1;
+      return 0;
+    }
 
     int spend_compare(MDB_val const* left, MDB_val const* right) noexcept
     {
@@ -180,6 +199,9 @@ namespace db
     };
     constexpr const lmdb::basic_table<request, request_info> requests{
       "requests_by_type,address", (MDB_CREATE | MDB_DUPSORT), MONERO_COMPARE(request_info, address.spend_public)
+    };
+    constexpr const lmdb::basic_table<char *, unsigned> properties{
+      "properties", (MDB_CREATE), &compare_string
     };
 
     template<typename D>
@@ -336,6 +358,106 @@ namespace db
         }
       }
       */
+    }
+    struct output_v1
+    {
+      block_id block;
+      uint32_t index;
+      uint64_t amount;
+      uint64_t timestamp;
+      crypto::hash tx_hash;
+      crypto::hash tx_prefix_hash;
+      crypto::public_key tx_public;
+      uint64_t unlock_time;
+      uint8_t mixin_count;
+      bool coinbase;
+    };
+
+    struct output_v2
+    {
+      block_id block;
+      uint32_t index;
+      uint64_t amount;
+      uint64_t timestamp;
+      crypto::hash tx_hash;
+      crypto::hash tx_prefix_hash;
+      crypto::key_image locked_key_image;
+      crypto::public_key tx_public;
+      uint64_t unlock_time;
+      uint8_t mixin_count;
+      bool coinbase;
+    };
+
+    void migrate_1_2(MDB_txn& txn, tables_ const& tables)
+    {
+      MINFO("Migrating outputs → add locked_key_image");
+
+      cursor::outputs cur;
+      check_cursor(txn, tables.outputs, cur);
+
+      struct owned_key { std::vector<unsigned char> data; };
+      std::vector<owned_key> keys;
+      std::vector<output_v2> values;
+
+      MDB_val key{}, value{};
+      int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+
+      while (err == 0)
+      {
+        const auto& old =
+          *reinterpret_cast<const output_v1*>(value.mv_data);
+
+        output_v2 v2{};
+        v2.block = old.block;
+        v2.index = old.index;
+        v2.amount = old.amount;
+        v2.timestamp = old.timestamp;
+        v2.tx_hash = old.tx_hash;
+        v2.tx_prefix_hash = old.tx_prefix_hash;
+        v2.locked_key_image = crypto::key_image{};
+        v2.tx_public = old.tx_public;
+        v2.unlock_time = old.unlock_time;
+        v2.mixin_count = old.mixin_count;
+        v2.coinbase = old.coinbase;
+
+        owned_key k;
+        k.data.assign(
+          static_cast<unsigned char*>(key.mv_data),
+          static_cast<unsigned char*>(key.mv_data) + key.mv_size
+        );
+
+        keys.push_back(std::move(k));
+        values.push_back(v2);
+
+        err = mdb_cursor_del(cur.get(), 0);
+        if (err)
+          MONERO_THROW(lmdb::error(err), "cursor_del failed");
+
+        err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
+      }
+
+      if (err != MDB_NOTFOUND)
+        MONERO_THROW(lmdb::error(err), "cursor iteration failed");
+
+      for (size_t i = 0; i < values.size(); ++i)
+      {
+        MDB_val k{ keys[i].data.size(), keys[i].data.data() };
+        MDB_val v = lmdb::to_val(values[i]);
+
+        err = mdb_put(&txn, tables.outputs, &k, &v, 0);
+        if (err)
+          MONERO_THROW(lmdb::error(err), "mdb_put failed");
+      }
+    }
+
+
+    void migrate(MDB_txn& txn, tables_ const& tables, unsigned oldversion)
+    {
+      if (oldversion < 2)
+      {
+        migrate_1_2(txn, tables);
+        complete_migration(txn, tables, 2);
+      }
     }
     
     template<typename T>

@@ -41,6 +41,17 @@ namespace db
     MONERO_CURSOR(accounts_by_address);
     MONERO_CURSOR(accounts_by_height);
   }
+  struct tables_
+  {
+    MDB_dbi blocks;
+    MDB_dbi accounts;
+    MDB_dbi accounts_by_address;
+    MDB_dbi accounts_by_height;
+    MDB_dbi outputs;
+    MDB_dbi spends;
+    MDB_dbi images;
+    MDB_dbi requests;
+  };
 
   struct storage_internal;
   
