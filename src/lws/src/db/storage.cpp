@@ -29,6 +29,7 @@
 #include "epee/span.h"
 #include "wire/filters.h"
 #include "wire/json.h"
+#include "wire/adapted/array.h"
 
 namespace lws
 {
@@ -187,7 +188,7 @@ namespace db
     {
       if (cur)
       {
-        MONERO_LMDB_CHECK(mdb_cursor_renew(&txn, cur.get()));
+        BLWS_LMDB_CHECK(mdb_cursor_renew(&txn, cur.get()));
       }
       else
       {
@@ -215,7 +216,7 @@ namespace db
           &cur, &key_bytes, value_bytes, (MDB_NODUPDATA | MDB_MULTIPLE)
         );
         if (err && err != MDB_KEYEXIST)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err __LINE__, __FILE__);
 
         values.remove_prefix(value_bytes[1].mv_size + (err == MDB_KEYEXIST ? 1 : 0));
       }
@@ -272,7 +273,7 @@ namespace db
     {
       MDB_val key = lmdb::to_val(blocks_version);
       MDB_val value = lmdb::to_val(id);
-      MONERO_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_GET_BOTH));
+      BLWS_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_GET_BOTH));
       return blocks.get_value<MONERO_FIELD(block_info, hash)>(value);
     }
 
@@ -345,8 +346,8 @@ namespace db
 
       MDB_val key = lmdb::to_val(blocks_version);
       MDB_val value{};
-      MONERO_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_SET));
-      MONERO_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_LAST_DUP));
+      BLWS_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_SET));
+      BLWS_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_LAST_DUP));
 
       //const expect<block_id> height = blocks.get_value<MONERO_FIELD(block_info,id)>(value);
       expect<block_info> next = blocks.get_value<block_info>(value);
@@ -367,8 +368,8 @@ namespace db
 
       MDB_val key = lmdb::to_val(blocks_version);
       MDB_val value{};
-      MONERO_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_SET));
-      MONERO_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_LAST_DUP));
+      BLWS_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_SET));
+      BLWS_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_LAST_DUP));
       for (unsigned i = 0; i < 10; ++i)
       {
         expect<block_info> next = blocks.get_value<block_info>(value);
@@ -381,7 +382,7 @@ namespace db
         if (err)
         {
           if (err != MDB_NOTFOUND)
-            return {lmdb::error(err)};
+            return log_lmdb_error(err, __LINE__, __FILE__);
           if (out.back().id != block_id(0))
             return {lws::error::bad_blockchain};
           return out;
@@ -427,11 +428,11 @@ namespace db
       if (err == MDB_NOTFOUND)
         return best;
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       do
       {
-        MONERO_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_LAST_DUP));
+        BLWS_LMDB_CHECK(mdb_cursor_get(&cur, &key, &value, MDB_LAST_DUP));
         const expect<account_id> current =
           accounts.get_value<MONERO_FIELD(account, id)>(value);
         if (!current)
@@ -443,7 +444,7 @@ namespace db
         if (err == MDB_NOTFOUND)
           return best;
       } while (err == 0);
-      return {lmdb::error(err)};
+      return log_lmdb_error(err, __LINE__, __FILE__);
     }
   } // anonymous
 
@@ -495,8 +496,8 @@ namespace db
 
     MDB_val key = lmdb::to_val(blocks_version);
     MDB_val value{};
-    MONERO_LMDB_CHECK(mdb_cursor_get(curs.blocks_cur.get(), &key, &value, MDB_SET));
-    MONERO_LMDB_CHECK(mdb_cursor_get(curs.blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+    BLWS_LMDB_CHECK(mdb_cursor_get(curs.blocks_cur.get(), &key, &value, MDB_SET));
+    BLWS_LMDB_CHECK(mdb_cursor_get(curs.blocks_cur.get(), &key, &value, MDB_LAST_DUP));
 
     return blocks.get_value<block_info>(value);
   }
@@ -559,7 +560,7 @@ namespace db
     {
       if (err == MDB_NOTFOUND)
         return {lws::error::account_not_found};
-      return {lmdb::error(err)};
+      return log_lmdb_error(err, __LINE__, __FILE__);
     }
 
     return accounts.get_value<account>(value);
@@ -580,7 +581,7 @@ namespace db
     {
       if (err == MDB_NOTFOUND)
         return {lws::error::account_not_found};
-      return {lmdb::error(err)};
+      return log_lmdb_error(err, __LINE__, __FILE__);
     }
 
     /* Database is only indexing by view public for possible CurveZMQ
@@ -647,7 +648,7 @@ namespace db
 
     MDB_val key = lmdb::to_val(type);
     MDB_val value = lmdb::to_val(address);
-    MONERO_LMDB_CHECK(mdb_cursor_get(cur.get(), &key, &value, MDB_GET_BOTH));
+    BLWS_LMDB_CHECK(mdb_cursor_get(cur.get(), &key, &value, MDB_GET_BOTH));
     return requests.get_value<request_info>(value);
   }
 
@@ -840,7 +841,7 @@ namespace db
       if (err == MDB_NOTFOUND)
         return success();
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       for (;;)
       {
@@ -855,15 +856,15 @@ namespace db
 
         key = lmdb::to_val(*out);
         value = lmdb::to_val(*image);
-        MONERO_LMDB_CHECK(mdb_cursor_get(&images_cur, &key, &value, MDB_GET_BOTH));
-        MONERO_LMDB_CHECK(mdb_cursor_del(&images_cur, 0));
+        BLWS_LMDB_CHECK(mdb_cursor_get(&images_cur, &key, &value, MDB_GET_BOTH));
+        BLWS_LMDB_CHECK(mdb_cursor_del(&images_cur, 0));
 
-        MONERO_LMDB_CHECK(mdb_cursor_del(&spends_cur, 0));
+        BLWS_LMDB_CHECK(mdb_cursor_del(&spends_cur, 0));
         const int err = mdb_cursor_get(&spends_cur, &key, &value, MDB_NEXT_DUP);
         if (err == MDB_NOTFOUND)
           break;
         if (err)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
       }
       return success();
     }
@@ -877,16 +878,16 @@ namespace db
       if (err == MDB_NOTFOUND)
         return success();
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       for (;;)
       {
-        MONERO_LMDB_CHECK(mdb_cursor_del(&outputs_cur, 0));
+        BLWS_LMDB_CHECK(mdb_cursor_del(&outputs_cur, 0));
         const int err = mdb_cursor_get(&outputs_cur, &key, &value, MDB_NEXT_DUP);
         if (err == MDB_NOTFOUND)
           break;
         if (err)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
       }
       return success();
     }
@@ -902,7 +903,7 @@ namespace db
       if (err == MDB_NOTFOUND)
         return success();
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       std::vector<account_lookup> new_by_heights{};
 
@@ -929,7 +930,7 @@ namespace db
         key = lmdb::to_val(lookup->status);
         value = lmdb::to_val(lookup->id);
 
-        MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
+        BLWS_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
         expect<account> user = accounts.get_value<account>(value);
         if (!user)
           return user.error();
@@ -938,13 +939,13 @@ namespace db
         user->start_height = std::min(user->scan_height, user->start_height);
 
         value = lmdb::to_val(*user);
-        MONERO_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_CURRENT));
+        BLWS_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_CURRENT));
 
         new_by_heights.push_back(account_lookup{user->id, lookup->status});
         MONERO_CHECK(rollback_outputs(user->id, height, *outputs_cur));
         MONERO_CHECK(rollback_spends(user->id, height, *spends_cur, *images_cur));
 
-        MONERO_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
+        BLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
         int err = mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_NEXT_DUP);
         if (err == MDB_NOTFOUND)
         {
@@ -953,7 +954,7 @@ namespace db
             break;
         }
         if (err)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
       }
 
       return bulk_insert(*accounts_bh_cur, new_height, epee::to_span(new_by_heights));
@@ -968,12 +969,12 @@ namespace db
       int err = 0;
       do
       {
-        MONERO_LMDB_CHECK(mdb_cursor_del(&cur, 0));
+        BLWS_LMDB_CHECK(mdb_cursor_del(&cur, 0));
         err = mdb_cursor_get(&cur, &key, &value, MDB_NEXT_DUP);
       } while (err == 0);
 
       if (err != MDB_NOTFOUND)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       return rollback_accounts(tables, txn,  height);
     }
@@ -1021,7 +1022,7 @@ namespace db
       if (err == MDB_NOTFOUND)
         return success();
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       return rollback_chain(this->db->tables, txn, *blocks_cur, height);
     });
@@ -1055,7 +1056,7 @@ namespace db
       //   // if (err == MDB_NOTFOUND)
       //   //   break;
       //   // if (err)
-      //   //   return {lmdb::error(err)};
+      //   //   return log_lmdb_error(err, __LINE__, __FILE__);
 
       //   hash = blocks.get_value<MONERO_FIELD(block_info, hash)>(value);
       //   // if (!hash)
@@ -1113,7 +1114,7 @@ namespace db
         if (err == MDB_NOTFOUND)
           continue;
         if (err)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
 
         expect<account_by_address> by_address =
           accounts_by_address.get_value<account_by_address>(value);
@@ -1126,28 +1127,28 @@ namespace db
           by_address->lookup.status = status;
 
           value = lmdb::to_val(*by_address);
-          MONERO_LMDB_CHECK(mdb_cursor_put(accounts_ba_cur.get(), &key, &value, MDB_CURRENT));
+          BLWS_LMDB_CHECK(mdb_cursor_put(accounts_ba_cur.get(), &key, &value, MDB_CURRENT));
 
           key = lmdb::to_val(current);
           value = lmdb::to_val(by_address->lookup.id);
-          MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
+          BLWS_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
 
           expect<account> user = accounts.get_value<account>(value);
           if (!user)
             return user.error();
 
-          MONERO_LMDB_CHECK(mdb_cursor_del(accounts_cur.get(), 0));
+          BLWS_LMDB_CHECK(mdb_cursor_del(accounts_cur.get(), 0));
 
           key = lmdb::to_val(status);
           value = lmdb::to_val(*user);
-          MONERO_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_NODUPDATA));
+          BLWS_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_NODUPDATA));
 
           key = lmdb::to_val(user->scan_height);
           value = lmdb::to_val(user->id);
-          MONERO_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
+          BLWS_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
 
           value = lmdb::to_val(by_address->lookup);
-          MONERO_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_CURRENT));
+          BLWS_LMDB_CHECK(mdb_cursor_put(accounts_bh_cur.get(), &key, &value, MDB_CURRENT));
         }
 
         changed.push_back(address);
@@ -1188,17 +1189,17 @@ namespace db
       if (err == MDB_KEYEXIST)
         return {lws::error::account_exists};
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       key = lmdb::to_val(user.scan_height);
       value = lmdb::to_val(by_address.lookup);
-      MONERO_LMDB_CHECK(
+      BLWS_LMDB_CHECK(
         mdb_cursor_put(&accounts_bh_cur, &key, &value, MDB_NODUPDATA)
       );
 
       key = lmdb::to_val(by_address.lookup.status);
       value = lmdb::to_val(user);
-      MONERO_LMDB_CHECK(
+      BLWS_LMDB_CHECK(
         mdb_cursor_put(&accounts_cur, &key, &value, MDB_NODUPDATA)
       );
       return success();
@@ -1217,7 +1218,7 @@ namespace db
       if (err == MDB_NOTFOUND)
         return {lws::error::account_not_found};
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       const expect<account_lookup> lookup =
         accounts_by_address.get_value<MONERO_FIELD(account_by_address, lookup)>(value);
@@ -1226,7 +1227,7 @@ namespace db
 
       key = lmdb::to_val(lookup->status);
       value = lmdb::to_val(lookup->id);
-      MONERO_LMDB_CHECK(
+      BLWS_LMDB_CHECK(
         mdb_cursor_get(&accounts_cur, &key, &value, MDB_GET_BOTH)
       );
 
@@ -1239,19 +1240,19 @@ namespace db
       user->start_height = std::min(height, user->start_height);
 
       value = lmdb::to_val(*user);
-      MONERO_LMDB_CHECK(
+      BLWS_LMDB_CHECK(
         mdb_cursor_put(&accounts_cur, &key, &value, MDB_CURRENT)
       );
 
       key = lmdb::to_val(current_height);
-      MONERO_LMDB_CHECK(
+      BLWS_LMDB_CHECK(
         mdb_cursor_get(&accounts_bh_cur, &key, &value, MDB_GET_BOTH)
       );
-      MONERO_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
+      BLWS_LMDB_CHECK(mdb_cursor_del(&accounts_bh_cur, 0));
 
       key = lmdb::to_val(height);
       value = lmdb::to_val(*lookup);
-      MONERO_LMDB_CHECK(
+      BLWS_LMDB_CHECK(
         mdb_cursor_put(&accounts_bh_cur, &key, &value, MDB_NODUPDATA)
       );
 
@@ -1272,8 +1273,8 @@ namespace db
         MDB_val key = lmdb::to_val(blocks_version);
         MDB_val value{};
 
-        MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET));
-        MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+        BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET));
+        BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
 
         const expect<block_id> current_height =
           blocks.get_value<MONERO_FIELD(block_info, id)>(value);
@@ -1336,7 +1337,7 @@ namespace db
       if (err != MDB_NOTFOUND)
       {
         if (err)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
         return {lws::error::account_exists};
       }
 
@@ -1347,18 +1348,18 @@ namespace db
       if (!err)
       {
         mdb_size_t count = 0;
-        MONERO_LMDB_CHECK(mdb_cursor_count(requests_cur.get(), &count));
+        BLWS_LMDB_CHECK(mdb_cursor_count(requests_cur.get(), &count));
         if (this->db->create_queue_max <= count)
           return {lws::error::create_queue_max};
       }
       else if (err != MDB_NOTFOUND)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       keyv = lmdb::to_val(blocks_version);
       value = MDB_val{};
 
-      MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_SET));
-      MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_LAST_DUP));
+      BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_SET));
+      BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_LAST_DUP));
 
       const expect<block_id> height =
         blocks.get_value<MONERO_FIELD(block_info, id)>(value);
@@ -1380,7 +1381,7 @@ namespace db
       if (err == MDB_KEYEXIST)
         return {lws::error::duplicate_request};
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       return success();
     });
@@ -1408,7 +1409,7 @@ namespace db
       if (err == MDB_NOTFOUND)
         return {lws::error::account_not_found};
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       request_info info{};
       info.address = address;
@@ -1422,7 +1423,7 @@ namespace db
       if (err == MDB_KEYEXIST)
         return {lws::error::duplicate_request};
       if (err)
-        return {lmdb::error(err)};
+        return log_lmdb_error(err, __LINE__, __FILE__);
 
       return success();
     });
@@ -1463,13 +1464,13 @@ namespace db
         if (err == MDB_NOTFOUND)
           continue;
         if (err)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
 
         const expect<db::request_info> info = requests.get_value<db::request_info>(value);
         if (!info)
           return info.error();
 
-        MONERO_LMDB_CHECK(mdb_cursor_del(requests_cur.get(), 0));
+        BLWS_LMDB_CHECK(mdb_cursor_del(requests_cur.get(), 0));
 
         const account_id next_id = account_id(lmdb::to_native(*last_id) + 1);
         if (next_id == account_id::invalid)
@@ -1526,11 +1527,11 @@ namespace db
         if (err == MDB_NOTFOUND)
           continue;
         if (err)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
 
         const expect<block_id> new_height =
           requests.get_value<MONERO_FIELD(request_info, start_height)>(value);
-        MONERO_LMDB_CHECK(mdb_cursor_del(requests_cur.get(), 0));
+        BLWS_LMDB_CHECK(mdb_cursor_del(requests_cur.get(), 0));
         if (!new_height)
           return new_height.error();
 
@@ -1589,11 +1590,11 @@ namespace db
         MDB_val value = lmdb::to_val(address);
         const int err = mdb_cursor_get(requests_cur.get(), &key, &value, MDB_GET_BOTH);
         if (err && err != MDB_NOTFOUND)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
 
         if (!err)
         {
-          MONERO_LMDB_CHECK(mdb_cursor_del(requests_cur.get(), 0));
+          BLWS_LMDB_CHECK(mdb_cursor_del(requests_cur.get(), 0));
           rejected.push_back(address);
         }
       }
@@ -1628,8 +1629,8 @@ namespace db
       MDB_val keyv = lmdb::to_val(blocks_version);
       MDB_val value{};
 
-      MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_SET));
-      MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_LAST_DUP));
+      BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_SET));
+      BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &keyv, &value, MDB_LAST_DUP));
 
       const expect<block_id> height =
         blocks.get_value<MONERO_FIELD(block_info, id)>(value);
@@ -1668,7 +1669,7 @@ namespace db
         MDB_val value = lmdb::to_val(image);
         const int err = mdb_cursor_put(&images_cur, &key, &value, MDB_NODUPDATA);
         if (err && err != MDB_KEYEXIST)
-          return {lmdb::error(err)};
+          return log_lmdb_error(err, __LINE__, __FILE__);
       }
       return success();
     }
@@ -1697,8 +1698,8 @@ namespace db
 
       //   MDB_val key = lmdb::to_val(blocks_version);
       //   MDB_val value;
-      //   MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET));
-      //   MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+      //   BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET));
+      //   BLWS_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
 
       //   const expect<block_info> last_block = blocks.get_value<block_info>(value);
       //   if (!last_block)
@@ -1767,7 +1768,7 @@ namespace db
         if (err)
         {
           if (err != MDB_NOTFOUND)
-            return {lmdb::error(err)};
+            return log_lmdb_error(err, __LINE__, __FILE__);
           if (accounts_ba_cur == nullptr)
             MONERO_CHECK(check_cursor(txn, this->db->tables.accounts_ba, accounts_ba_cur));
 
@@ -1777,7 +1778,7 @@ namespace db
           if (err)
           {
             if (err != MDB_NOTFOUND)
-              return {lmdb::error(err)};
+              return log_lmdb_error(err, __LINE__, __FILE__);
             continue; // to next account
           }
 
@@ -1787,7 +1788,7 @@ namespace db
             return lookup.error();
 
           status_key = lookup->status;
-          MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
+          BLWS_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
         }
         expect<account> existing = accounts.get_value<account>(value);
         if (!existing || existing->scan_height != user->scan_height())
@@ -1797,14 +1798,14 @@ namespace db
 
         existing->scan_height = block_id(last_update);
         value = lmdb::to_val(*existing);
-        MONERO_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_CURRENT));
+        BLWS_LMDB_CHECK(mdb_cursor_put(accounts_cur.get(), &key, &value, MDB_CURRENT));
 
         heights.push_back(account_lookup{user->id(), status_key});
 
         key = lmdb::to_val(existing_height);
         value = lmdb::to_val(user_id);
-        MONERO_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
-        MONERO_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
+        BLWS_LMDB_CHECK(mdb_cursor_get(accounts_bh_cur.get(), &key, &value, MDB_GET_BOTH));
+        BLWS_LMDB_CHECK(mdb_cursor_del(accounts_bh_cur.get(), 0));
 
         MONERO_CHECK(bulk_insert(*outputs_cur, user->id(), epee::to_span(user->outputs())));
         MONERO_CHECK(add_spends(*spends_cur, *images_cur, user->id(), epee::to_span(user->spends())));

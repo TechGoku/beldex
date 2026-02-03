@@ -62,3 +62,16 @@ namespace std
       : true_type
     {};
 }
+
+#define BLWS_LMDB_CHECK(...)                                 \
+  do                                                         \
+  {                                                          \
+    const int err = __VA_ARGS__ ;                            \
+    if (err)                                                 \
+      return ::lws::log_lmdb_error(err, __LINE__, __FILE__); \
+  } while (0)
+
+namespace lws
+{
+  std::error_code log_lmdb_error(int err, int line, const char* file);
+}
