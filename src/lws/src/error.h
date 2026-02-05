@@ -30,6 +30,7 @@ namespace lws
     exchange_rates_old,         //!< Exchange rates are older than cache interval
     http_server,                //!< HTTP server failure (init or run)
     not_enough_mixin,           //!< Not enough outputs to meet mixin count
+    not_enough_amount,          //!< Not enough outputs to meet amount
     signal_abort_process,       //!< In process ZMQ PUB to abort the process was received
     signal_abort_scan,          //!< In process ZMQ PUB to abort the scan was received
     signal_unknown,             //!< An unknown in process ZMQ PUB was received

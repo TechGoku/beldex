@@ -60,6 +60,8 @@ namespace lws
         return "Exchange rates are older than cache interval";
       case error::not_enough_mixin:
         return "Not enough outputs to meet requested mixin count";
+      case error::not_enough_amount:
+        return "Not enough outputs to meet requested amount";
       case error::signal_abort_process:
         return "An in-process message was received to abort the process";
       case error::signal_abort_scan:
