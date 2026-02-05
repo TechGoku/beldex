@@ -216,7 +216,7 @@ namespace db
           &cur, &key_bytes, value_bytes, (MDB_NODUPDATA | MDB_MULTIPLE)
         );
         if (err && err != MDB_KEYEXIST)
-          return log_lmdb_error(err __LINE__, __FILE__);
+          return log_lmdb_error(err, __LINE__, __FILE__);
 
         values.remove_prefix(value_bytes[1].mv_size + (err == MDB_KEYEXIST ? 1 : 0));
       }

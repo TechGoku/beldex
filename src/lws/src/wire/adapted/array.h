@@ -85,7 +85,7 @@ namespace wire
     {
       if (json && source.is_array_end(count))
         WIRE_DLOG_THROW(wire::error::schema::array, "Expected array of size " << dest.size());
-      wire_read::bytes(source, elem);
+      wire::read_bytes(source, elem);
       --count;
     }
     if (!source.is_array_end(count))
