@@ -105,7 +105,7 @@ namespace lws
       if (!user)
         return user.error();
       if (is_hidden(user->first))
-        return {lws::error::account_not_found};
+        return {lws::error::not_enough_amount};
       return {std::make_pair(user->second, std::move(*reader))};
     }
 
@@ -889,7 +889,7 @@ namespace lws
       {"/get_unspent_outs",      call<get_unspent_outs>, 2 * 1024},
       {"/import_request",        call<import_request>,   2 * 1024},
       {"/login",                 call<login>,            2 * 1024},
-      {"/submit_raw_tx",         call<submit_raw_tx>,   50 * 1024}
+      {"/submit_raw_tx",         call<submit_raw_tx>,   512 * 1024}
     };
     constexpr const endpoint admin_endpoints[] =
     {

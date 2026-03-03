@@ -648,7 +648,14 @@ namespace db
 
     MDB_val key = lmdb::to_val(type);
     MDB_val value = lmdb::to_val(address);
-    BLWS_LMDB_CHECK(mdb_cursor_get(cur.get(), &key, &value, MDB_GET_BOTH));
+    // BLWS_LMDB_CHECK(mdb_cursor_get(cur.get(), &key, &value, MDB_GET_BOTH));
+    const int err = mdb_cursor_get(cur.get(), &key, &value, MDB_GET_BOTH);
+    if (err)
+    {
+      if (err != MDB_NOTFOUND)
+        return log_lmdb_error(err, __LINE__, __FILE__);
+      return {lmdb::error(err)}; // do not log MDB_NOTFOUND; expected
+    }
     return requests.get_value<request_info>(value);
   }
 
