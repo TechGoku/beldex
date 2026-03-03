@@ -29,6 +29,8 @@
 
 #include <lmdb.h>
 #include <string>
+#include <cstring>                 
+#include "misc_log_ex.h"
 
 namespace {
     struct category final : std::error_category
@@ -96,3 +98,13 @@ namespace lmdb
     }
 }
 
+std::error_code lws::log_lmdb_error(const int err, const int line, const char* file)
+{
+  const std::error_code code{lmdb::error(err)};
+  char const* const name_end = std::strrchr(file, '/');
+  if (name_end)
+    file = name_end + 1;
+
+  MERROR("lmdb error (" << file << ':' << line << "): " << code.message());
+  return code;
+}
