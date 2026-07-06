@@ -535,6 +535,7 @@ TEST(NetUtils, NetworkAddress)
     constexpr static bool equal(const custom_address&) noexcept { return false; }
     constexpr static bool less(const custom_address&) noexcept { return false; }
     constexpr static bool is_same_host(const custom_address&) noexcept { return false; }
+    constexpr static uint16_t port() noexcept { return 0; }
     constexpr static bool is_loopback() noexcept { return false; }
     constexpr static bool is_local() noexcept { return false; }
     static std::string str() { return {}; }

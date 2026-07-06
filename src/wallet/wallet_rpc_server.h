@@ -168,6 +168,10 @@ namespace tools
     wallet_rpc::BNS_DECRYPT_VALUE::response               invoke(wallet_rpc::BNS_DECRYPT_VALUE::request&& req);
     wallet_rpc::BNS_ENCRYPT_VALUE::response               invoke(wallet_rpc::BNS_ENCRYPT_VALUE::request&& req);
     wallet_rpc::COIN_BURN::response                       invoke(wallet_rpc::COIN_BURN::request&& req);
+    wallet_rpc::GATEWAY_REGISTER::response                invoke(wallet_rpc::GATEWAY_REGISTER::request&& req);
+    wallet_rpc::GATEWAY_CHANGE_OWNER::response            invoke(wallet_rpc::GATEWAY_CHANGE_OWNER::request&& req);
+    wallet_rpc::GATEWAY_INFO::response                    invoke(wallet_rpc::GATEWAY_INFO::request&& req);
+    wallet_rpc::GATEWAY_TX_HISTORY::response              invoke(wallet_rpc::GATEWAY_TX_HISTORY::request&& req);
     wallet_rpc::QUERY_KEY::response                       invoke(wallet_rpc::QUERY_KEY::request&& req);
 
   private:

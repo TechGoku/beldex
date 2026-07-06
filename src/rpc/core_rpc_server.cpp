@@ -49,6 +49,7 @@
 #include "cryptonote_core/beldex_name_system.h"
 #include "cryptonote_core/pos.h"
 #include "cryptonote_core/master_node_rules.h"
+#include "cryptonote_core/gateway_storage.h"
 #include "beldex_economy.h"
 #include "epee/string_tools.h"
 #include "core_rpc_server.h"
@@ -815,6 +816,25 @@ namespace cryptonote::rpc {
         set("bns", std::move(bns));
     }
 
+      void operator()(const tx_extra_gateway_operation& x) {
+        json gw{};
+        if (auto* reg = std::get_if<gateway_address_descriptor_operation_register>(&x.operation))
+        {
+          gw["type"] = "register";
+          if (auto* owner_key = std::get_if<crypto::public_key>(&reg->descriptor.owner_key))
+            gw["owner_key"] = tools::type_to_hex(*owner_key);
+          gw["meta_info"] = reg->descriptor.meta_info;
+        }
+        else if (auto* chg = std::get_if<gateway_address_descriptor_operation_owner_change>(&x.operation))
+        {
+          gw["type"] = "owner_change";
+          gw["gateway_address_id"] = tools::type_to_hex(chg->gateway_addr);
+          if (auto* new_owner_key = std::get_if<crypto::public_key>(&chg->new_owner_key))
+            gw["new_owner_key"] = tools::type_to_hex(*new_owner_key);
+        }
+        set("gateway_operation", std::move(gw));
+      }
+
       // Ignore these fields:
       void operator()(const tx_extra_padding&) {}
       void operator()(const tx_extra_mysterious_minergate&) {}
@@ -1182,6 +1202,69 @@ namespace cryptonote::rpc {
 
    spent.response["status"] = STATUS_OK;
    spent.response["spent_status"] = std::move(spent_status);
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  void core_rpc_server::invoke(GET_GATEWAY_INFO& info, rpc_context context)
+  {
+    PERF_TIMER(on_get_gateway_info);
+
+    json params{
+      {"gateway_address_id", tools::type_to_hex(info.request.gateway_address_id)}
+    };
+    if (info.request.asset_id)
+      params["asset_id"] = tools::type_to_hex(*info.request.asset_id);
+
+    if (use_bootstrap_daemon_if_necessary<GET_GATEWAY_INFO>(params, info.response))
+      return;
+
+    info.response["status"] = STATUS_OK;
+
+    auto& db = m_core.get_blockchain_storage().get_db();
+    gateway_record record;
+    bool found = db.get_gateway_record(info.request.gateway_address_id, record);
+    info.response["found"] = found;
+    if (found)
+    {
+      info.response_hex["owner_key"] = record.owner_key;
+      info.response["meta_info"] = record.meta_info;
+      info.response["creation_height"] = record.creation_height;
+      if (info.request.asset_id)
+        info.response["balance"] = db.get_gateway_balance(info.request.gateway_address_id, *info.request.asset_id);
+    }
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  void core_rpc_server::invoke(GET_GATEWAY_TX_HISTORY& history, rpc_context context)
+  {
+    PERF_TIMER(on_get_gateway_tx_history);
+
+    json params{{"tx_hashes", json::array()}};
+    for (const auto& h : history.request.tx_hashes)
+      params["tx_hashes"].push_back(tools::type_to_hex(h));
+
+    if (use_bootstrap_daemon_if_necessary<GET_GATEWAY_TX_HISTORY>(params, history.response))
+      return;
+
+    history.response["status"] = STATUS_OK;
+
+    auto& db = m_core.get_blockchain_storage().get_db();
+    auto entries = json::array();
+    for (const auto& tx_hash : history.request.tx_hashes)
+    {
+      gateway_tx_entry entry;
+      if (!db.get_gateway_tx_history(tx_hash, entry))
+      {
+        entries.push_back(nullptr);
+        continue;
+      }
+      json e;
+      e["type"] = entry.type;
+      e["gateway_address_id"] = tools::type_to_hex(entry.gateway_addr);
+      e["asset_id"] = tools::type_to_hex(entry.asset_id);
+      e["amount"] = entry.amount;
+      e["height"] = entry.height;
+      entries.push_back(std::move(e));
+    }
+    history.response["entries"] = std::move(entries);
   }
   //------------------------------------------------------------------------------------------------------------------------------
   void core_rpc_server::invoke(SUBMIT_TRANSACTION& tx, rpc_context context)

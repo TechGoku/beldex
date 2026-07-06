@@ -117,6 +117,10 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
       /* nothing to do here */
       miner_tx = true;
     }
+    else if (std::holds_alternative<txin_gateway>(tx_input))
+    {
+      /* gateway inputs don't spend a ring-signature key image */
+    }
     else
     {
       LOG_PRINT_L1("Unsupported input type, removing key images and aborting transaction addition");
@@ -149,6 +153,13 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
       unlock_time = tx.unlock_time;
     }
 
+    // gateway outputs are not part of the ring-signature global output index
+    if (std::holds_alternative<txout_gateway>(tx.vout[i].target))
+    {
+      amount_output_indices[i] = 0;
+      continue;
+    }
+
     // miner v2 txes have their coinbase output in one single out to save space,
     // and we store them as rct outputs with an identity mask
     if (miner_tx && tx.version >= cryptonote::txversion::v2_ringct)
@@ -170,6 +181,89 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
     add_output_blacklist(amount_output_indices);
 
   add_tx_amount_output_indices(tx_id, amount_output_indices);
+
+  // Gateway persistence wiring. By the time a transaction reaches here it has already
+  // passed Blockchain::check_tx_inputs, which is what actually verifies ownership
+  // signatures and sufficient balance (see blockchain.cpp) -- so these calls are not
+  // wrapped in a try/catch: a failure here means state is already inconsistent with what
+  // consensus validated, which is a bug that should surface loudly, not be swallowed.
+
+  // A registration or owner-change operation, if present, is independent of any
+  // txin_gateway/txout_gateway on the same tx (it lives in tx_extra).
+  tx_extra_gateway_operation gw_op;
+  if (get_gateway_operation_from_tx_extra(tx.extra, gw_op))
+  {
+    if (auto* reg = std::get_if<gateway_address_descriptor_operation_register>(&gw_op.operation))
+    {
+      const crypto::public_key& owner_key = var::get<crypto::public_key>(reg->descriptor.owner_key);
+      gateway_record record{};
+      record.gateway_addr = owner_key; // self-sovereign bootstrap: address == its own first owner key
+      record.owner_key = owner_key;
+      record.meta_info = reg->descriptor.meta_info;
+      record.creation_height = height();
+      add_gateway_record(record);
+
+      gateway_tx_entry entry{};
+      entry.tx_hash = tx_hash;
+      entry.type = 0; // register
+      entry.gateway_addr = record.gateway_addr;
+      entry.height = record.creation_height;
+      add_gateway_tx_history(tx_hash, entry);
+    }
+    else if (auto* chg = std::get_if<gateway_address_descriptor_operation_owner_change>(&gw_op.operation))
+    {
+      gateway_record record{};
+      if (!get_gateway_record(chg->gateway_addr, record))
+        throw std::runtime_error("owner-change tx accepted for a gateway_addr with no registry record");
+      const crypto::public_key prev_owner_key = record.owner_key;
+      const crypto::public_key& new_owner_key = var::get<crypto::public_key>(chg->new_owner_key);
+      update_gateway_owner(chg->gateway_addr, new_owner_key);
+
+      gateway_tx_entry entry{};
+      entry.tx_hash = tx_hash;
+      entry.type = 3; // owner_change
+      entry.gateway_addr = chg->gateway_addr;
+      entry.height = height();
+      entry.prev_owner_key = prev_owner_key;
+      add_gateway_tx_history(tx_hash, entry);
+    }
+  }
+
+  // record gateway outputs (credit)
+  for (const auto &out : tx.vout)
+  {
+    if (std::holds_alternative<txout_gateway>(out.target))
+    {
+      const txout_gateway &gw = var::get<txout_gateway>(out.target);
+      gateway_tx_entry entry{};
+      entry.tx_hash = tx_hash;
+      entry.type = 1; // transfer / credit
+      entry.gateway_addr = gw.gateway_addr;
+      entry.asset_id = gw.asset_id;
+      entry.amount = gw.amount;
+      entry.height = height();
+      add_gateway_tx_history(tx_hash, entry);
+      update_gateway_balance(entry.gateway_addr, entry.asset_id, static_cast<int64_t>(entry.amount));
+    }
+  }
+
+  // record gateway inputs (debit)
+  for (const auto &in : tx.vin)
+  {
+    if (std::holds_alternative<txin_gateway>(in))
+    {
+      const txin_gateway &gwi = var::get<txin_gateway>(in);
+      gateway_tx_entry entry{};
+      entry.tx_hash = tx_hash;
+      entry.type = 2; // withdraw / debit
+      entry.gateway_addr = gwi.gateway_addr;
+      entry.asset_id = gwi.asset_id;
+      entry.amount = gwi.amount;
+      entry.height = height();
+      add_gateway_tx_history(tx_hash, entry);
+      update_gateway_balance(entry.gateway_addr, entry.asset_id, -static_cast<int64_t>(entry.amount));
+    }
+  }
 }
 
 uint64_t BlockchainDB::add_block( const std::pair<block, blobdata>& blck
@@ -255,6 +349,49 @@ void BlockchainDB::remove_transaction(const crypto::hash& tx_hash)
       remove_spent_key(var::get<txin_to_key>(tx_input).k_image);
     }
   }
+
+  // Gateway rollback: reverse balance/ownership updates, then drop the history entries.
+  // Not wrapped in try/catch for the same reason as the add-path in add_transaction: a
+  // failure here means the DB is already inconsistent, which must not be hidden.
+
+  // reverse a registration or owner-change operation, if this tx carried one
+  tx_extra_gateway_operation gw_op;
+  if (get_gateway_operation_from_tx_extra(tx.extra, gw_op))
+  {
+    if (auto* reg = std::get_if<gateway_address_descriptor_operation_register>(&gw_op.operation))
+    {
+      const crypto::public_key& owner_key = var::get<crypto::public_key>(reg->descriptor.owner_key);
+      remove_gateway_record(owner_key); // gateway_addr == owner_key at registration (see add_transaction)
+    }
+    else if (auto* chg = std::get_if<gateway_address_descriptor_operation_owner_change>(&gw_op.operation))
+    {
+      gateway_tx_entry chg_entry;
+      if (get_gateway_tx_history(tx_hash, chg_entry) && chg_entry.type == 3)
+        update_gateway_owner(chg->gateway_addr, chg_entry.prev_owner_key);
+    }
+  }
+
+  // reverse outputs (these were credits)
+  for (const auto &out : tx.vout)
+  {
+    if (std::holds_alternative<txout_gateway>(out.target))
+    {
+      const txout_gateway &gw = var::get<txout_gateway>(out.target);
+      update_gateway_balance(gw.gateway_addr, gw.asset_id, -static_cast<int64_t>(gw.amount));
+    }
+  }
+
+  // reverse inputs (these were debits)
+  for (const auto &in : tx.vin)
+  {
+    if (std::holds_alternative<txin_gateway>(in))
+    {
+      const txin_gateway &gwi = var::get<txin_gateway>(in);
+      update_gateway_balance(gwi.gateway_addr, gwi.asset_id, static_cast<int64_t>(gwi.amount));
+    }
+  }
+
+  remove_gateway_tx_history(tx_hash);
 
   // need tx as tx.vout has the tx outputs, and the output amounts are needed
   remove_transaction_data(tx_hash, tx);

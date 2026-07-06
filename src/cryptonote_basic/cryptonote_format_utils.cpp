@@ -874,6 +874,79 @@ namespace cryptonote
     add_tx_extra_field_to_tx_extra(tx_extra, field);
   }
   //---------------------------------------------------------------
+  void add_gateway_operation_to_tx_extra(std::vector<uint8_t> &tx_extra, tx_extra_gateway_operation const &entry)
+  {
+    tx_extra_field field = entry;
+    add_tx_extra_field_to_tx_extra(tx_extra, field);
+  }
+  //---------------------------------------------------------------
+  bool get_gateway_operation_from_tx_extra(const std::vector<uint8_t>& tx_extra, tx_extra_gateway_operation& entry)
+  {
+    return get_field_from_tx_extra(tx_extra, entry);
+  }
+  //---------------------------------------------------------------
+  // Deliberately hashes just the operation's own fields, not the transaction prefix hash
+  // of whatever tx it ends up embedded in: the transaction's tx_extra (part of its
+  // prefix) is what *contains* this operation (wrapped in a tx_extra_gateway_operation
+  // alongside the resulting proof), so signing the prefix hash would be circular -- the
+  // prefix can't be finalized until tx_extra (containing the proof) is, but the proof
+  // can't be produced until there's a hash to sign. Hashing only the operation's fields
+  // sidesteps this, mirroring how tx_extra_beldex_name_system signatures are computed
+  // (see beldex_name_system.cpp's tx_extra_signature/verify_bns_signature).
+  crypto::hash hash_gateway_operation(const gateway_address_descriptor_operation_v& operation)
+  {
+    std::string blob = serialization::dump_binary(const_cast<gateway_address_descriptor_operation_v&>(operation));
+    crypto::hash h;
+    crypto::cn_fast_hash(blob.data(), blob.size(), h);
+    return h;
+  }
+  //---------------------------------------------------------------
+  void sign_gateway_ownership_proof(const crypto::hash& operation_hash, const crypto::secret_key& owner_sec, gateway_address_ownership_proof& proof)
+  {
+    crypto::public_key owner_pub;
+    crypto::secret_key_to_public_key(owner_sec, owner_pub);
+    crypto::signature sig;
+    crypto::generate_signature(operation_hash, owner_pub, owner_sec, sig);
+    proof.version = 0;
+    proof.sign = sig;
+  }
+  //---------------------------------------------------------------
+  bool check_gateway_ownership_proof(const crypto::hash& operation_hash, const crypto::public_key& owner_key, const gateway_address_ownership_proof& proof)
+  {
+    const crypto::signature* sig = std::get_if<crypto::signature>(&proof.sign);
+    if (!sig)
+      return false;
+    return crypto::check_signature(operation_hash, owner_key, *sig);
+  }
+  //---------------------------------------------------------------
+  tx_extra_gateway_operation make_gateway_registration(const crypto::secret_key& owner_sec, std::string meta_info)
+  {
+    crypto::public_key owner_pub = crypto::null_pkey;
+    crypto::secret_key_to_public_key(owner_sec, owner_pub);
+
+    gateway_address_descriptor_operation_register reg{};
+    reg.descriptor.owner_key = owner_pub;
+    reg.descriptor.meta_info = std::move(meta_info);
+    reg.view_pub_key = crypto::null_pkey;
+
+    tx_extra_gateway_operation op{};
+    op.operation = reg;
+    sign_gateway_ownership_proof(hash_gateway_operation(op.operation), owner_sec, op.proof);
+    return op;
+  }
+  //---------------------------------------------------------------
+  tx_extra_gateway_operation make_gateway_owner_change(const gateway_address_id_type& gateway_addr, const crypto::secret_key& current_owner_sec, const crypto::public_key& new_owner_key)
+  {
+    gateway_address_descriptor_operation_owner_change chg{};
+    chg.gateway_addr = gateway_addr;
+    chg.new_owner_key = new_owner_key;
+
+    tx_extra_gateway_operation op{};
+    op.operation = chg;
+    sign_gateway_ownership_proof(hash_gateway_operation(op.operation), current_owner_sec, op.proof);
+    return op;
+  }
+  //---------------------------------------------------------------
   bool remove_field_from_tx_extra(std::vector<uint8_t>& tx_extra, const size_t variant_index)
   {
     if (tx_extra.empty())
@@ -960,8 +1033,12 @@ namespace cryptonote
     money = 0;
     for(const auto& in: tx.vin)
     {
-      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, tokey_in, false);
-      money += tokey_in.amount;
+      if (std::holds_alternative<txin_to_key>(in))
+        money += var::get<txin_to_key>(in).amount;
+      else if (std::holds_alternative<txin_gateway>(in))
+        money += var::get<txin_gateway>(in).amount;
+      else
+        return false;
     }
     return true;
   }
@@ -977,8 +1054,19 @@ namespace cryptonote
   {
     for(const auto& in: tx.vin)
     {
+      if (std::holds_alternative<txin_gateway>(in))
+      {
+        const auto& gateway_in = var::get<txin_gateway>(in);
+        if (!check_key(gateway_in.gateway_addr) || !check_key(gateway_in.asset_id) || gateway_in.amount == 0)
+        {
+          CHECK_AND_ASSERT_MES(false, false, "invalid gateway input in transaction id=" << get_transaction_hash(tx));
+        }
+        continue;
+      }
+
       CHECK_AND_ASSERT_MES(std::holds_alternative<txin_to_key>(in), false, "wrong variant type: "
         << tools::type_name(tools::variant_type(in)) << ", expected " << tools::type_name<txin_to_key>()
+        << " or " << tools::type_name<txin_gateway>()
         << ", in transaction id=" << get_transaction_hash(tx));
 
     }
@@ -999,17 +1087,29 @@ namespace cryptonote
 
     for(const tx_out& out: tx.vout)
     {
-      CHECK_AND_ASSERT_MES(std::holds_alternative<txout_to_key>(out.target), false, "wrong variant type: "
-        << tools::type_name(tools::variant_type(out.target)) << ", expected " << tools::type_name<txout_to_key>()
-        << ", in transaction id=" << get_transaction_hash(tx));
-
-      if (tx.version == txversion::v1)
+      if (std::holds_alternative<txout_to_key>(out.target))
       {
-        CHECK_AND_NO_ASSERT_MES(0 < out.amount, false, "zero amount output in transaction id=" << get_transaction_hash(tx));
-      }
+        if (tx.version == txversion::v1)
+        {
+          CHECK_AND_NO_ASSERT_MES(0 < out.amount, false, "zero amount output in transaction id=" << get_transaction_hash(tx));
+        }
 
-      if(!check_key(var::get<txout_to_key>(out.target).key))
-        return false;
+        if(!check_key(var::get<txout_to_key>(out.target).key))
+          return false;
+      }
+      else if (std::holds_alternative<txout_gateway>(out.target))
+      {
+        const auto& gw_out = var::get<txout_gateway>(out.target);
+        if (!check_key(gw_out.gateway_addr) || !check_key(gw_out.asset_id) || gw_out.amount == 0)
+          return false;
+      }
+      else
+      {
+        CHECK_AND_ASSERT_MES(false, false, "wrong variant type: "
+          << tools::type_name(tools::variant_type(out.target)) << ", expected " << tools::type_name<txout_to_key>()
+          << " or " << tools::type_name<txout_gateway>()
+          << ", in transaction id=" << get_transaction_hash(tx));
+      }
     }
     return true;
   }
@@ -1024,10 +1124,16 @@ namespace cryptonote
     uint64_t money = 0;
     for(const auto& in: tx.vin)
     {
-      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, tokey_in, false);
-      if(money > tokey_in.amount + money)
+      uint64_t amount = 0;
+      if (std::holds_alternative<txin_to_key>(in))
+        amount = var::get<txin_to_key>(in).amount;
+      else if (std::holds_alternative<txin_gateway>(in))
+        amount = var::get<txin_gateway>(in).amount;
+      else
         return false;
-      money += tokey_in.amount;
+      if(money > amount + money)
+        return false;
+      money += amount;
     }
     return true;
   }
@@ -1116,7 +1222,11 @@ namespace cryptonote
     size_t i = 0;
     for(const tx_out& o:  tx.vout)
     {
-      CHECK_AND_ASSERT_MES(std::holds_alternative<txout_to_key>(o.target), false, "wrong type id in transaction out" );
+      if (!std::holds_alternative<txout_to_key>(o.target))
+      {
+        ++i;
+        continue;
+      }
       if(is_out_to_acc(acc, var::get<txout_to_key>(o.target), tx_pub_key, additional_tx_pub_keys, i))
       {
         outs.push_back(i);

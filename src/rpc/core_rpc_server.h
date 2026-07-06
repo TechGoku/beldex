@@ -152,6 +152,8 @@ namespace cryptonote::rpc {
     void invoke(GET_LIMIT& limit, rpc_context context);
     void invoke(SET_LIMIT& limit, rpc_context context);
     void invoke(IS_KEY_IMAGE_SPENT& spent, rpc_context context);
+    void invoke(GET_GATEWAY_INFO& info, rpc_context context);
+    void invoke(GET_GATEWAY_TX_HISTORY& history, rpc_context context);
     void invoke(SUBMIT_TRANSACTION& tx, rpc_context context);
     void invoke(GET_BLOCK_HASH& req, rpc_context context);
     void invoke(GET_PEER_LIST& pl, rpc_context context);

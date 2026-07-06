@@ -8950,6 +8950,146 @@ std::vector<wallet2::pending_tx> wallet2::bns_create_buy_mapping_tx(bns::mapping
   return result;
 }
 
+std::vector<wallet2::pending_tx> wallet2::create_gateway_registration_tx(const std::string& meta_info,
+                                                                          crypto::secret_key& out_owner_sec,
+                                                                          crypto::public_key& out_owner_pub,
+                                                                          std::string* reason,
+                                                                          uint32_t priority,
+                                                                          uint32_t account_index,
+                                                                          std::set<uint32_t> subaddr_indices)
+{
+  auto hf_version = get_hard_fork_version();
+  if (!hf_version)
+  {
+    if (reason) *reason = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+    return {};
+  }
+
+  if (*hf_version < feature::GATEWAY_ADDRESSES)
+  {
+    if (reason) *reason = "Gateway addresses are not available on this network yet";
+    return {};
+  }
+
+  crypto::generate_keys(out_owner_pub, out_owner_sec);
+  tx_extra_gateway_operation op = make_gateway_registration(out_owner_sec, meta_info);
+
+  std::vector<uint8_t> extra;
+  add_gateway_operation_to_tx_extra(extra, op);
+
+  // Registration carries no real value transfer of its own; send a minimal amount to our
+  // own primary address to produce a normal, fee-paying, signed transaction that the
+  // operation rides along on (this tx is a normal txtype::standard tx, unlike BNS/burn --
+  // see Blockchain::check_tx_inputs, which only exempts it from the MIN_2_OUTPUTS rule).
+  std::vector<cryptonote::tx_destination_entry> dsts{
+      cryptonote::tx_destination_entry{1, get_address(), false}};
+
+  beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::standard, priority, 0);
+  return create_transactions_2(dsts,
+                                cryptonote::TX_OUTPUT_DECOYS,
+                                0 /*unlock_at_block*/,
+                                priority,
+                                extra,
+                                account_index,
+                                subaddr_indices,
+                                tx_params);
+}
+
+std::vector<wallet2::pending_tx> wallet2::create_gateway_owner_change_tx(const crypto::public_key& gateway_addr,
+                                                                          const crypto::secret_key& current_owner_sec,
+                                                                          const crypto::public_key& new_owner_key,
+                                                                          std::string* reason,
+                                                                          uint32_t priority,
+                                                                          uint32_t account_index,
+                                                                          std::set<uint32_t> subaddr_indices)
+{
+  auto hf_version = get_hard_fork_version();
+  if (!hf_version)
+  {
+    if (reason) *reason = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+    return {};
+  }
+
+  if (*hf_version < feature::GATEWAY_ADDRESSES)
+  {
+    if (reason) *reason = "Gateway addresses are not available on this network yet";
+    return {};
+  }
+
+  tx_extra_gateway_operation op = make_gateway_owner_change(gateway_addr, current_owner_sec, new_owner_key);
+
+  std::vector<uint8_t> extra;
+  add_gateway_operation_to_tx_extra(extra, op);
+
+  std::vector<cryptonote::tx_destination_entry> dsts{
+      cryptonote::tx_destination_entry{1, get_address(), false}};
+
+  beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::standard, priority, 0);
+  return create_transactions_2(dsts,
+                                cryptonote::TX_OUTPUT_DECOYS,
+                                0 /*unlock_at_block*/,
+                                priority,
+                                extra,
+                                account_index,
+                                subaddr_indices,
+                                tx_params);
+}
+
+wallet2::gateway_info_result wallet2::get_gateway_info(const crypto::public_key& gateway_address_id, const std::optional<crypto::public_key>& asset_id)
+{
+  nlohmann::json req_params{
+    {"gateway_address_id", tools::type_to_hex(gateway_address_id)}
+  };
+  if (asset_id)
+    req_params["asset_id"] = tools::type_to_hex(*asset_id);
+
+  auto res = m_http_client.json_rpc("get_gateway_info", req_params);
+  THROW_WALLET_EXCEPTION_IF(res["status"] == rpc::STATUS_BUSY, error::daemon_busy, "get_gateway_info");
+  THROW_WALLET_EXCEPTION_IF(res["status"] != rpc::STATUS_OK, error::wallet_internal_error, "get_gateway_info failed: " + get_rpc_status(res["status"]));
+
+  gateway_info_result result;
+  result.found = res.value("found", false);
+  if (result.found)
+  {
+    result.owner_key = res.value("owner_key", std::string());
+    result.meta_info = res.value("meta_info", std::string());
+    result.creation_height = res.value("creation_height", uint64_t(0));
+    if (res.contains("balance"))
+      result.balance = res["balance"].get<uint64_t>();
+  }
+  return result;
+}
+
+std::vector<wallet2::gateway_tx_history_entry> wallet2::get_gateway_tx_history(const std::vector<crypto::hash>& tx_hashes)
+{
+  auto hashes_json = nlohmann::json::array();
+  for (const auto& h : tx_hashes)
+    hashes_json.push_back(tools::type_to_hex(h));
+
+  nlohmann::json req_params{{"tx_hashes", std::move(hashes_json)}};
+  auto res = m_http_client.json_rpc("get_gateway_tx_history", req_params);
+  THROW_WALLET_EXCEPTION_IF(res["status"] == rpc::STATUS_BUSY, error::daemon_busy, "get_gateway_tx_history");
+  THROW_WALLET_EXCEPTION_IF(res["status"] != rpc::STATUS_OK, error::wallet_internal_error, "get_gateway_tx_history failed: " + get_rpc_status(res["status"]));
+
+  std::vector<gateway_tx_history_entry> results;
+  results.reserve(tx_hashes.size());
+  for (const auto& e : res["entries"])
+  {
+    gateway_tx_history_entry entry;
+    if (!e.is_null())
+    {
+      entry.found = true;
+      entry.type = e.value("type", uint8_t(0));
+      entry.gateway_address_id = e.value("gateway_address_id", std::string());
+      entry.asset_id = e.value("asset_id", std::string());
+      entry.amount = e.value("amount", uint64_t(0));
+      entry.height = e.value("height", uint64_t(0));
+    }
+    results.push_back(std::move(entry));
+  }
+  return results;
+}
+
 std::optional<bns::mapping_years> wallet2::bns_validate_years(std::string_view map_years, std::string *reason)
 {
   if (!map_years.empty())

@@ -29,6 +29,7 @@
 
 add_library(cryptonote_core
   blockchain.cpp
+  gateway_validation.cpp
   cryptonote_core.cpp
   master_node_rules.cpp
   master_node_list.cpp

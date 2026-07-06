@@ -356,6 +356,67 @@ namespace cryptonote::rpc {
     } request;
   };
 
+  /// RPC: blockchain/get_gateway_info
+  ///
+  /// Looks up the on-chain registration record and (optionally) the balance for a gateway
+  /// address. NOTE: gateway registration/transfer transactions are not yet accepted by
+  /// consensus, so today this can only ever return data written directly at the storage
+  /// layer (e.g. by tests); it exposes whatever the DB has recorded, nothing more.
+  ///
+  /// Inputs:
+  ///
+  /// - `gateway_address_id` -- the gateway address' identifying public key (hex).
+  /// - `asset_id` -- (optional) asset public key (hex); if given, the balance for this asset
+  ///   is also returned.
+  ///
+  /// Outputs:
+  ///
+  /// - `status` -- General RPC status string. `"OK"` means the request was processed
+  ///   (regardless of whether the gateway address was found -- check `found`).
+  /// - `found` -- whether a registration record exists for `gateway_address_id`.
+  /// - `owner_key` -- (only present if `found`) hex-encoded owner public key.
+  /// - `meta_info` -- (only present if `found`) descriptor metadata string.
+  /// - `creation_height` -- (only present if `found`) block height the record was created at.
+  /// - `balance` -- (only present if `found` and `asset_id` was given) balance for that asset.
+  struct GET_GATEWAY_INFO : PUBLIC, LEGACY
+  {
+    static constexpr auto names() { return NAMES("get_gateway_info"); }
+
+    struct request_parameters {
+      crypto::public_key gateway_address_id;
+      std::optional<crypto::public_key> asset_id;
+    } request;
+  };
+
+  /// RPC: blockchain/get_gateway_tx_history
+  ///
+  /// Looks up recorded gateway operation history entries by transaction hash. The gateway
+  /// history table is indexed by transaction hash only (not by gateway address), so callers
+  /// must already know which transaction hashes to query -- e.g. transactions they submitted
+  /// themselves.
+  ///
+  /// Inputs:
+  ///
+  /// - `tx_hashes` -- list of transaction hashes (hex) to look up.
+  ///
+  /// Outputs:
+  ///
+  /// - `status` -- General RPC status string. `"OK"` means everything looks good.
+  /// - `entries` -- array with one element per input tx hash, in the same order. Each element
+  ///   is `null` if no gateway history was recorded for that tx hash, otherwise a dict with:
+  ///   - `type` -- `1` for a gateway transfer/credit, `2` for a withdraw/debit.
+  ///   - `gateway_address_id` -- hex-encoded gateway address public key.
+  ///   - `asset_id` -- hex-encoded asset public key.
+  ///   - `amount` -- the amount recorded for this operation.
+  ///   - `height` -- block height the entry was recorded at.
+  struct GET_GATEWAY_TX_HISTORY : PUBLIC, LEGACY
+  {
+    static constexpr auto names() { return NAMES("get_gateway_tx_history"); }
+
+    struct request_parameters {
+      std::vector<crypto::hash> tx_hashes;
+    } request;
+  };
 
   /// RPC: blockchain/get_outs
   ///
@@ -2672,6 +2733,8 @@ namespace cryptonote::rpc {
     GET_ALTERNATE_CHAINS,
     GET_BANS,
     GET_FEE_ESTIMATE,
+    GET_GATEWAY_INFO,
+    GET_GATEWAY_TX_HISTORY,
     GET_BLOCK,
     GET_BLOCK_COUNT,
     GET_BLOCK_HASH,

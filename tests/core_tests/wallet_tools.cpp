@@ -219,19 +219,21 @@ void wallet_tools::gen_block_data(block_tracker &bt, const cryptonote::block *bl
   parsed_block.block = *bl;
   parsed_block.txes.reserve(bl->tx_hashes.size());
 
-  auto & o_indices = parsed_block.o_indices.indices;
-  o_indices.reserve(bl->tx_hashes.size() + 1);
+  cryptonote::rpc::GET_BLOCKS_BIN::block_output_indices boi;
+  boi.indices.reserve(bl->tx_hashes.size() + 1);
 
   size_t cur = 0;
   for (const transaction *tx : vtx){
     cur += 1;
-    o_indices.emplace_back();
+    cryptonote::rpc::GET_BLOCKS_BIN::tx_output_indices toi;
     bt.process(bl, tx, cur - 1);
-    bt.global_indices(tx, o_indices.back().indices);
+    bt.global_indices(tx, toi.indices);
+    boi.indices.push_back(std::move(toi));
 
     if (cur > 1)  // miner not included
       parsed_block.txes.push_back(*tx);
   }
+  parsed_block.o_indices = boi;
 }
 
 void wallet_tools::compute_subaddresses(std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses, cryptonote::account_base & creds, size_t account, size_t minors)

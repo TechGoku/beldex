@@ -141,6 +141,57 @@ namespace boost
   }
 
   template <class Archive>
+  inline void serialize(Archive &a, cryptonote::txin_gateway &x, const boost::serialization::version_type ver)
+  {
+    a & x.version;
+    a & x.gateway_addr;
+    a & x.asset_id;
+    a & x.amount;
+    a & x.owner_proof;
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::txout_gateway &x, const boost::serialization::version_type ver)
+  {
+    a & x.version;
+    a & x.gateway_addr;
+    a & x.asset_id;
+    a & x.amount;
+    a & x.payment_id;
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::gateway_address_descriptor_base &x, const boost::serialization::version_type ver)
+  {
+    a & x.version;
+    a & x.owner_key;
+    a & x.meta_info;
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::gateway_address_descriptor_operation_register &x, const boost::serialization::version_type ver)
+  {
+    a & x.version;
+    a & x.descriptor;
+    a & x.view_pub_key;
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::gateway_address_descriptor_operation_owner_change &x, const boost::serialization::version_type ver)
+  {
+    a & x.version;
+    a & x.gateway_addr;
+    a & x.new_owner_key;
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::gateway_address_ownership_proof &x, const boost::serialization::version_type ver)
+  {
+    a & x.version;
+    a & x.sign;
+  }
+
+  template <class Archive>
   inline void serialize(Archive &a, cryptonote::tx_out &x, const boost::serialization::version_type ver)
   {
     a & x.amount;

@@ -76,6 +76,7 @@ add_executable(unit_tests
   string_util.cpp
   subaddress.cpp
   test_tx_utils.cpp
+  gateway_consensus.cpp
   test_peerlist.cpp
   test_protocol_pack.cpp
   threadpool.cpp
@@ -102,7 +103,7 @@ target_link_libraries(unit_tests
     p2p
     version
     Boost::thread
-    gtest
+    gtest_main
     extra)
 set_property(TARGET unit_tests
   PROPERTY
@@ -123,6 +124,35 @@ add_test(
   NAME    unit_tests
   COMMAND unit_tests --data-dir "${TEST_DATA_DIR}")
 
+# Focused gateway tests target to avoid building the entire unit_tests suite
+add_executable(gateway_unit_tests
+  gateway_consensus.cpp
+  gateway_registration_consensus.cpp
+  gateway_reorg.cpp
+  main.cpp
+  test_gateway_db.cpp
+  test_gateway_rpc.cpp)
+target_link_libraries(gateway_unit_tests
+  PRIVATE
+    ringct
+    cryptonote_protocol
+    cryptonote_core
+    blockchain_db
+    lmdb_lib
+    rpc
+    net
+    wallet
+    p2p
+    version
+    Boost::thread
+    gtest
+    extra)
+set_property(TARGET gateway_unit_tests
+  PROPERTY
+    FOLDER "tests")
+add_test(
+  NAME gateway_unit_tests
+  COMMAND gateway_unit_tests --data-dir "${TEST_DATA_DIR}")
 add_executable(test_notifier test_notifier.cpp)
 target_link_libraries(test_notifier extra)
 set_property(TARGET test_notifier PROPERTY FOLDER "tests")

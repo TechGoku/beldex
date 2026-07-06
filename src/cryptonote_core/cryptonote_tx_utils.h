@@ -144,6 +144,7 @@ namespace cryptonote
     bool rct;                           //true if the output is rct
     rct::key mask;                      //ringct amount mask
     rct::multisig_kLRki multisig_kLRki; //multisig info
+    std::optional<gateway_address_id_type> gateway_origin;
 
     void push_output(uint64_t idx, const crypto::public_key &k, uint64_t amount) { outputs.push_back(std::make_pair(idx, rct::ctkey({rct::pk2rct(k), rct::zeroCommit(amount)}))); }
 
@@ -157,6 +158,7 @@ namespace cryptonote
       FIELD(rct)
       FIELD(mask)
       FIELD(multisig_kLRki)
+      FIELD(gateway_origin)
 
       if (real_output >= outputs.size())
         throw std::invalid_argument{"invalid real_output size"};
@@ -170,6 +172,7 @@ namespace cryptonote
     account_public_address addr;        // Destination Address
     bool is_subaddress;
     bool is_integrated;
+    std::optional<gateway_address_id_type> gateway_address;
 
     tx_destination_entry() : amount(0), addr{}, is_subaddress(false), is_integrated(false) { }
     tx_destination_entry(uint64_t a, const account_public_address &ad, bool is_subaddress) : amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false) { }
@@ -201,6 +204,7 @@ namespace cryptonote
       FIELD(addr)
       FIELD(is_subaddress)
       FIELD(is_integrated)
+      FIELD(gateway_address)
     END_SERIALIZE()
   };
 

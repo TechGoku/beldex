@@ -149,6 +149,29 @@ namespace cryptonote
 
   void add_beldex_name_system_to_tx_extra(std::vector<uint8_t> &tx_extra, tx_extra_beldex_name_system const &entry);
 
+  void add_gateway_operation_to_tx_extra(std::vector<uint8_t> &tx_extra, tx_extra_gateway_operation const &entry);
+  bool get_gateway_operation_from_tx_extra(const std::vector<uint8_t>& tx_extra, tx_extra_gateway_operation& entry);
+
+  // Hashes a gateway_address_descriptor_operation_v's own fields (not any transaction
+  // it's embedded in -- see the .cpp for why that matters) for signing/verification.
+  crypto::hash hash_gateway_operation(const gateway_address_descriptor_operation_v& operation);
+
+  // Signs/checks a gateway_address_ownership_proof over the given hash (normally the
+  // result of hash_gateway_operation()). The proof authorizes whatever it's attached to
+  // (a registration or owner-change operation) as coming from the holder of
+  // `owner_sec`/`owner_key`.
+  void sign_gateway_ownership_proof(const crypto::hash& operation_hash, const crypto::secret_key& owner_sec, gateway_address_ownership_proof& proof);
+  bool check_gateway_ownership_proof(const crypto::hash& operation_hash, const crypto::public_key& owner_key, const gateway_address_ownership_proof& proof);
+
+  // Builds a signed, ready-to-embed gateway registration operation for a brand new
+  // gateway address. The address is bootstrapped as its own first owner (gateway_addr ==
+  // owner_key derived from owner_sec) -- see Blockchain::check_tx_inputs for why.
+  tx_extra_gateway_operation make_gateway_registration(const crypto::secret_key& owner_sec, std::string meta_info);
+
+  // Builds a signed, ready-to-embed owner-change operation for an existing gateway
+  // address, signed by its *current* owner's secret key.
+  tx_extra_gateway_operation make_gateway_owner_change(const gateway_address_id_type& gateway_addr, const crypto::secret_key& current_owner_sec, const crypto::public_key& new_owner_key);
+
   crypto::hash make_security_hash_from(size_t block_height, const block& b);
   bool get_security_signature_from_tx_extra(const std::vector<uint8_t>& tx_extra, crypto::signature& security_signature);
   bool add_security_signature_to_tx_extra(std::vector<uint8_t>& tx_extra, const crypto::signature& signature);

@@ -205,6 +205,30 @@ enum class hf : uint8_t
     hf19_enhance_bns, // provided EVM address in BNS
     hf20_bulletproof_plus,
     hf21_bulletproof_plus,
+    hf22_gateway_addresses,   // Gateway address registration/owner-change consensus rules
+                              // (real spends from/to a gateway address are still
+                              // unconditionally rejected regardless of this hf -- see
+                              // hf23_gateway_transfers below). Scheduled in
+                              // mainnet_hard_forks/testnet_hard_forks/devnet_hard_forks
+                              // (hardfork.cpp) at a deliberately far-future mainnet height
+                              // so it stays inert there until reviewed; testnet/devnet are
+                              // scheduled near-term for real testing.
+    hf23_gateway_transfers,   // RESERVED, not implemented: real spends from/to a gateway
+                              // address (txin_gateway/txout_gateway), which requires
+                              // folding gateway amounts into the RingCT Pedersen
+                              // commitment balance equation -- see GATEWAY_CHANGES_SUMMARY.md
+                              // §2/§5 for the proposed mechanism. Deliberately kept as its
+                              // own hardfork, separate from hf22, so a problem in this
+                              // much higher-risk piece never blocks hf22 from activating.
+                              // Not scheduled on any network.
+    hf24_gateway_confidential_assets, // RESERVED, not implemented, not designed beyond the
+                              // storage layer: hidden/blinded gateway asset amounts (as
+                              // opposed to hf23's transparent-but-commitment-balanced
+                              // amounts). The gateway_records/gateway_balances/
+                              // gateway_tx_history on-disk schemas (gateway_storage.h) were
+                              // already made version-tagged so this can reuse those same
+                              // tables later without another migration. Not scheduled on
+                              // any network.
 
     _next,
     none = 0
@@ -236,6 +260,9 @@ namespace feature {
   constexpr auto CLSAG                        = hf::hf15_flash;
   constexpr auto PROOF_BTENC                  = hf::hf18_bns;
   constexpr auto BULLETPROOF_PLUS             = hf::hf20_bulletproof_plus;
+  constexpr auto GATEWAY_ADDRESSES             = hf::hf22_gateway_addresses;
+  constexpr auto GATEWAY_TRANSFERS             = hf::hf23_gateway_transfers;            // RESERVED, not implemented
+  constexpr auto GATEWAY_CONFIDENTIAL_ASSETS   = hf::hf24_gateway_confidential_assets;   // RESERVED, not implemented
 }
 
 enum network_type : uint8_t

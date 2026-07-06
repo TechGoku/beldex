@@ -63,6 +63,7 @@ constexpr uint8_t
   TX_EXTRA_TAG_MASTER_NODE_STATE_CHANGE  = 0x78,
   TX_EXTRA_TAG_BURN                       = 0x79,
   TX_EXTRA_TAG_BELDEX_NAME_SYSTEM           = 0x7A,
+  TX_EXTRA_TAG_GATEWAY_OPERATION           = 0x7B,
   TX_EXTRA_TAG_SECURITY_SIGNATURE          = 0x88,
   TX_EXTRA_MYSTERIOUS_MINERGATE_TAG       = 0xDE;
 
@@ -619,6 +620,30 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
+  // Carries a gateway address registration or owner-change operation. `proof` must be a
+  // valid signature (checked at consensus time -- see Blockchain::check_tx_inputs) over
+  // this transaction's prefix hash:
+  //  - for a registration operation, signed by the private key matching
+  //    `operation.descriptor.owner_key` (the gateway address is bootstrapped as its own
+  //    initial owner: the registrant must prove they hold that key before claiming the
+  //    gateway_addr identifier, which prevents squatting on an address someone else
+  //    controls).
+  //  - for an owner-change operation, signed by the private key matching the *current*
+  //    owner_key already on file for `operation.gateway_addr` (proving the current owner
+  //    authorized handing control to `new_owner_key`).
+  struct tx_extra_gateway_operation
+  {
+    uint8_t version = 0;
+    gateway_address_descriptor_operation_v operation;
+    gateway_address_ownership_proof proof;
+
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(version)
+      FIELD(operation)
+      FIELD(proof)
+    END_SERIALIZE()
+  };
+
   // tx_extra_field format, except tx_extra_padding and tx_extra_pub_key:
   //   varint tag;
   //   varint size;
@@ -645,7 +670,8 @@ namespace cryptonote
       tx_extra_merge_mining_tag,
       tx_extra_mysterious_minergate,
       tx_extra_padding,
-      tx_extra_security_signature
+      tx_extra_security_signature,
+      tx_extra_gateway_operation
       >;
 }
 
@@ -670,3 +696,4 @@ BINARY_VARIANT_TAG(cryptonote::tx_extra_tx_key_image_unlock,         cryptonote:
 BINARY_VARIANT_TAG(cryptonote::tx_extra_burn,                        cryptonote::TX_EXTRA_TAG_BURN);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_beldex_name_system,            cryptonote::TX_EXTRA_TAG_BELDEX_NAME_SYSTEM);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_security_signature,            cryptonote::TX_EXTRA_TAG_SECURITY_SIGNATURE);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_operation,             cryptonote::TX_EXTRA_TAG_GATEWAY_OPERATION);

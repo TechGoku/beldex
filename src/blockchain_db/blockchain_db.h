@@ -39,6 +39,7 @@
 #include "cryptonote_basic/blobdatatype.h"
 #include "cryptonote_basic/cryptonote_basic.h"
 #include "cryptonote_basic/difficulty.h"
+#include "cryptonote_core/gateway_storage.h"
 
 /** \file
  * Cryptonote Blockchain Database Interface
@@ -1822,6 +1823,25 @@ public:
   /// Removes stored serialized proof mn data associated with the given pubkey.  Returns true if
   /// found, false if not found.
   virtual bool remove_master_node_proof(const crypto::public_key &pubkey) = 0;
+
+  /************************************************************************/
+  /* Gateway storage API                                                   */
+  /************************************************************************/
+  virtual void add_gateway_record(const gateway_record &r) { throw DB_ERROR("add_gateway_record not implemented"); }
+  virtual bool get_gateway_record(const gateway_address_id_type &id, gateway_record &r) const { return false; }
+  virtual void remove_gateway_record(const gateway_address_id_type &id) { throw DB_ERROR("remove_gateway_record not implemented"); }
+  virtual void update_gateway_owner(const gateway_address_id_type &id, const crypto::public_key &new_owner_key) { throw DB_ERROR("update_gateway_owner not implemented"); }
+
+  virtual void update_gateway_balance(const gateway_address_id_type &id, const crypto::public_key &asset_id, int64_t delta) { throw DB_ERROR("update_gateway_balance not implemented"); }
+  virtual uint64_t get_gateway_balance(const gateway_address_id_type &id, const crypto::public_key &asset_id) const { return 0; }
+
+  virtual void add_gateway_tx_history(const crypto::hash &tx_hash, const gateway_tx_entry &entry) { throw DB_ERROR("add_gateway_tx_history not implemented"); }
+  virtual bool get_gateway_tx_history(const crypto::hash &tx_hash, gateway_tx_entry &entry) const { return false; }
+  // A tx can carry more than one gateway event (e.g. a transfer is a debit and a credit
+  // in the same tx); this returns all of them, in the order they were added.
+  virtual bool get_gateway_tx_history_all(const crypto::hash &tx_hash, std::vector<gateway_tx_entry> &entries) const { entries.clear(); return false; }
+  virtual void remove_gateway_tx_history(const crypto::hash &tx_hash) { throw DB_ERROR("remove_gateway_tx_history not implemented"); }
+
 
   // This function accepts an empty timestamps/difficulties array to fill, or
   // a prior timestamps/difficulties array that was filled by a previous call to

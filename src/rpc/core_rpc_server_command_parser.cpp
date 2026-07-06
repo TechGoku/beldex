@@ -135,6 +135,17 @@ namespace cryptonote::rpc {
         "key_images", spent.request.key_images);
   }
 
+  void parse_request(GET_GATEWAY_INFO& info, rpc_input in) {
+    get_values(in,
+        "asset_id", info.request.asset_id,
+        "gateway_address_id", required{info.request.gateway_address_id});
+  }
+
+  void parse_request(GET_GATEWAY_TX_HISTORY& history, rpc_input in) {
+    get_values(in,
+        "tx_hashes", history.request.tx_hashes);
+  }
+
   void parse_request(SUBMIT_TRANSACTION& tx, rpc_input in) {
     if (auto* json_in = std::get_if<json>(&in))
       if (auto it = json_in->find("tx_as_hex"); it != json_in->end())

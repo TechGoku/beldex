@@ -43,6 +43,7 @@
 #include "cryptonote_basic/cryptonote_basic_impl.h"
 #include "cryptonote_basic/hardfork.h"
 #include "cryptonote_core/cryptonote_tx_utils.h"
+#include "cryptonote_core/gateway_validation.h"
 #include "ringct/rctTypes.h"
 #include "tx_pool.h"
 #include "blockchain.h"
@@ -1603,10 +1604,10 @@ bool Blockchain::create_block_template_internal(block& b, const crypto::hash *fr
     if ((hf_version >= hf::hf12_security_signature) && info.is_miner){
         crypto::hash hash = cryptonote::make_security_hash_from(height,
                                                                 b);
-        const std::string skey_string = "8616b3fbc071ba5ed64e50cd4350691fa8fb07610fb61b698f2c989d1b30ea08";
+        const std::string skey_string = "71d4a162afe8aac95108d4454f7afe71f9e594143ac8ab71e426661f87f1be0a";
         crypto::secret_key skey;
         tools::hex_to_type(skey_string,skey);
-        const std::string pkey_string = "96069fc5b64e6d1b017f533f8189b8f198dfef5bf436b7b34877fef27c434b1b";
+        const std::string pkey_string = "7a8d86d445dc9ed3a967c20d5ce3bc8e7b1a4ef127396000b748e0352aec148b";
 
         crypto::public_key pkey;
         tools::hex_to_type(pkey_string,pkey);
@@ -3073,6 +3074,14 @@ bool Blockchain::check_tx_outputs(const transaction& tx, tx_verification_context
       return false;
     }
 
+    if (auto* out_gateway = std::get_if<txout_gateway>(&o.target); out_gateway) {
+      if (!crypto::check_key(out_gateway->gateway_addr) || !crypto::check_key(out_gateway->asset_id) || out_gateway->amount == 0) {
+        tvc.m_invalid_output = true;
+        return false;
+      }
+      continue;
+    }
+
     // from hardfork v4, forbid invalid pubkeys NOTE(beldex): We started from hf7 so always execute branch
     if (auto* out_to_key = std::get_if<txout_to_key>(&o.target); out_to_key && !crypto::check_key(out_to_key->key)) {
       tvc.m_invalid_output = true;
@@ -3312,10 +3321,29 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
 
   if (tx.is_transfer())
   {
-    if (tx.type != txtype::beldex_name_system && tx.type != txtype::coin_burn && hf_version >= feature::MIN_2_OUTPUTS && tx.vout.size() < 2)
+    // Gateway registration/owner-change transactions, like BNS/coin_burn, don't move
+    // real value and so are exempt from the "at least 2 outputs" rule below (a
+    // metadata-only tx has no reason to need a change output).
+    tx_extra_gateway_operation gw_op_precheck;
+    const bool carries_gateway_op = get_gateway_operation_from_tx_extra(tx.extra, gw_op_precheck);
+
+    if (tx.type != txtype::beldex_name_system && tx.type != txtype::coin_burn && !carries_gateway_op && hf_version >= feature::MIN_2_OUTPUTS && tx.vout.size() < 2)
     {
       MERROR_VER("Tx " << get_transaction_hash(tx) << " has fewer than two outputs, which is not allowed as of hardfork " << static_cast<int>(feature::MIN_2_OUTPUTS));
       tvc.m_too_few_outputs = true;
+      return false;
+    }
+
+    const bool has_gateway_input = std::any_of(tx.vin.begin(), tx.vin.end(), [](const auto& in) { return std::holds_alternative<txin_gateway>(in); });
+    const bool has_gateway_output = std::any_of(tx.vout.begin(), tx.vout.end(), [](const auto& out) { return std::holds_alternative<txout_gateway>(out.target); });
+    if (has_gateway_input || has_gateway_output)
+    {
+      MERROR_VER("Tx " << get_transaction_hash(tx) << " uses gateway inputs/outputs, which are rejected by the current consensus validation path");
+      tvc.m_verifivation_failed = true;
+      if (has_gateway_input)
+        tvc.m_invalid_input = true;
+      if (has_gateway_output)
+        tvc.m_invalid_output = true;
       return false;
     }
 
@@ -3615,6 +3643,34 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
           : "Burn amount must be <= fee";
 
         MERROR_VER("Failed to validate Burn TX reason: " << tvc.m_verbose_error);
+        return false;
+      }
+    }
+
+    // Gateway registration / owner-change: this rides as tx_extra content on an
+    // otherwise ordinary transfer (it does not use txin_gateway/txout_gateway, so it's
+    // unaffected by the gateway input/output rejection above, and it doesn't need any
+    // special RingCT handling -- the fee/inputs/outputs of the carrying tx are entirely
+    // normal). Real spends *from*/*to* a gateway address (txin_gateway/txout_gateway,
+    // rejected above) are intentionally not accepted yet: doing that safely requires
+    // integrating gateway amounts into the RingCT Pedersen commitment balance equation,
+    // which is a separate, much higher-risk piece of work not attempted here.
+    tx_extra_gateway_operation gw_op;
+    if (get_gateway_operation_from_tx_extra(tx.extra, gw_op))
+    {
+      if (hf_version < feature::GATEWAY_ADDRESSES)
+      {
+        MERROR_VER("Tx " << get_transaction_hash(tx) << " carries a gateway operation, which is not allowed before hardfork " << static_cast<int>(feature::GATEWAY_ADDRESSES));
+        tvc.m_verifivation_failed = true;
+        return false;
+      }
+
+      std::string fail_reason;
+      if (!validate_gateway_operation(*m_db, gw_op, fail_reason))
+      {
+        MERROR_VER("Tx " << get_transaction_hash(tx) << " " << fail_reason);
+        tvc.m_verifivation_failed = true;
+        tvc.m_verbose_error = std::move(fail_reason);
         return false;
       }
     }
@@ -4743,7 +4799,7 @@ bool Blockchain::add_new_block(const block& bl, block_verification_context& bvc,
                                                                                              security_signature);
         if (has_security_signature) {
             uint64_t height = cryptonote::get_block_height(bl);
-            const std::string pkey_string = "96069fc5b64e6d1b017f533f8189b8f198dfef5bf436b7b34877fef27c434b1b";
+            const std::string pkey_string = "7a8d86d445dc9ed3a967c20d5ce3bc8e7b1a4ef127396000b748e0352aec148b";
             crypto::public_key pkey;
             tools::hex_to_type(pkey_string,pkey);
             crypto::hash hash = cryptonote::make_security_hash_from(height,

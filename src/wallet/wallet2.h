@@ -1418,6 +1418,48 @@ private:
     // Generate just the signature required for putting into bns_update_mapping command in the wallet
     bool bns_make_update_mapping_signature(std::string name, std::string const *value_bchat, std::string const *value_wallet, std::string const *value_belnet, std::string const *value_eth_addr, std::string const *owner, std::string const *backup_owner, bns::generic_signature &signature, uint32_t account_index = 0, std::string *reason = nullptr);
 
+    // Builds and signs a gateway address registration transaction (see
+    // cryptonote_basic/cryptonote_format_utils.h's make_gateway_registration, and
+    // Blockchain::check_tx_inputs' hf22_gateway_addresses-gated acceptance logic). A
+    // fresh gateway keypair is generated and returned via `out_owner_sec`/`out_owner_pub`
+    // -- the gateway's address becomes its own first owner (see the design note in
+    // gateway_validation.h for why). Returns an empty vector and sets `*reason` on
+    // failure (e.g. hardfork not active yet).
+    std::vector<pending_tx> create_gateway_registration_tx(const std::string& meta_info, crypto::secret_key& out_owner_sec, crypto::public_key& out_owner_pub, std::string* reason = nullptr, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+
+    // Builds and signs a gateway owner-change transaction, signed by the current owner's
+    // secret key (the caller must already know/hold this -- gateway ownership is managed
+    // independently of the wallet's own account keys).
+    std::vector<pending_tx> create_gateway_owner_change_tx(const crypto::public_key& gateway_addr, const crypto::secret_key& current_owner_sec, const crypto::public_key& new_owner_key, std::string* reason = nullptr, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+
+    // Thin read-only wrappers around the daemon's get_gateway_info/get_gateway_tx_history
+    // RPCs (src/rpc/core_rpc_server_commands_defs.h) -- no consensus/signing involved,
+    // safe to call regardless of whether hf22_gateway_addresses is active anywhere (they
+    // just report `found: false` until it is). Thrown exceptions indicate an RPC-level
+    // failure (daemon busy/unreachable), not "not found" -- that's `.found == false`.
+    struct gateway_info_result
+    {
+      bool found = false;
+      std::string owner_key;         // hex; meaningful only if found
+      std::string meta_info;         // meaningful only if found
+      uint64_t creation_height = 0;  // meaningful only if found
+      std::optional<uint64_t> balance; // set only if an asset_id was given and found
+    };
+    gateway_info_result get_gateway_info(const crypto::public_key& gateway_address_id, const std::optional<crypto::public_key>& asset_id = std::nullopt);
+
+    struct gateway_tx_history_entry
+    {
+      bool found = false;
+      uint8_t type = 0; // 0=register, 1=transfer/credit, 2=withdraw/debit, 3=owner_change
+      std::string gateway_address_id; // hex; meaningful only if found
+      std::string asset_id;           // hex; meaningful only if found
+      uint64_t amount = 0;
+      uint64_t height = 0;
+    };
+    // Returns one entry per input hash, in the same order (entry.found == false where
+    // the daemon has no record for that hash).
+    std::vector<gateway_tx_history_entry> get_gateway_tx_history(const std::vector<crypto::hash>& tx_hashes);
+
     void freeze(size_t idx);
     void thaw(size_t idx);
     bool frozen(size_t idx) const;

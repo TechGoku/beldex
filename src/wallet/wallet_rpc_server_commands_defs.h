@@ -2585,7 +2585,173 @@ This command is only required if the open wallet is one of the owners of a BNS r
       KV_MAP_SERIALIZABLE
     };
   };
-  
+
+  BELDEX_RPC_DOC_INTROSPECT
+  // Registers a new gateway address. NOTE: gateway addresses are a new feature gated by
+  // hardfork hf22_gateway_addresses, scheduled near-term on testnet/devnet but at a
+  // deliberately far-future placeholder height on mainnet pending security review (see
+  // GATEWAY_NEXT_STEPS_CHECKLIST.md) -- this will fail with an error on any network
+  // where that hardfork isn't active yet.
+  struct GATEWAY_REGISTER : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_register"); }
+
+    static constexpr const char *description =
+R"(Registers a new gateway address: a special on-chain identity that can hold a balance
+and (once fully supported) act as a controlled transfer origin, distinct from a normal
+wallet account.
+
+A fresh gateway keypair is generated for the new address; it is returned in the response
+as `gateway_owner_secret_key`. This secret key is NOT stored by the wallet -- it is the
+only credential that can later change the gateway's ownership (via gateway_change_owner),
+and, once transfers are supported, spend from it. The caller is responsible for storing it
+securely; if it's lost, control of the gateway address is lost permanently.)";
+
+    struct request
+    {
+      std::string        meta_info;        // Free-form metadata to attach to the registration.
+      uint32_t           account_index;    // (Optional) Pay the registration fee from this account index. (Defaults to 0)
+      std::set<uint32_t> subaddr_indices;  // (Optional) Pay the registration fee from this set of subaddresses. (Defaults to 0)
+      uint32_t           priority;         // Set a priority for the transaction. Accepted values are: 0-4 for: default, unimportant, normal, elevated, priority.
+      bool               get_tx_key;       // (Optional) Return the transaction key after sending.
+      bool               do_not_relay;     // (Optional) If true, the newly created transaction will not be relayed to the beldex network. (Defaults to false)
+      bool               get_tx_hex;       // Return the transaction as hex string after sending. (Defaults to false)
+      bool               get_tx_metadata;  // Return the metadata needed to relay the transaction. (Defaults to false)
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string gateway_address_id;        // Hex-encoded public key identifying the new gateway address.
+      std::string gateway_owner_secret_key;  // Hex-encoded secret key controlling the new gateway. Store this securely -- it is not kept by the wallet.
+      std::string tx_hash;        // Publicly searchable transaction hash.
+      std::string tx_key;         // Transaction key if get_tx_key is true, otherwise, blank string.
+      uint64_t amount;            // Amount transferred for the transaction.
+      amounts_list amounts_by_dest;
+      uint64_t fee;               // Fee charged for the txn.
+      std::string tx_blob;        // Raw transaction represented as hex string, if get_tx_hex is true.
+      std::string tx_metadata;    // Set of transaction metadata needed to relay this transfer later, if get_tx_metadata is true.
+      std::string multisig_txset; // Set of multisig transactions in the process of being signed (empty for non-multisig).
+      std::string unsigned_txset; // Set of unsigned tx for cold-signing purposes.
+      key_image_list spent_key_images;
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  // Changes the owner of an existing gateway address. Must be signed by the *current*
+  // owner's secret key (the one returned by gateway_register, or a previous
+  // gateway_change_owner call).
+  struct GATEWAY_CHANGE_OWNER : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_change_owner"); }
+
+    static constexpr const char *description =
+R"(Changes the owner of an existing gateway address to a new owner key. Requires the
+*current* owner's secret key to authorize the change (the wallet does not store gateway
+owner keys -- the caller must supply it).)";
+
+    struct request
+    {
+      std::string        gateway_address_id;         // Hex-encoded public key identifying the gateway address to change ownership of.
+      std::string        current_owner_secret_key;   // Hex-encoded secret key of the *current* owner, used to authorize this change.
+      std::string        new_owner_key;               // Hex-encoded public key of the new owner.
+      uint32_t           account_index;    // (Optional) Pay the transaction fee from this account index. (Defaults to 0)
+      std::set<uint32_t> subaddr_indices;  // (Optional) Pay the transaction fee from this set of subaddresses. (Defaults to 0)
+      uint32_t           priority;         // Set a priority for the transaction. Accepted values are: 0-4 for: default, unimportant, normal, elevated, priority.
+      bool               get_tx_key;       // (Optional) Return the transaction key after sending.
+      bool               do_not_relay;     // (Optional) If true, the newly created transaction will not be relayed to the beldex network. (Defaults to false)
+      bool               get_tx_hex;       // Return the transaction as hex string after sending. (Defaults to false)
+      bool               get_tx_metadata;  // Return the metadata needed to relay the transaction. (Defaults to false)
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;        // Publicly searchable transaction hash.
+      std::string tx_key;         // Transaction key if get_tx_key is true, otherwise, blank string.
+      uint64_t amount;            // Amount transferred for the transaction.
+      amounts_list amounts_by_dest;
+      uint64_t fee;               // Fee charged for the txn.
+      std::string tx_blob;        // Raw transaction represented as hex string, if get_tx_hex is true.
+      std::string tx_metadata;    // Set of transaction metadata needed to relay this transfer later, if get_tx_metadata is true.
+      std::string multisig_txset; // Set of multisig transactions in the process of being signed (empty for non-multisig).
+      std::string unsigned_txset; // Set of unsigned tx for cold-signing purposes.
+      key_image_list spent_key_images;
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  // Read-only lookup of a gateway address's registration record and (optionally)
+  // balance. Thin wrapper around the daemon's get_gateway_info RPC -- no signing, no
+  // consensus dependency beyond whatever the daemon itself enforces. Always returns
+  // `found: false` until hf22_gateway_addresses is active on the connected network.
+  struct GATEWAY_INFO : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_info"); }
+
+    struct request
+    {
+      std::string gateway_address_id; // Hex-encoded public key identifying the gateway address to look up.
+      std::string asset_id;           // (Optional) hex-encoded asset public key; if given, also fetch the balance for that asset. Leave empty to omit.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      bool found;                  // Whether a registration record exists for gateway_address_id.
+      std::string owner_key;       // Hex-encoded current owner public key. Only meaningful if found.
+      std::string meta_info;       // Descriptor metadata. Only meaningful if found.
+      uint64_t creation_height;    // Block height the record was created at. Only meaningful if found.
+      bool balance_available;      // Whether `balance` below is meaningful (request.asset_id was given and found is true).
+      uint64_t balance;            // Balance for the requested asset_id. Only meaningful if balance_available.
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  // Read-only lookup of gateway operation history entries by transaction hash. Thin
+  // wrapper around the daemon's get_gateway_tx_history RPC. The underlying table is
+  // indexed by transaction hash only, not by gateway address, so callers must already
+  // know which transaction hashes to ask about.
+  struct GATEWAY_TX_HISTORY : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_tx_history"); }
+
+    struct request
+    {
+      std::vector<std::string> tx_hashes; // Hex-encoded transaction hashes to look up.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct entry
+    {
+      bool found;                     // Whether a gateway history entry was recorded for this tx hash.
+      uint8_t type;                   // 0=register, 1=transfer/credit, 2=withdraw/debit, 3=owner_change. Only meaningful if found.
+      std::string gateway_address_id; // Hex-encoded gateway address. Only meaningful if found.
+      std::string asset_id;           // Hex-encoded asset public key. Only meaningful if found and type is 1 or 2.
+      uint64_t amount;                // Only meaningful if found and type is 1 or 2.
+      uint64_t height;                // Block height the entry was recorded at. Only meaningful if found.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::vector<entry> entries; // One entry per input tx hash, in the same order.
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
   /// List of all supported rpc command structs to allow compile-time enumeration of all supported
   /// RPC types.  Every type added above that has an RPC endpoint needs to be added here, and needs
   /// a core_rpc_server::invoke() overload that takes a <TYPE>::request and returns a
@@ -2690,7 +2856,11 @@ This command is only required if the open wallet is one of the owners of a BNS r
     BNS_ADD_KNOWN_NAMES,
     BNS_DECRYPT_VALUE,
     BNS_ENCRYPT_VALUE,
-    COIN_BURN
+    COIN_BURN,
+    GATEWAY_REGISTER,
+    GATEWAY_CHANGE_OWNER,
+    GATEWAY_INFO,
+    GATEWAY_TX_HISTORY
   >;
 
 }

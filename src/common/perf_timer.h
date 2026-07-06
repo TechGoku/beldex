@@ -50,6 +50,7 @@ public:
   void reset();
   std::chrono::nanoseconds value() const;
   std::chrono::duration<double> seconds() const { return value(); }
+  operator double() const { return seconds().count(); }
 
 protected:
   std::optional<std::chrono::steady_clock::time_point> since;

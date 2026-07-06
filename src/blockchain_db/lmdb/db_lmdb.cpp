@@ -44,6 +44,7 @@
 #include "common/pruning.h"
 #include "common/hex.h"
 #include "common/median.h"
+#include "serialization/binary_utils.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "crypto/crypto.h"
 #include "ringct/rctOps.h"
@@ -81,6 +82,13 @@ struct pre_rct_output_data_t
   uint64_t           height;       //!< the height of the block which created the output
 };
 static_assert(sizeof(pre_rct_output_data_t) == sizeof(crypto::public_key) + 2*sizeof(uint64_t), "pre_ct_output_data_t has unexpected padding");
+
+struct gateway_balance_key
+{
+  cryptonote::gateway_address_id_type gateway_addr;
+  crypto::public_key asset_id;
+};
+static_assert(sizeof(gateway_balance_key) == sizeof(cryptonote::gateway_address_id_type) + sizeof(crypto::public_key), "gateway_balance_key has unexpected padding");
 
 template <typename T>
 void throw0(const T &e)
@@ -149,6 +157,9 @@ private:
 
 namespace cryptonote
 {
+
+// forward declaration for lmdb txn commit wrapper
+int lmdb_txn_commit(MDB_txn *txn);
 
 int BlockchainLMDB::compare_uint64(const MDB_val *a, const MDB_val *b)
 {
@@ -254,9 +265,13 @@ const char* const LMDB_HF_VERSIONS = "hf_versions";
 const char* const LMDB_MASTER_NODE_DATA = "master_node_data";
 const char* const LMDB_MASTER_NODE_LATEST = "master_node_proofs"; // contains the latest data sent with a proof: time, aux keys, ip, ports
 
+const char* const LMDB_GATEWAY_RECORDS = "gateway_records";
+const char* const LMDB_GATEWAY_BALANCES = "gateway_balances";
+const char* const LMDB_GATEWAY_TX_HISTORY = "gateway_tx_history";
+
 const char* const LMDB_PROPERTIES = "properties";
 
-constexpr unsigned int LMDB_DB_COUNT = 23; // Should agree with the number of db's above
+constexpr unsigned int LMDB_DB_COUNT = 26; // Should agree with the number of db's above
 
 const char zerokey[8] = {0};
 const MDB_val zerokval = { sizeof(zerokey), (void *)zerokey };
@@ -397,6 +412,9 @@ void setup_rcursor(const MDB_dbi& db, MDB_cursor*& cursor, MDB_txn* txn, bool* r
 #define m_cur_txpool_meta	m_cursors->txpool_meta
 #define m_cur_txpool_blob	m_cursors->txpool_blob
 #define m_cur_alt_blocks	m_cursors->alt_blocks
+#define m_cur_gateway_records	m_cursors->gateway_records
+#define m_cur_gateway_balances	m_cursors->gateway_balances
+#define m_cur_gateway_tx_history	m_cursors->gateway_tx_history
 #define m_cur_hf_versions	m_cursors->hf_versions
 #define m_cur_properties	m_cursors->properties
 
@@ -523,12 +541,17 @@ void mdb_txn_safe::uncheck()
 
 void mdb_txn_safe::commit(std::string message)
 {
+  if (m_txn == nullptr)
+  {
+    LOG_PRINT_L3("mdb_txn_safe::commit called with null txn, skipping commit");
+    return;
+  }
   if (message.size() == 0)
   {
     message = "Failed to commit a transaction to the db";
   }
 
-  if (auto result = mdb_txn_commit(m_txn))
+  if (auto result = lmdb_txn_commit(m_txn))
   {
     m_txn = nullptr;
     throw0(DB_ERROR(lmdb_error(message + ": ", result).c_str()));
@@ -611,6 +634,19 @@ int lmdb_txn_renew(MDB_txn *txn)
   if (res == MDB_MAP_RESIZED) {
     lmdb_resized(mdb_txn_env(txn));
     res = mdb_txn_renew(txn);
+  }
+  return res;
+}
+
+// forward declaration for commit wrapper used in mdb_txn_safe::commit
+int lmdb_txn_commit(MDB_txn *txn);
+
+int lmdb_txn_commit(MDB_txn *txn)
+{
+  int res = mdb_txn_commit(txn);
+  if (res == MDB_MAP_RESIZED) {
+    lmdb_resized(mdb_txn_env(txn));
+    res = mdb_txn_commit(txn);
   }
   return res;
 }
@@ -1229,6 +1265,9 @@ void BlockchainLMDB::remove_tx_outputs(const uint64_t tx_id, const transaction& 
   bool is_pseudo_rct = tx.version >= cryptonote::txversion::v2_ringct && tx.vin.size() == 1 && std::holds_alternative<txin_gen>(tx.vin[0]);
   for (size_t i = tx.vout.size(); i-- > 0;)
   {
+    // gateway outputs are not part of the ring-signature global output index
+    if (std::holds_alternative<txout_gateway>(tx.vout[i].target))
+      continue;
     uint64_t amount = is_pseudo_rct ? 0 : tx.vout[i].amount;
     remove_output(amount, amount_output_indices[i]);
   }
@@ -1511,6 +1550,10 @@ void BlockchainLMDB::open(const fs::path& filename, cryptonote::network_type net
   lmdb_db_open(txn, LMDB_OUTPUT_BLACKLIST, MDB_INTEGERKEY | MDB_CREATE | MDB_DUPSORT | MDB_DUPFIXED | MDB_INTEGERDUP, m_output_blacklist, "Failed to open db handle for m_output_blacklist");
 
   lmdb_db_open(txn, LMDB_SPENT_KEYS, MDB_INTEGERKEY | MDB_CREATE | MDB_DUPSORT | MDB_DUPFIXED, m_spent_keys, "Failed to open db handle for m_spent_keys");
+
+  lmdb_db_open(txn, LMDB_GATEWAY_RECORDS, MDB_CREATE, m_gateway_records, "Failed to open db handle for m_gateway_records");
+  lmdb_db_open(txn, LMDB_GATEWAY_BALANCES, MDB_CREATE, m_gateway_balances, "Failed to open db handle for m_gateway_balances");
+  lmdb_db_open(txn, LMDB_GATEWAY_TX_HISTORY, MDB_CREATE, m_gateway_tx_history, "Failed to open db handle for m_gateway_tx_history");
 
   lmdb_db_open(txn, LMDB_TXPOOL_META, MDB_CREATE, m_txpool_meta, "Failed to open db handle for m_txpool_meta");
   lmdb_db_open(txn, LMDB_TXPOOL_BLOB, MDB_CREATE, m_txpool_blob, "Failed to open db handle for m_txpool_blob");
@@ -1961,6 +2004,289 @@ void BlockchainLMDB::remove_txpool_tx(const crypto::hash& txid)
     if (result)
       throw1(DB_ERROR(lmdb_error("Error adding removal of txpool tx blob to db transaction: ", result).c_str()));
   }
+}
+
+void BlockchainLMDB::add_gateway_record(const gateway_record &r)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+
+  CURSOR(gateway_records)
+
+  MDB_val key{sizeof(r.gateway_addr), (void *)&r.gateway_addr};
+  std::string blob = serialization::dump_binary(const_cast<gateway_record&>(r));
+  MDB_val value{blob.size(), (void *)blob.data()};
+  int result = mdb_cursor_put(m_cur_gateway_records, &key, &value, MDB_NODUPDATA);
+  if (result == MDB_KEYEXIST)
+    throw1(DB_ERROR("Attempting to add gateway record that's already in the db"));
+  if (result)
+    throw1(DB_ERROR(lmdb_error("Failed to add gateway record to db transaction: ", result).c_str()));
+}
+
+bool BlockchainLMDB::get_gateway_record(const gateway_address_id_type &id, gateway_record &r) const
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+
+  TXN_PREFIX_RDONLY();
+  RCURSOR(gateway_records)
+
+  MDB_val key{sizeof(id), (void *)&id};
+  MDB_val value;
+  int result = mdb_cursor_get(m_cur_gateway_records, &key, &value, MDB_SET_KEY);
+  if (result == MDB_NOTFOUND)
+    return false;
+  if (result != MDB_SUCCESS)
+    throw0(DB_ERROR(lmdb_error("Failed to get gateway record: ", result).c_str()));
+
+  std::string blob(reinterpret_cast<const char*>(value.mv_data), value.mv_size);
+  serialization::parse_binary(blob, r);
+  return true;
+}
+
+void BlockchainLMDB::remove_gateway_record(const gateway_address_id_type &id)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+
+  CURSOR(gateway_records)
+
+  MDB_val key{sizeof(id), (void *)&id};
+  int result = mdb_cursor_get(m_cur_gateway_records, &key, NULL, MDB_SET_KEY);
+  if (result == MDB_NOTFOUND)
+    return;
+  if (result != MDB_SUCCESS)
+    throw1(DB_ERROR(lmdb_error("Error finding gateway record to remove: ", result).c_str()));
+  result = mdb_cursor_del(m_cur_gateway_records, 0);
+  if (result)
+    throw1(DB_ERROR(lmdb_error("Error adding removal of gateway record to db transaction: ", result).c_str()));
+}
+
+void BlockchainLMDB::update_gateway_owner(const gateway_address_id_type &id, const crypto::public_key &new_owner_key)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+
+  CURSOR(gateway_records)
+
+  MDB_val key{sizeof(id), (void *)&id};
+  MDB_val value;
+  int result = mdb_cursor_get(m_cur_gateway_records, &key, &value, MDB_SET_KEY);
+  if (result == MDB_NOTFOUND)
+    throw1(DB_ERROR("Attempting to update owner of a gateway record that doesn't exist"));
+  if (result != MDB_SUCCESS)
+    throw1(DB_ERROR(lmdb_error("Failed to get gateway record for owner update: ", result).c_str()));
+
+  gateway_record r;
+  std::string blob(reinterpret_cast<const char*>(value.mv_data), value.mv_size);
+  serialization::parse_binary(blob, r);
+  r.owner_key = new_owner_key;
+
+  std::string new_blob = serialization::dump_binary(r);
+  MDB_val new_value{new_blob.size(), (void *)new_blob.data()};
+  result = mdb_cursor_put(m_cur_gateway_records, &key, &new_value, MDB_CURRENT);
+  if (result)
+    throw1(DB_ERROR(lmdb_error("Failed to update gateway record owner in db transaction: ", result).c_str()));
+}
+
+// The stored value is a versioned gateway_balance_value (see gateway_storage.h), not a
+// bare uint64_t, specifically so a future confidential-asset balance (version 1) can
+// share this same table without a schema migration. `get_gateway_balance`/
+// `update_gateway_balance` only ever deal in transparent (version 0) balances -- a
+// version-1 record existing (from future hf24 code, not implemented anywhere today)
+// would be a programming error to read through these two functions, so they reject it
+// explicitly rather than silently returning 0 or misinterpreting the bytes.
+void BlockchainLMDB::update_gateway_balance(const gateway_address_id_type &id, const crypto::public_key &asset_id, int64_t delta)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+
+  CURSOR(gateway_balances)
+
+  gateway_balance_key key{id, asset_id};
+  MDB_val mdb_key{sizeof(key), (void *)&key};
+  MDB_val value;
+  gateway_balance_value bv{};
+  int result = mdb_cursor_get(m_cur_gateway_balances, &mdb_key, &value, MDB_SET_KEY);
+  if (result == MDB_SUCCESS)
+  {
+    std::string blob(reinterpret_cast<const char*>(value.mv_data), value.mv_size);
+    serialization::parse_binary(blob, bv);
+    if (bv.version != 0)
+      throw1(DB_ERROR("Stored gateway balance has an unsupported version (confidential balances are not implemented)"));
+  }
+  else if (result != MDB_NOTFOUND)
+  {
+    throw1(DB_ERROR(lmdb_error("Failed to get gateway balance: ", result).c_str()));
+  }
+  if (delta >= 0)
+  {
+    // safe add
+    uint64_t add = static_cast<uint64_t>(delta);
+    if (UINT64_MAX - bv.balance < add)
+      throw1(DB_ERROR("Gateway balance overflow"));
+    bv.balance += add;
+  }
+  else
+  {
+    uint64_t sub = static_cast<uint64_t>(-delta);
+    if (bv.balance < sub)
+      throw1(DB_ERROR("Gateway balance negative result"));
+    bv.balance -= sub;
+  }
+  std::string new_blob = serialization::dump_binary(bv);
+  MDB_val new_value{new_blob.size(), (void *)new_blob.data()};
+  result = mdb_cursor_put(m_cur_gateway_balances, &mdb_key, &new_value, 0);
+  if (result)
+    throw1(DB_ERROR(lmdb_error("Failed to update gateway balance in db transaction: ", result).c_str()));
+}
+
+uint64_t BlockchainLMDB::get_gateway_balance(const gateway_address_id_type &id, const crypto::public_key &asset_id) const
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+
+  TXN_PREFIX_RDONLY();
+  RCURSOR(gateway_balances)
+
+  gateway_balance_key key{id, asset_id};
+  MDB_val mdb_key{sizeof(key), (void *)&key};
+  MDB_val value;
+
+  int result = mdb_cursor_get(m_cur_gateway_balances, &mdb_key, &value, MDB_SET_KEY);
+  if (result == MDB_NOTFOUND)
+    return 0;
+  if (result != MDB_SUCCESS)
+    throw0(DB_ERROR(lmdb_error("Failed to get gateway balance: ", result).c_str()));
+
+  gateway_balance_value bv{};
+  std::string blob(reinterpret_cast<const char*>(value.mv_data), value.mv_size);
+  serialization::parse_binary(blob, bv);
+  if (bv.version != 0)
+    throw0(DB_ERROR("Stored gateway balance has an unsupported version (confidential balances are not implemented)"));
+  return bv.balance;
+}
+
+// A single transaction can carry more than one gateway event (e.g. a transfer between
+// two gateway addresses is one txin_gateway *and* one txout_gateway in the same tx), so
+// the tx_history table is keyed by (tx_hash, sub_index) rather than tx_hash alone.
+// Sub-indices are always assigned contiguously starting at 0 with no gaps, which is what
+// lets remove/get-all scan by incrementing until the first NOTFOUND.
+struct gateway_tx_history_key
+{
+  crypto::hash tx_hash;
+  uint64_t sub_index; // uint64_t (not e.g. uint8_t) to avoid trailing padding: crypto::hash is alignas(size_t)
+};
+static_assert(sizeof(gateway_tx_history_key) == sizeof(crypto::hash) + sizeof(uint64_t), "gateway_tx_history_key has unexpected padding");
+
+void BlockchainLMDB::add_gateway_tx_history(const crypto::hash &tx_hash, const gateway_tx_entry &entry)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+
+  CURSOR(gateway_tx_history)
+
+  uint32_t sub_index = 0;
+  for (; sub_index < 256; ++sub_index)
+  {
+    gateway_tx_history_key probe{tx_hash, sub_index};
+    MDB_val probe_key{sizeof(probe), (void *)&probe};
+    int result = mdb_cursor_get(m_cur_gateway_tx_history, &probe_key, NULL, MDB_SET_KEY);
+    if (result == MDB_NOTFOUND)
+      break;
+    if (result != MDB_SUCCESS)
+      throw1(DB_ERROR(lmdb_error("Failed to scan gateway tx history for a free slot: ", result).c_str()));
+  }
+  if (sub_index == 256)
+    throw1(DB_ERROR("Too many gateway tx history entries for a single transaction"));
+
+  gateway_tx_history_key key{tx_hash, sub_index};
+  MDB_val mdb_key{sizeof(key), (void *)&key};
+  std::string blob = serialization::dump_binary(const_cast<gateway_tx_entry&>(entry));
+  MDB_val value{blob.size(), (void *)blob.data()};
+  int result = mdb_cursor_put(m_cur_gateway_tx_history, &mdb_key, &value, MDB_NODUPDATA);
+  if (result == MDB_KEYEXIST)
+    throw1(DB_ERROR("Attempting to add gateway tx history that's already in the db"));
+  if (result)
+    throw1(DB_ERROR(lmdb_error("Failed to add gateway tx history to db transaction: ", result).c_str()));
+}
+
+void BlockchainLMDB::remove_gateway_tx_history(const crypto::hash &tx_hash)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+
+  CURSOR(gateway_tx_history)
+
+  for (uint32_t sub_index = 0; sub_index < 256; ++sub_index)
+  {
+    gateway_tx_history_key key{tx_hash, sub_index};
+    MDB_val mdb_key{sizeof(key), (void *)&key};
+    int result = mdb_cursor_get(m_cur_gateway_tx_history, &mdb_key, NULL, MDB_SET_KEY);
+    if (result == MDB_NOTFOUND)
+      break;
+    if (result != MDB_SUCCESS)
+      throw1(DB_ERROR(lmdb_error("Error finding gateway tx history to remove: ", result).c_str()));
+    result = mdb_cursor_del(m_cur_gateway_tx_history, 0);
+    if (result)
+      throw1(DB_ERROR(lmdb_error("Error adding removal of gateway tx history to db transaction: ", result).c_str()));
+  }
+}
+
+bool BlockchainLMDB::get_gateway_tx_history(const crypto::hash &tx_hash, gateway_tx_entry &entry) const
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+
+  TXN_PREFIX_RDONLY();
+  RCURSOR(gateway_tx_history)
+
+  gateway_tx_history_key key{tx_hash, 0};
+  MDB_val mdb_key{sizeof(key), (void *)&key};
+  MDB_val value;
+  int result = mdb_cursor_get(m_cur_gateway_tx_history, &mdb_key, &value, MDB_SET_KEY);
+  if (result == MDB_NOTFOUND)
+    return false;
+  if (result != MDB_SUCCESS)
+    throw0(DB_ERROR(lmdb_error("Failed to get gateway tx history: ", result).c_str()));
+
+  std::string blob(reinterpret_cast<const char*>(value.mv_data), value.mv_size);
+  serialization::parse_binary(blob, entry);
+  return true;
+}
+
+bool BlockchainLMDB::get_gateway_tx_history_all(const crypto::hash &tx_hash, std::vector<gateway_tx_entry> &entries) const
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  entries.clear();
+
+  TXN_PREFIX_RDONLY();
+  RCURSOR(gateway_tx_history)
+
+  for (uint32_t sub_index = 0; sub_index < 256; ++sub_index)
+  {
+    gateway_tx_history_key key{tx_hash, sub_index};
+    MDB_val mdb_key{sizeof(key), (void *)&key};
+    MDB_val value;
+    int result = mdb_cursor_get(m_cur_gateway_tx_history, &mdb_key, &value, MDB_SET_KEY);
+    if (result == MDB_NOTFOUND)
+      break;
+    if (result != MDB_SUCCESS)
+      throw0(DB_ERROR(lmdb_error("Failed to get gateway tx history: ", result).c_str()));
+
+    gateway_tx_entry entry;
+    std::string blob(reinterpret_cast<const char*>(value.mv_data), value.mv_size);
+    serialization::parse_binary(blob, entry);
+    entries.push_back(std::move(entry));
+  }
+  return !entries.empty();
 }
 
 bool BlockchainLMDB::get_txpool_tx_meta(const crypto::hash& txid, txpool_tx_meta_t &meta) const

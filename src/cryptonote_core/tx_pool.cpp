@@ -306,6 +306,19 @@ namespace cryptonote
       return false;
     }
 
+    const bool has_gateway_input = std::any_of(tx.vin.begin(), tx.vin.end(), [](const auto& in) { return std::holds_alternative<txin_gateway>(in); });
+    const bool has_gateway_output = std::any_of(tx.vout.begin(), tx.vout.end(), [](const auto& out) { return std::holds_alternative<txout_gateway>(out.target); });
+    if (has_gateway_input || has_gateway_output)
+    {
+      LOG_PRINT_L1("Transaction with id= " << id << " uses gateway inputs/outputs, which are rejected by the current consensus validation path");
+      tvc.m_verifivation_failed = true;
+      if (has_gateway_input)
+        tvc.m_invalid_input = true;
+      if (has_gateway_output)
+        tvc.m_invalid_output = true;
+      return false;
+    }
+
     uint64_t fee, burned;
 
     if (!get_tx_miner_fee(tx, fee, hf_version >= feature::FEE_BURNING, &burned))

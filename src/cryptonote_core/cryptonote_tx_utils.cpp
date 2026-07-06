@@ -755,17 +755,27 @@ namespace cryptonote
         return false;
       }
 
-      //put key image into tx input
-      txin_to_key input_to_key;
-      input_to_key.amount = src_entr.amount;
-      input_to_key.k_image = msout ? rct::rct2ki(src_entr.multisig_kLRki.ki) : img;
+      if (src_entr.gateway_origin)
+      {
+        txin_gateway input_gateway;
+        input_gateway.amount = src_entr.amount;
+        input_gateway.gateway_addr = *src_entr.gateway_origin;
+        tx.vin.push_back(input_gateway);
+      }
+      else
+      {
+        //put key image into tx input
+        txin_to_key input_to_key;
+        input_to_key.amount = src_entr.amount;
+        input_to_key.k_image = msout ? rct::rct2ki(src_entr.multisig_kLRki.ki) : img;
 
-      //fill outputs array and use relative offsets
-      for(const tx_source_entry::output_entry& out_entry: src_entr.outputs)
-        input_to_key.key_offsets.push_back(out_entry.first);
+        //fill outputs array and use relative offsets
+        for(const tx_source_entry::output_entry& out_entry: src_entr.outputs)
+          input_to_key.key_offsets.push_back(out_entry.first);
 
-      input_to_key.key_offsets = absolute_output_offsets_to_relative(input_to_key.key_offsets);
-      tx.vin.push_back(input_to_key);
+        input_to_key.key_offsets = absolute_output_offsets_to_relative(input_to_key.key_offsets);
+        tx.vin.push_back(input_to_key);
+      }
     }
 
     if (shuffle_outs)
@@ -773,14 +783,21 @@ namespace cryptonote
       std::shuffle(destinations.begin(), destinations.end(), crypto::random_device{});
     }
 
-    // sort ins by their key image
+    // sort ins by their key image (gateway inputs have no key image; treat them as a null one
+    // so they sort consistently instead of crashing on the txin_to_key-only cast below)
     std::vector<size_t> ins_order(sources.size());
     for (size_t n = 0; n < sources.size(); ++n)
       ins_order[n] = n;
+    auto ins_sort_key_image = [&](size_t i) -> const crypto::key_image& {
+      static const crypto::key_image null_ki{};
+      if (const auto *tk = std::get_if<txin_to_key>(&tx.vin[i]))
+        return tk->k_image;
+      return null_ki;
+    };
     std::sort(ins_order.begin(), ins_order.end(), [&](const size_t i0, const size_t i1) {
-      const txin_to_key &tk0 = var::get<txin_to_key>(tx.vin[i0]);
-      const txin_to_key &tk1 = var::get<txin_to_key>(tx.vin[i1]);
-      return memcmp(&tk0.k_image, &tk1.k_image, sizeof(tk0.k_image)) > 0;
+      const crypto::key_image &k0 = ins_sort_key_image(i0);
+      const crypto::key_image &k1 = ins_sort_key_image(i1);
+      return memcmp(&k0, &k1, sizeof(k0)) > 0;
     });
     tools::apply_permutation(ins_order, [&] (size_t i0, size_t i1) {
       std::swap(tx.vin[i0], tx.vin[i1]);
@@ -866,9 +883,21 @@ namespace cryptonote
 
       tx_out out;
       out.amount = dst_entr.amount;
-      txout_to_key tk;
-      tk.key = out_eph_public_key;
-      out.target = tk;
+      if (dst_entr.gateway_address)
+      {
+        txout_gateway gw;
+        gw.gateway_addr = *dst_entr.gateway_address;
+        gw.asset_id = crypto::null_pkey;
+        gw.amount = dst_entr.amount;
+        gw.payment_id = 0;
+        out.target = gw;
+      }
+      else
+      {
+        txout_to_key tk;
+        tk.key = out_eph_public_key;
+        out.target = tk;
+      }
       tx.vout.push_back(out);
       output_index++;
       summary_outs_money += dst_entr.amount;

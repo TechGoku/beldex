@@ -92,6 +92,22 @@ namespace cryptonote
     crypto::public_key key;
   };
 
+  struct txout_gateway
+  {
+    uint8_t version = 0;
+    crypto::public_key gateway_addr = crypto::null_pkey;
+    crypto::public_key asset_id = crypto::null_pkey;
+    uint64_t amount = 0;
+    uint64_t payment_id = 0;
+
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(version)
+      FIELD(gateway_addr)
+      FIELD(asset_id)
+      VARINT_FIELD(amount)
+      VARINT_FIELD(payment_id)
+    END_SERIALIZE()
+  };
 
   /* inputs */
 
@@ -145,10 +161,48 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
+  using gateway_address_id_type = crypto::public_key;
+  using gateway_owner_key_v = std::variant<crypto::public_key>;
+  using gateway_owner_signature_v = std::variant<crypto::signature>;
 
-  using txin_v = std::variant<txin_gen, txin_to_script, txin_to_scripthash, txin_to_key>;
+  // A signed proof that the holder of `owner_key` (as currently on file for a gateway
+  // address, or as proposed by a registration/owner-change operation) authorized
+  // whatever operation this proof is attached to. The signed message is always the
+  // transaction prefix hash of the transaction the proof is attached to, which binds the
+  // proof to that exact transaction and prevents it from being replayed onto another one.
+  struct gateway_address_ownership_proof
+  {
+    uint8_t version = 0;
+    gateway_owner_signature_v sign;
 
-  using txout_target_v = std::variant<txout_to_script, txout_to_scripthash, txout_to_key>;
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(version)
+      FIELD(sign)
+    END_SERIALIZE()
+  };
+
+  struct txin_gateway
+  {
+    uint8_t version = 0;
+    crypto::public_key gateway_addr = crypto::null_pkey;
+    crypto::public_key asset_id = crypto::null_pkey;
+    uint64_t amount = 0;
+    // Proof that this spend is authorized by the gateway's current owner key (looked up
+    // in the gateway registry by `gateway_addr` at validation time).
+    gateway_address_ownership_proof owner_proof;
+
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(version)
+      FIELD(gateway_addr)
+      FIELD(asset_id)
+      VARINT_FIELD(amount)
+      FIELD(owner_proof)
+    END_SERIALIZE()
+  };
+
+  using txin_v = std::variant<txin_gen, txin_to_script, txin_to_scripthash, txin_to_key, txin_gateway>;
+
+  using txout_target_v = std::variant<txout_to_script, txout_to_scripthash, txout_to_key, txout_gateway>;
 
   //typedef std::pair<uint64_t, txout> out_t;
   struct tx_out
@@ -163,6 +217,47 @@ namespace cryptonote
 
 
   };
+
+  struct gateway_address_descriptor_base
+  {
+    uint8_t version = 0;
+    gateway_owner_key_v owner_key;
+    std::string meta_info;
+
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(version)
+      FIELD(owner_key)
+      FIELD(meta_info)
+    END_SERIALIZE()
+  };
+
+  struct gateway_address_descriptor_operation_register
+  {
+    uint8_t version = 0;
+    gateway_address_descriptor_base descriptor;
+    gateway_address_id_type view_pub_key = crypto::null_pkey;
+
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(version)
+      FIELD(descriptor)
+      FIELD(view_pub_key)
+    END_SERIALIZE()
+  };
+
+  struct gateway_address_descriptor_operation_owner_change
+  {
+    uint8_t version = 0;
+    gateway_address_id_type gateway_addr = crypto::null_pkey;
+    gateway_owner_key_v new_owner_key;
+
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(version)
+      FIELD(gateway_addr)
+      FIELD(new_owner_key)
+    END_SERIALIZE()
+  };
+
+  using gateway_address_descriptor_operation_v = std::variant<gateway_address_descriptor_operation_register, gateway_address_descriptor_operation_owner_change>;
 
   // Flahs quorum statuses.  Note that the underlying numeric values is used in the RPC.  `none` is
   // only used in places like the RPC where we return a value even if not a flash at all.
@@ -611,8 +706,20 @@ VARIANT_TAG(cryptonote::txin_gen, "gen", 0xff);
 VARIANT_TAG(cryptonote::txin_to_script, "script", 0x0);
 VARIANT_TAG(cryptonote::txin_to_scripthash, "scripthash", 0x1);
 VARIANT_TAG(cryptonote::txin_to_key, "key", 0x2);
+VARIANT_TAG(cryptonote::txin_gateway, "gateway", 0x3);
 VARIANT_TAG(cryptonote::txout_to_script, "script", 0x0);
 VARIANT_TAG(cryptonote::txout_to_scripthash, "scripthash", 0x1);
 VARIANT_TAG(cryptonote::txout_to_key, "key", 0x2);
+VARIANT_TAG(cryptonote::txout_gateway, "gateway", 0x3);
 VARIANT_TAG(cryptonote::transaction, "tx", 0xcc);
 VARIANT_TAG(cryptonote::block, "block", 0xbb);
+
+// Single-alternative variants used by the gateway owner key/signature types
+// (gateway_owner_key_v / gateway_owner_signature_v). Only one alternative each exists
+// today; more key/signature formats (as Zano supports) could be added later the same way
+// other txin_v/txout_target_v alternatives are, each with its own tag.
+VARIANT_TAG(crypto::public_key, "pubkey", 0x0);
+VARIANT_TAG(crypto::signature, "signature", 0x0);
+
+VARIANT_TAG(cryptonote::gateway_address_descriptor_operation_register, "gateway_register", 0x0);
+VARIANT_TAG(cryptonote::gateway_address_descriptor_operation_owner_change, "gateway_owner_change", 0x1);

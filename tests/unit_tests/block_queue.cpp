@@ -26,21 +26,20 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <boost/uuid/uuid.hpp>
 #include "gtest/gtest.h"
 #include "crypto/crypto.h"
 #include "cryptonote_protocol/cryptonote_protocol_defs.h"
 #include "cryptonote_protocol/block_queue.h"
 
-static const boost::uuids::uuid &uuid1()
+static const epee::connection_id_t &uuid1()
 {
-  static const boost::uuids::uuid uuid = crypto::rand<boost::uuids::uuid>();
+  static const epee::connection_id_t uuid = epee::connection_id_t::random();
   return uuid;
 }
 
-static const boost::uuids::uuid &uuid2()
+static const epee::connection_id_t &uuid2()
 {
-  static const boost::uuids::uuid uuid = crypto::rand<boost::uuids::uuid>();
+  static const epee::connection_id_t uuid = epee::connection_id_t::random();
   return uuid;
 }
 

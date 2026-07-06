@@ -74,6 +74,10 @@ struct mdb_txn_cursors
 
   MDB_cursor *alt_blocks;
 
+  MDB_cursor *gateway_records;
+  MDB_cursor *gateway_balances;
+  MDB_cursor *gateway_tx_history;
+
   MDB_cursor *hf_versions;
 
   MDB_cursor *master_node_data;
@@ -104,6 +108,9 @@ struct mdb_rflags
   bool m_rf_txpool_blob;
   bool m_rf_alt_blocks;
   bool m_rf_hf_versions;
+  bool m_rf_gateway_records;
+  bool m_rf_gateway_balances;
+  bool m_rf_gateway_tx_history;
   bool m_rf_master_node_data;
   bool m_rf_master_node_proofs;
   bool m_rf_properties;
@@ -442,6 +449,18 @@ private:
   std::unordered_map<crypto::public_key, master_nodes::proof_info> get_all_master_node_proofs() const override;
   bool remove_master_node_proof(const crypto::public_key& pubkey) override;
 
+public:
+  void add_gateway_record(const gateway_record &r) override;
+  bool get_gateway_record(const gateway_address_id_type &id, gateway_record &r) const override;
+  void remove_gateway_record(const gateway_address_id_type &id) override;
+  void update_gateway_owner(const gateway_address_id_type &id, const crypto::public_key &new_owner_key) override;
+  void update_gateway_balance(const gateway_address_id_type &id, const crypto::public_key &asset_id, int64_t delta) override;
+  uint64_t get_gateway_balance(const gateway_address_id_type &id, const crypto::public_key &asset_id) const override;
+  void add_gateway_tx_history(const crypto::hash &tx_hash, const gateway_tx_entry &entry) override;
+  bool get_gateway_tx_history(const crypto::hash &tx_hash, gateway_tx_entry &entry) const override;
+  bool get_gateway_tx_history_all(const crypto::hash &tx_hash, std::vector<gateway_tx_entry> &entries) const override;
+  void remove_gateway_tx_history(const crypto::hash &tx_hash) override;
+
 private:
   template <typename T,
             std::enable_if_t<std::is_same_v<T, cryptonote::block> ||
@@ -480,6 +499,10 @@ private:
 
   MDB_dbi m_master_node_data;
   MDB_dbi m_master_node_proofs;
+
+  MDB_dbi m_gateway_records;
+  MDB_dbi m_gateway_balances;
+  MDB_dbi m_gateway_tx_history;
 
   MDB_dbi m_properties;
 

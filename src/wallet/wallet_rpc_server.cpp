@@ -1169,6 +1169,142 @@ namespace tools
     return res;
   }
   //------------------------------------------------------------------------------------------------------------------------------
+  GATEWAY_REGISTER::response wallet_rpc_server::invoke(GATEWAY_REGISTER::request&& req)
+  {
+    require_open();
+    GATEWAY_REGISTER::response res{};
+
+    crypto::secret_key owner_sec;
+    crypto::public_key owner_pub;
+    std::string reason;
+    std::vector<wallet2::pending_tx> ptx_vector = m_wallet->create_gateway_registration_tx(
+        req.meta_info, owner_sec, owner_pub, &reason, req.priority, req.account_index, req.subaddr_indices);
+    if (ptx_vector.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Failed to create gateway registration transaction: " + reason};
+
+    res.gateway_address_id = tools::type_to_hex(owner_pub);
+    res.gateway_owner_secret_key = tools::type_to_hex(owner_sec);
+
+    fill_response( ptx_vector,
+                   req.get_tx_key,
+                   res.tx_key,
+                   res.amount,
+                   res.amounts_by_dest,
+                   res.fee,
+                   res.multisig_txset,
+                   res.unsigned_txset,
+                   req.do_not_relay,
+                   false /*flash*/,
+                   res.tx_hash,
+                   req.get_tx_hex,
+                   res.tx_blob,
+                   req.get_tx_metadata,
+                   res.tx_metadata,
+                   res.spent_key_images);
+    return res;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  GATEWAY_CHANGE_OWNER::response wallet_rpc_server::invoke(GATEWAY_CHANGE_OWNER::request&& req)
+  {
+    require_open();
+    GATEWAY_CHANGE_OWNER::response res{};
+
+    crypto::public_key gateway_addr;
+    if (!tools::hex_to_type(req.gateway_address_id, gateway_addr))
+      throw wallet_rpc_error{error_code::WRONG_ADDRESS, "failed to parse gateway_address_id"};
+
+    crypto::secret_key current_owner_sec;
+    if (!tools::hex_to_type(req.current_owner_secret_key, current_owner_sec))
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "failed to parse current_owner_secret_key"};
+
+    crypto::public_key new_owner_key;
+    if (!tools::hex_to_type(req.new_owner_key, new_owner_key))
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "failed to parse new_owner_key"};
+
+    std::string reason;
+    std::vector<wallet2::pending_tx> ptx_vector = m_wallet->create_gateway_owner_change_tx(
+        gateway_addr, current_owner_sec, new_owner_key, &reason, req.priority, req.account_index, req.subaddr_indices);
+    if (ptx_vector.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Failed to create gateway owner-change transaction: " + reason};
+
+    fill_response( ptx_vector,
+                   req.get_tx_key,
+                   res.tx_key,
+                   res.amount,
+                   res.amounts_by_dest,
+                   res.fee,
+                   res.multisig_txset,
+                   res.unsigned_txset,
+                   req.do_not_relay,
+                   false /*flash*/,
+                   res.tx_hash,
+                   req.get_tx_hex,
+                   res.tx_blob,
+                   req.get_tx_metadata,
+                   res.tx_metadata,
+                   res.spent_key_images);
+    return res;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  GATEWAY_INFO::response wallet_rpc_server::invoke(GATEWAY_INFO::request&& req)
+  {
+    require_open();
+    GATEWAY_INFO::response res{};
+
+    crypto::public_key gateway_addr;
+    if (!tools::hex_to_type(req.gateway_address_id, gateway_addr))
+      throw wallet_rpc_error{error_code::WRONG_ADDRESS, "failed to parse gateway_address_id"};
+
+    std::optional<crypto::public_key> asset_id;
+    if (!req.asset_id.empty())
+    {
+      crypto::public_key parsed_asset_id;
+      if (!tools::hex_to_type(req.asset_id, parsed_asset_id))
+        throw wallet_rpc_error{error_code::WRONG_ADDRESS, "failed to parse asset_id"};
+      asset_id = parsed_asset_id;
+    }
+
+    auto info = m_wallet->get_gateway_info(gateway_addr, asset_id);
+    res.found = info.found;
+    res.owner_key = info.owner_key;
+    res.meta_info = info.meta_info;
+    res.creation_height = info.creation_height;
+    res.balance_available = info.balance.has_value();
+    res.balance = info.balance.value_or(0);
+    return res;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  GATEWAY_TX_HISTORY::response wallet_rpc_server::invoke(GATEWAY_TX_HISTORY::request&& req)
+  {
+    require_open();
+    GATEWAY_TX_HISTORY::response res{};
+
+    std::vector<crypto::hash> tx_hashes;
+    tx_hashes.reserve(req.tx_hashes.size());
+    for (const auto& hex : req.tx_hashes)
+    {
+      crypto::hash h;
+      if (!tools::hex_to_type(hex, h))
+        throw wallet_rpc_error{error_code::WRONG_TXID, "failed to parse a tx hash in tx_hashes"};
+      tx_hashes.push_back(h);
+    }
+
+    auto entries = m_wallet->get_gateway_tx_history(tx_hashes);
+    res.entries.reserve(entries.size());
+    for (const auto& e : entries)
+    {
+      GATEWAY_TX_HISTORY::entry out{};
+      out.found = e.found;
+      out.type = e.type;
+      out.gateway_address_id = e.gateway_address_id;
+      out.asset_id = e.asset_id;
+      out.amount = e.amount;
+      out.height = e.height;
+      res.entries.push_back(std::move(out));
+    }
+    return res;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
   TRANSFER_SPLIT::response wallet_rpc_server::invoke(TRANSFER_SPLIT::request&& req)
   {
     require_open();

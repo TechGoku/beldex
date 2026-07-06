@@ -236,7 +236,7 @@ static void rollback_chain(cryptonote::core * core, const cryptonote::block & he
   MDEBUG("Rollbacking to " << height << " to hash " << head_hash);
 
   do {
-    core->get_blockchain_top(cur_height, cur_hash);
+    std::tie(cur_height, cur_hash) = core->get_blockchain_top();
 
     if (cur_height <= height && head_hash == cur_hash)
       return;

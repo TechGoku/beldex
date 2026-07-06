@@ -37,6 +37,8 @@ namespace cryptonote::rpc {
   void parse_request(HARD_FORK_INFO& hfinfo, rpc_input in);
   void parse_request(IN_PEERS& in_peers, rpc_input in);
   void parse_request(IS_KEY_IMAGE_SPENT& spent, rpc_input in);
+  void parse_request(GET_GATEWAY_INFO& info, rpc_input in);
+  void parse_request(GET_GATEWAY_TX_HISTORY& history, rpc_input in);
   void parse_request(BELNET_PING& belnet_ping, rpc_input in);
   void parse_request(BNS_OWNERS_TO_NAMES& owners_to_names, rpc_input in);
   void parse_request(BNS_NAMES_TO_OWNERS& names_to_owners, rpc_input in);
