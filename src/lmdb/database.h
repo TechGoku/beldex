@@ -51,7 +51,10 @@ namespace lmdb
     using environment = std::unique_ptr<MDB_env, close_env>;
 
     //! \return LMDB environment at `path` with a max of `max_dbs` tables.
-    expect<environment> open_environment(const char* path, MDB_dbi max_dbs) noexcept;
+    //! \param map_size Initial memory-map size in bytes; `0` keeps the LMDB
+    //!   default (1 MiB). On 64-bit the map is sparse virtual address space, so
+    //!   a large value does not preallocate disk - the file grows on demand.
+    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size = 0) noexcept;
 
     //! Context given to LMDB.
     struct context
@@ -110,7 +113,7 @@ namespace lmdb
             \return The result of calling `f`.
         */
         template<typename F>
-        typename std::result_of<F(MDB_txn&)>::type try_write(F f, unsigned attempts = 3)
+        typename std::result_of<F(MDB_txn&)>::type try_write(F f, unsigned attempts = 16)
         {
             for (unsigned i = 0; i < attempts; ++i)
             {
@@ -119,11 +122,19 @@ namespace lmdb
                     return txn.error();
 
                 MONERO_PRECOND(*txn != nullptr);
-                const auto wrote = f(*(*txn));
+                auto wrote = f(*(*txn));
                 if (wrote)
                 {
-                    MONERO_CHECK(commit(std::move(*txn)));
-                    return wrote;
+                    // MDB_MAP_FULL can surface at commit as well as during the
+                    // write; grow the map and retry the whole transaction rather
+                    // than failing (which would stop the scanner / lose the write).
+                    const expect<void> committed = commit(std::move(*txn));
+                    if (committed)
+                        return wrote;
+                    if (committed != lmdb::error(MDB_MAP_FULL))
+                        return committed.error();
+                    MONERO_CHECK(this->resize());
+                    continue;
                 }
                 if (wrote != lmdb::error(MDB_MAP_FULL))
                     return wrote;

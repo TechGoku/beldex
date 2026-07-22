@@ -75,7 +75,7 @@ namespace lmdb
         }
     }
 
-    expect<environment> open_environment(const char* path, MDB_dbi max_dbs) noexcept
+    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size) noexcept
     {
         MONERO_PRECOND(path != nullptr);
 
@@ -84,6 +84,12 @@ namespace lmdb
         environment out{obj};
 
         MONERO_LMDB_CHECK(mdb_env_set_maxdbs(out.get(), max_dbs));
+        // Set an initial map size *before* opening so the first writes have room.
+        // Without this the map starts at the 1 MiB LMDB default and a single large
+        // write can exhaust the bounded resize-retries in `try_write`, surfacing as
+        // MDB_MAP_FULL. The map is sparse on 64-bit; the file only grows on demand.
+        if (map_size)
+            MONERO_LMDB_CHECK(mdb_env_set_mapsize(out.get(), map_size));
         MONERO_LMDB_CHECK(mdb_env_open(out.get(), path, 0, open_flags));
         return {std::move(out)};
     }
@@ -179,9 +185,14 @@ namespace lmdb
     expect<void> database::commit(write_txn txn) noexcept
     {
         MONERO_PRECOND(txn != nullptr);
-        MONERO_LMDB_CHECK(mdb_txn_commit(txn.get()));
-        txn.release();
+        // `mdb_txn_commit` frees the txn handle on *both* success and failure, so
+        // release ownership first to avoid a double-free via `abort_write_txn`
+        // (the previous code aborted an already-freed handle when commit failed,
+        // e.g. on MDB_MAP_FULL). The context is always released.
+        const int err = mdb_txn_commit(txn.release());
         release_context(ctx);
+        if (err)
+            return {lmdb::error(err)};
         return success();
     }
 } // lmdb

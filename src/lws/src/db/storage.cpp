@@ -546,35 +546,52 @@ namespace db
       return success();
   }
 
+  // Migrate the `outputs` table from the pre-`locked_key_image` layout (v1) to
+  // the current one (v2). Safe to run against any starting state:
+  //   * fresh / empty DB      -> no rows, no-op (just stamps the version)
+  //   * legacy v1 DB          -> every row converted, zero-filled locked_key_image
+  //   * already-v2 DB         -> rows left exactly as-is, nothing rewritten
+  // A record whose size matches neither layout cannot occur in a healthy DB, so
+  // it is treated as a hard error: we throw, the enclosing write txn is aborted,
+  // and the DB is left byte-for-byte unchanged. We never delete output or spend
+  // rows here - that only risks losing funds visibility.
   void migrate_1_2(MDB_txn& txn, tables_ const& tables)
-{
-  MINFO("Migrating outputs → add locked_key_image (removing corrupted data and spends)");
-
-  // First, migrate outputs and remove corrupted ones and their spends
-  cursor::outputs cur;
-  check_cursor(txn, tables.outputs, cur);
-
-  struct owned_key { std::vector<unsigned char> data; };
-  std::vector<owned_key> keys;
-  std::vector<output_v2> values;
-
-  MDB_val key{}, value{};
-  int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
-
-  while (err == 0)
   {
-    output_v2 v2{};
-    bool is_corrupted = false;
+    MINFO("Checking outputs for locked_key_image migration (v1 -> v2)");
 
-    if (value.mv_size == sizeof(output_v2))
+    cursor::outputs cur;
+    const expect<void> opened = check_cursor(txn, tables.outputs, cur);
+    if (!opened)
+      MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
+
+    struct owned_key { std::vector<unsigned char> data; };
+    std::vector<owned_key> keys;
+    std::vector<output_v2> values;
+
+    MDB_val key{}, value{};
+    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+
+    while (err == 0)
     {
-      // Already correct size—copy directly
-      v2 = *reinterpret_cast<const output_v2*>(value.mv_data);
-    }
-    else if (value.mv_size == sizeof(output_v1))
-    {
-      // Convert from old size
+      if (value.mv_size == sizeof(output_v2))
+      {
+        // Already in the current layout - leave untouched, advance.
+        err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
+        continue;
+      }
+      if (value.mv_size != sizeof(output_v1))
+      {
+        // Impossible in a healthy DB. Abort instead of deleting/reinterpreting:
+        // aborting rolls back the txn and leaves every row intact.
+        MONERO_THROW(lws::error::bad_blockchain,
+          "Unexpected output record size during migration; refusing to modify the database");
+      }
+
+      // Convert v1 -> v2 by inserting a zeroed locked_key_image. Record size
+      // changes, so we must delete the old row and re-insert the new one; stash
+      // both and apply the puts after the iteration completes.
       const auto& old = *reinterpret_cast<const output_v1*>(value.mv_data);
+      output_v2 v2{};
       v2.link = old.link;
       v2.spend_meta.id = old.spend_meta.id;
       v2.spend_meta.amount = old.spend_meta.amount;
@@ -584,100 +601,40 @@ namespace db
       v2.timestamp = old.timestamp;
       v2.unlock_time = old.unlock_time;
       v2.tx_prefix_hash = old.tx_prefix_hash;
-      v2.locked_key_image = crypto::key_image{};  // New field
+      v2.locked_key_image = crypto::key_image{};  // defaulted for old rows
       v2.pub = old.pub;
       v2.ringct_mask = old.ringct_mask;
       std::memcpy(v2.reserved, old.reserved, sizeof(v2.reserved));
       v2.extra = old.extra;
       std::memcpy(&v2.payment_id, &old.payment_id, sizeof(v2.payment_id));
-    }
-    else
-    {
-      // Corrupted size—remove from DB and any associated spends
-      MERROR("Removing corrupted output data (size " << value.mv_size << ") and associated spends");
-      is_corrupted = true;
 
-      // *** Remove associated spends for this output key ***
-      {
-        cursor::spends spend_cur;
-        check_cursor(txn, tables.spends, spend_cur);
-        MDB_val spend_key = key;  // Spend key includes output key
-        MDB_val spend_value{};
-        int spend_err = mdb_cursor_get(spend_cur.get(), &spend_key, &spend_value, MDB_SET_RANGE);
-        while (spend_err == 0)
-        {
-          // Check if this spend matches the output key (spend key starts with output key)
-          if (spend_key.mv_size >= key.mv_size &&
-              std::memcmp(spend_key.mv_data, key.mv_data, key.mv_size) == 0)
-          {
-            // Delete this spend
-            int del_err = mdb_cursor_del(spend_cur.get(), 0);
-            if (del_err) MONERO_THROW(lmdb::error(del_err), "cursor_del spend failed");
-          }
-          else
-          {
-            break;  // No more matching spends
-          }
-          spend_err = mdb_cursor_get(spend_cur.get(), &spend_key, &spend_value, MDB_NEXT);
-        }
-        if (spend_err != MDB_NOTFOUND && spend_err != 0) MONERO_THROW(lmdb::error(spend_err), "spend cursor iteration failed");
-      }
+      owned_key k;
+      k.data.assign(static_cast<unsigned char*>(key.mv_data), static_cast<unsigned char*>(key.mv_data) + key.mv_size);
+      keys.push_back(std::move(k));
+      values.push_back(v2);
 
-      // Delete the corrupted output
       err = mdb_cursor_del(cur.get(), 0);
       if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
       err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
-      continue;
     }
 
-    owned_key k;
-    k.data.assign(static_cast<unsigned char*>(key.mv_data), static_cast<unsigned char*>(key.mv_data) + key.mv_size);
+    if (err != MDB_NOTFOUND) MONERO_THROW(lmdb::error(err), "cursor iteration failed");
 
-    keys.push_back(std::move(k));
-    values.push_back(v2);
-
-    err = mdb_cursor_del(cur.get(), 0);
-    if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
-
-    err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
-  }
-
-  if (err != MDB_NOTFOUND) MONERO_THROW(lmdb::error(err), "cursor iteration failed");
-
-  for (size_t i = 0; i < values.size(); ++i)
-  {
-    MDB_val k{ keys[i].data.size(), keys[i].data.data() };
-    MDB_val v = lmdb::to_val(values[i]);
-    err = mdb_put(&txn, tables.outputs, &k, &v, 0);
-    if (err) MONERO_THROW(lmdb::error(err), "mdb_put failed");
-  }
-
-  // *** Second pass: Remove orphaned spends (spends without corresponding outputs) ***
-  MINFO("Cleaning up orphaned spends");
-  cursor::spends spend_cur;
-  check_cursor(txn, tables.spends, spend_cur);
-  MDB_val spend_key{}, spend_value{};
-  int spend_err = mdb_cursor_get(spend_cur.get(), &spend_key, &spend_value, MDB_FIRST);
-  while (spend_err == 0)
-  {
-    // Extract output key from spend key (assuming spend key starts with output key)
-    // Adjust based on actual key structure; for simplicity, assume first part is output key
-    MDB_val output_key = spend_key;  // If spend key is output_key + extra, adjust accordingly
-    // For BelDex LWS, spend key might be output_key + spend details; check the code for exact structure
-    // If unsure, remove all spends if output doesn't exist
-    MDB_val dummy{};
-    int output_err = mdb_get(&txn, tables.outputs, &output_key, &dummy);
-    if (output_err == MDB_NOTFOUND)
+    for (std::size_t i = 0; i < values.size(); ++i)
     {
-      // Orphaned spend—delete it
-      MERROR("Removing orphaned spend");
-      int del_err = mdb_cursor_del(spend_cur.get(), 0);
-      if (del_err) MONERO_THROW(lmdb::error(del_err), "cursor_del orphaned spend failed");
+      MDB_val k{ keys[i].data.size(), keys[i].data.data() };
+      MDB_val v = lmdb::to_val(values[i]);
+      err = mdb_put(&txn, tables.outputs, &k, &v, 0);
+      if (err) MONERO_THROW(lmdb::error(err), "mdb_put failed");
     }
-    spend_err = mdb_cursor_get(spend_cur.get(), &spend_key, &spend_value, MDB_NEXT);
+
+    MINFO("Output migration complete: converted " << values.size() << " legacy row(s)");
+
+    // NB: no spend rows are touched. The old code had two destructive passes that
+    // deleted spends via the account-id DUPSORT key (mis-modelled as an output
+    // key), which could wipe valid spends. Spends are keyed independently and
+    // remain valid across this migration.
   }
-  if (spend_err != MDB_NOTFOUND) MONERO_THROW(lmdb::error(spend_err), "spend cursor iteration failed");
-}
 
   expect<void> migrate(MDB_txn& txn, tables_ const& tables, unsigned oldversion)
   {
@@ -1053,9 +1010,18 @@ namespace db
 
   storage storage::open(const char* path, unsigned create_queue_max)
   {
+    // Generous initial memory-map: 8 GiB on 64-bit, 2 GiB where mdb_size_t is
+    // 32-bit (so the constant cannot overflow the type). The LWS DB holds every
+    // chain block hash plus per-account outputs/spends, which far exceeds the
+    // tiny LMDB default. The map is sparse on 64-bit, so this reserves address
+    // space, not disk; the file grows on demand. LMDB silently raises this to the
+    // used size for DBs already larger, and `try_write` resizes further if needed.
+    static constexpr const mdb_size_t one_gib = mdb_size_t(1) << 30;
+    static constexpr const mdb_size_t initial_map_size =
+      (sizeof(mdb_size_t) >= 8) ? (one_gib * 8) : (one_gib * 2);
     return {
       std::make_shared<storage_internal>(
-        MONERO_UNWRAP(lmdb::open_environment(path, 20)), create_queue_max
+        MONERO_UNWRAP(lmdb::open_environment(path, 20, initial_map_size)), create_queue_max
       )
     };
   }
@@ -1240,20 +1206,20 @@ namespace db
       {
         if (current == chain.end() || hashes.size() == hashes.capacity())
         {
-          // std::cout << "hashes.size() in append : " << hashes.size() << std::endl;
           MONERO_CHECK(bulk_insert(cur, blocks_version, epee::to_span(hashes)));
           if (current == chain.end())
           {
-            MINFO("last entered hash in DB : " << *current);
+            // NB: do not dereference `current` here - it is the end iterator, and
+            // reading `*current` is an out-of-bounds access on the source buffer.
+            MINFO("last block height entered in DB : " << (height ? height - 1 : height));
             return success();
-          }           
+          }
           hashes.clear();
         }
 
         hashes.push_back(block_info{db::block_id(height), *current});
         ++height;
       }
-      // std::cout << " inside the append function" << std::endl;
     }
   } // anonymous
 
@@ -1288,37 +1254,44 @@ namespace db
       cursor::blocks blocks_cur;
       MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
 
-      expect<crypto::hash> hash = do_get_block_hash(*blocks_cur, height);
-
-      MDB_val key{};
-      MDB_val value{};
-
       std::uint64_t current = std::uint64_t(height) + 1;
-      auto first = hashes.begin();
-      auto chain = boost::make_iterator_range(++first, hashes.end());
-      // std::cout << "hashes.size() : " << hashes.size() << std::endl;
-      // std::cout << "chain.size() : " << chain.size() << std::endl;
+      auto chain = boost::make_iterator_range(hashes.begin() + 1, hashes.end());
 
-      // for ( ; !chain.empty(); chain.advance_begin(1), ++current)
-      // {
-      //   a++;
-      //   // const int err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_NEXT_DUP);
-      //   // if (err == MDB_NOTFOUND)
-      //   //   break;
-      //   // if (err)
-      //   //   return {lmdb::error(err)};
+      // `hashes[0]` is the anchor at `height` and should already be stored. If it
+      // is, walk our stored hashes forward in lock-step with the incoming chain;
+      // on the first divergence roll back from that height (dropping now-orphaned
+      // blocks and the outputs/spends scanned against them) before appending the
+      // new chain. This is what keeps a reorg from creating duplicate heights and
+      // stale balances. If the anchor is absent (e.g. a fresh DB) we just append.
+      MDB_val key = lmdb::to_val(blocks_version);
+      MDB_val value = lmdb::to_val(height);
+      int err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_GET_BOTH);
+      if (err == 0)
+      {
+        for ( ; !chain.empty(); chain.advance_begin(1), ++current)
+        {
+          err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_NEXT_DUP);
+          if (err == MDB_NOTFOUND)
+            break; // no stored block past here - append the remainder
+          if (err)
+            return {lmdb::error(err)};
 
-      //   hash = blocks.get_value<MONERO_FIELD(block_info, hash)>(value);
-      //   // if (!hash)
-      //   //   return hash.error();
+          const expect<crypto::hash> stored =
+            blocks.get_value<MONERO_FIELD(block_info, hash)>(value);
+          if (!stored)
+            return stored.error();
 
-      //   // if (*hash != chain.front())
-      //   // {
-      //   //   MONERO_CHECK(rollback_chain(this->db->tables, txn, *blocks_cur, db::block_id(current)));
-      //   //   break;
-      //   // }
-      // }
-      // std::cout <<"current : " << current << std::endl;
+          if (*stored != chain.front())
+          {
+            MINFO("Blockchain reorg detected at height " << current << ", rolling back");
+            MONERO_CHECK(rollback_chain(this->db->tables, txn, *blocks_cur, db::block_id(current)));
+            break;
+          }
+        }
+      }
+      else if (err != MDB_NOTFOUND)
+        return {lmdb::error(err)};
+
       return append_block_hashes(*blocks_cur, db::block_id(current), chain);
     });
   }

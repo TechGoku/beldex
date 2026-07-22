@@ -952,7 +952,10 @@ namespace lws
           break;
         }
 
-        disk.sync_chain(db::block_id(details["start_height"]), epee::to_span(blk_ids));
+        const expect<void> synced =
+          disk.sync_chain(db::block_id(details["start_height"]), epee::to_span(blk_ids));
+        if (!synced)
+          throw std::runtime_error{"Failed to sync chain hashes to DB: " + synced.error().message()};
         blk_ids.clear();
         a = block_ids_size + start_height - 1;
       }
