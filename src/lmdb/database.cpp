@@ -84,6 +84,11 @@ namespace lmdb
         environment out{obj};
 
         MONERO_LMDB_CHECK(mdb_env_set_maxdbs(out.get(), max_dbs));
+        // Raise the reader-slot table above LMDB's default of 126. Concurrent
+        // read txns come from every REST worker and scan thread plus reused
+        // suspended txns; the default can hit MDB_READERS_FULL under load. Must
+        // be set before mdb_env_open. Reader slots are cheap (a few KiB total).
+        MONERO_LMDB_CHECK(mdb_env_set_maxreaders(out.get(), 1024));
         // Set an initial map size *before* opening so the first writes have room.
         // Without this the map starts at the 1 MiB LMDB default and a single large
         // write can exhaust the bounded resize-retries in `try_write`, surfacing as

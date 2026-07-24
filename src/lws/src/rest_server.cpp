@@ -105,7 +105,8 @@ namespace lws
       auto response = cpr::Post(
         cpr::Url{lws::daemon_add},
         cpr::Body{request_body.dump()},
-        cpr::Header{{"Content-Type", "application/json"}}
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Timeout{std::chrono::milliseconds{30000}}
       );
 
       if (response.status_code != 200)
@@ -208,7 +209,8 @@ namespace lws
             auto response_http = cpr::Post(
                 cpr::Url{lws::daemon_add},
                 cpr::Body{request_body.dump()},
-                cpr::Header{{"Content-Type", "application/json"}}
+                cpr::Header{{"Content-Type", "application/json"}},
+                cpr::Timeout{std::chrono::milliseconds{30000}}
             );
     
             if (response_http.status_code != 200)
@@ -454,7 +456,8 @@ namespace lws
 
         auto fee_data = cpr::Post(cpr::Url{lws::daemon_add},
                                   cpr::Body{dynamic_fee.dump()},
-                                  cpr::Header{{"Content-Type", "application/json"}});
+                                  cpr::Header{{"Content-Type", "application/json"}},
+                                  cpr::Timeout{std::chrono::milliseconds{30000}});
 
         json resp = json::parse(fee_data.text);
 
@@ -737,7 +740,8 @@ namespace lws
           // auto histogram_resp = client->receive<histogram_rpc::Response>(std::chrono::minutes{3}, MLWS_CURRENT_LOCATION);
           auto histogram_data = cpr::Post(cpr::Url{lws::daemon_add},
                                           cpr::Body{output_histogram.dump()},
-                                          cpr::Header{{"Content-Type", "application/json"}});
+                                          cpr::Header{{"Content-Type", "application/json"}},
+                                          cpr::Timeout{std::chrono::milliseconds{30000}});
 
           json resp = json::parse(histogram_data.text);
           // if (!histogram_resp)
@@ -789,7 +793,8 @@ namespace lws
           //   client->receive<distribution_rpc::Response>(std::chrono::minutes{3}, MLWS_CURRENT_LOCATION);
           auto distribution_data = cpr::Post(cpr::Url{lws::daemon_add},
                                              cpr::Body{output_distribution.dump()},
-               cpr::Header{ { "Content-Type", "application/json" }});
+               cpr::Header{ { "Content-Type", "application/json" }},
+               cpr::Timeout{std::chrono::milliseconds{30000}});
 
           json resp = json::parse(distribution_data.text);
           // std::cout << "get_output_distribution : " << resp << std::endl;
@@ -863,7 +868,8 @@ namespace lws
             // MONERO_CHECK(client->send(std::move(msg), std::chrono::seconds{10}));
             auto out_keys_data = cpr::Post(cpr::Url{lws::daemon_add},
                                            cpr::Body{out_keys.dump()},
-                 cpr::Header{ { "Content-Type", "application/json" }});
+                 cpr::Header{ { "Content-Type", "application/json" }},
+                 cpr::Timeout{std::chrono::milliseconds{30000}});
 
             json resp = json::parse(out_keys_data.text);
             // std::cout << "get_outs response : " << resp << std::endl;
@@ -1012,7 +1018,8 @@ namespace lws
           // std::cout <<"message : " << message.dump() << std::endl;
         auto resp = cpr::Post(cpr::Url{lws::daemon_add},
                               cpr::Body{message.dump()},
-                         cpr::Header{ { "Content-Type", "application/json" }});
+                         cpr::Header{ { "Content-Type", "application/json" }},
+                         cpr::Timeout{std::chrono::milliseconds{30000}});
 
         json daemon_resp = json::parse(resp.text);
         // std::cout <<"daemon_resp : " << daemon_resp << std::endl;

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <fstream>
 
@@ -181,18 +182,18 @@ namespace lws
         }
         else
           extra_nonce = boost::none;
-      } // destruct `extra` vector
-      {
 
+        // Reuse the already-parsed `extra` here instead of calling
+        // get_field_from_tx_extra(tx.extra, ...), which would re-run
+        // parse_tx_extra over tx.extra a second time. Same result.
         cryptonote::tx_extra_tx_key_image_proofs key_image_proofs;
-        get_field_from_tx_extra(tx.extra, key_image_proofs);
-
-        if (!key_image_proofs.proofs.empty())
+        if (cryptonote::find_tx_extra_field_by_type(extra, key_image_proofs) &&
+            !key_image_proofs.proofs.empty())
         {
           // Assign the key_image from the first proof to locked_key_image
           locked_key_image = key_image_proofs.proofs.front().key_image;
         }
-      }
+      } // destruct `extra` vector
 
       for (account &user : users)
       {
@@ -441,7 +442,8 @@ namespace lws
             auto response = cpr::Post(
               cpr::Url{daemon_rpc},
               cpr::Body{request.dump()},
-              cpr::Header{{"Content-Type", "application/json"}}
+              cpr::Header{{"Content-Type", "application/json"}},
+              cpr::Timeout{block_rpc_timeout}
             );
 
             if (response.text.empty())
@@ -468,7 +470,7 @@ namespace lws
             throw std::runtime_error{"Daemon unexpectedly returned zero blocks and status failed"};
           }
           // ---- Parse minor_tx_hashes ----
-          std::map<uint, crypto::hash> heightWithHash;
+          std::unordered_map<uint, crypto::hash> heightWithHash;
           if (details.contains("minor_tx_hashes") &&
               !details["minor_tx_hashes"].is_null())
           {
@@ -910,7 +912,8 @@ namespace lws
           auto response = cpr::Post(
             cpr::Url{daemon_rpc},
             cpr::Body{request.dump()},
-            cpr::Header{{"Content-Type", "application/json"}}
+            cpr::Header{{"Content-Type", "application/json"}},
+            cpr::Timeout{sync_rpc_timeout}
           );
 
           if (response.text.empty())

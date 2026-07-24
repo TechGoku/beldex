@@ -87,19 +87,13 @@ namespace wire
     check_flush();
   }
   void json_writer::binary(epee::span<const std::uint8_t> source)
-  {/* TODO update monero project
-    std::array<char, 256> buffer;
-    if (source.size() <= buffer.size() / 2)
-    {
-      if (!epee::to_hex::buffer({buffer.data(), source.size() * 2}, source))
-        throw std::logic_error{"Invalid buffer size for binary->hex conversion"};
-      string({buffer.data(), source.size() * 2});
-    }
-    else
-    {*/
-      const auto hex = epee::to_hex::string(source);
-      string(hex);
-      //}
+  {
+    // NOTE: a stack-buffer fast path (avoiding this per-field std::string alloc)
+    // needs epee::to_hex::buffer_unchecked, which is private, or a compile-time
+    // size. Left as the allocating path until that is exposed. See #15 in
+    // LWS_OPTIMIZATION.md.
+    const auto hex = epee::to_hex::string(source);
+    string(hex);
   }
 
 
