@@ -172,6 +172,73 @@ namespace lws
       return cache;
     }
 
+    // Cache slow-changing, request-independent daemon data behind a short TTL,
+    // the same pattern as get_master_node_cache above. The fee estimate and the
+    // RingCT (amount 0) output distribution both change ~once per block; before
+    // this, every get_unspent_outs did a live get_fee_estimate and every
+    // get_random_outs did a live get_output_distribution (a large JSON) even
+    // though the parameters are constant. The cached response shape is identical
+    // (only up to `cache_ttl` stale), so clients are unaffected. A few blocks of
+    // staleness in the distribution is harmless: decoy selection deliberately
+    // avoids the very newest outputs anyway.
+    expect<json> get_fee_estimate_cache()
+    {
+      static constexpr const auto cache_ttl = std::chrono::seconds{30};
+      static std::mutex cache_mutex;
+      static json cache{};
+      static auto last_update = std::chrono::steady_clock::now();
+      static bool cache_initialized = false;
+
+      {
+        const std::lock_guard<std::mutex> lock{cache_mutex};
+        if (cache_initialized && std::chrono::steady_clock::now() - last_update < cache_ttl)
+          return cache;
+      }
+
+      json params = json::object();
+      params["grace_blocks"] = std::uint64_t(10);
+      auto fetched = post_json_rpc("get_fee_estimate", std::move(params));
+      if (!fetched)
+        return fetched.error();
+
+      const std::lock_guard<std::mutex> lock{cache_mutex};
+      cache = std::move(*fetched);
+      last_update = std::chrono::steady_clock::now();
+      cache_initialized = true;
+      return cache;
+    }
+
+    expect<json> get_output_distribution_cache()
+    {
+      static constexpr const auto cache_ttl = std::chrono::seconds{30};
+      static std::mutex cache_mutex;
+      static json cache{};
+      static auto last_update = std::chrono::steady_clock::now();
+      static bool cache_initialized = false;
+
+      {
+        const std::lock_guard<std::mutex> lock{cache_mutex};
+        if (cache_initialized && std::chrono::steady_clock::now() - last_update < cache_ttl)
+          return cache;
+      }
+
+      json params = {
+        {"amounts", json::array({0})},
+        {"from_height", 0},
+        {"to_height", 0},
+        {"cumulative", true}
+      };
+      auto fetched = post_json_rpc("get_output_distribution", std::move(params));
+      if (!fetched)
+        return fetched.error();
+
+      const std::lock_guard<std::mutex> lock{cache_mutex};
+      cache = std::move(*fetched);
+      last_update = std::chrono::steady_clock::now();
+      cache_initialized = true;
+      return cache;
+    }
+
 
     //! \return Account info from the DB, iff key matches address AND address is NOT hidden.
     expect<std::pair<db::account, db::storage_reader>> open_account(const rpc::account_credentials& creds, db::storage disk)
@@ -446,20 +513,14 @@ namespace lws
         if (!master_node_data)
           return master_node_data.error();
 
-        uint64_t grace_blocks = 10;
+        // Fee estimate is request-independent (constant grace_blocks) and
+        // changes slowly; served from a short-TTL cache instead of a live
+        // daemon round-trip per request.
+        auto fee_data = get_fee_estimate_cache();
+        if (!fee_data)
+          return fee_data.error();
 
-        json dynamic_fee = {
-            {"jsonrpc", "2.0"},
-            {"id", "0"},
-            {"method", "get_fee_estimate"},
-            {"params", {{"grace_blocks", grace_blocks}}}};
-
-        auto fee_data = cpr::Post(cpr::Url{lws::daemon_add},
-                                  cpr::Body{dynamic_fee.dump()},
-                                  cpr::Header{{"Content-Type", "application/json"}},
-                                  cpr::Timeout{std::chrono::milliseconds{30000}});
-
-        json resp = json::parse(fee_data.text);
+        json resp = std::move(*fee_data);
 
         if ((req.use_dust && req.use_dust) || !req.dust_threshold)
           req.dust_threshold = rpc::safe_uint64(0);
@@ -782,21 +843,14 @@ namespace lws
           //       // epee::byte_slice msg =
           //       //   rpc::client::make_message("get_output_distribution", distribution_req.request);
           //       // MONERO_CHECK(client->send(std::move(msg), std::chrono::seconds{10}));
-          json output_distribution = {
-            {"jsonrpc","2.0"},
-            {"id","0"},
-            {"method","get_output_distribution"},
-            {"params",{{"amounts",distribution_req.request.amounts},{"from_height",distribution_req.request.from_height},{"to_height",distribution_req.request.to_height},{"cumulative",distribution_req.request.cumulative}}}
-          };
+          // The distribution request is constant (amount 0, full cumulative
+          // range); served from a short-TTL cache instead of refetching + parsing
+          // this large JSON on every get_random_outs.
+          auto distribution_data = get_output_distribution_cache();
+          if (!distribution_data)
+            return distribution_data.error();
 
-          // auto distribution_resp =
-          //   client->receive<distribution_rpc::Response>(std::chrono::minutes{3}, MLWS_CURRENT_LOCATION);
-          auto distribution_data = cpr::Post(cpr::Url{lws::daemon_add},
-                                             cpr::Body{output_distribution.dump()},
-               cpr::Header{ { "Content-Type", "application/json" }},
-               cpr::Timeout{std::chrono::milliseconds{30000}});
-
-          json resp = json::parse(distribution_data.text);
+          json resp = std::move(*distribution_data);
           // std::cout << "get_output_distribution : " << resp << std::endl;
           // if (!distribution_resp)
           //   return distribution_resp.error();
