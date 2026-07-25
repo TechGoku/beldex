@@ -52,7 +52,11 @@ namespace rpc
   template<typename R>
   inline void read_bytes(wire::json_reader& source, json_response<R>& self)
   {
-    wire::object(source, WIRE_FIELD(id), WIRE_FIELD(result));
+    // `id` is echoed verbatim by the daemon (the HTTP JSON-RPC request sends it
+    // as the string "0"), and nothing here consumes it, so it is left unread -
+    // skipped as an unknown key - rather than requiring an integer. The old
+    // scanner path rebuilt the envelope with an integer id before parsing.
+    wire::object(source, WIRE_FIELD(result));
   }
 
 
