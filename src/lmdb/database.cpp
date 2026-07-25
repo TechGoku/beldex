@@ -75,7 +75,7 @@ namespace lmdb
         }
     }
 
-    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size) noexcept
+    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size, unsigned max_readers) noexcept
     {
         MONERO_PRECOND(path != nullptr);
 
@@ -88,7 +88,7 @@ namespace lmdb
         // read txns come from every REST worker and scan thread plus reused
         // suspended txns; the default can hit MDB_READERS_FULL under load. Must
         // be set before mdb_env_open. Reader slots are cheap (a few KiB total).
-        MONERO_LMDB_CHECK(mdb_env_set_maxreaders(out.get(), 1024));
+        MONERO_LMDB_CHECK(mdb_env_set_maxreaders(out.get(), max_readers));
         // Set an initial map size *before* opening so the first writes have room.
         // Without this the map starts at the 1 MiB LMDB default and a single large
         // write can exhaust the bounded resize-retries in `try_write`, surfacing as
@@ -198,6 +198,14 @@ namespace lmdb
         release_context(ctx);
         if (err)
             return {lmdb::error(err)};
+        return success();
+    }
+
+    expect<void> database::compact(const char* dest_path) const noexcept
+    {
+        MONERO_PRECOND(handle() != nullptr);
+        MONERO_PRECOND(dest_path != nullptr);
+        MONERO_LMDB_CHECK(mdb_env_copy2(handle(), dest_path, MDB_CP_COMPACT));
         return success();
     }
 } // lmdb

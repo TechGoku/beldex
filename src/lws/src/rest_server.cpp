@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <cpr/cpr.h>
 
@@ -127,10 +128,27 @@ namespace lws
       }
     }
 
+    //! `crypto::key_image` has no `std::hash` specialization in this tree.
+    struct key_image_hash
+    {
+      std::size_t operator()(crypto::key_image const& image) const noexcept
+      {
+        std::size_t out{};
+        static_assert(sizeof(out) <= sizeof(image.data), "key_image smaller than size_t");
+        std::memcpy(std::addressof(out), image.data, sizeof(out));
+        return out;
+      }
+    };
+
     struct master_node_cache
     {
       json master_nodes;
       json blacklist;
+      // Built once per cache refresh from `blacklist`/`master_nodes` above so
+      // request handlers do an O(1) lookup instead of walking every
+      // masternode/contributor/contribution per output, per request.
+      std::unordered_map<crypto::key_image, std::uint64_t, key_image_hash> blacklist_by_image;
+      std::unordered_map<crypto::key_image, std::uint64_t, key_image_hash> locked_by_image;
     };
 
     expect<master_node_cache> get_master_node_cache()
@@ -166,6 +184,34 @@ namespace lws
         cache.blacklist = std::move(blacklist->at(0));
       else
         cache.blacklist = std::move(*blacklist);
+
+      cache.blacklist_by_image.clear();
+      for (const auto& item : cache.blacklist["result"]["blacklist"])
+      {
+        crypto::key_image image;
+        const std::string image_str = item["key_image"];
+        if (epee::string_tools::hex_to_pod(image_str, image))
+          cache.blacklist_by_image[image] = item["amount"].get<std::uint64_t>();
+      }
+
+      cache.locked_by_image.clear();
+      for (const auto& mn_all : cache.master_nodes["result"]["master_node_states"])
+      {
+        if (!mn_all.contains("contributors"))
+          continue;
+        for (const auto& mn_contrib : mn_all["contributors"])
+        {
+          if (!mn_contrib.contains("locked_contributions"))
+            continue;
+          for (const auto& contribution : mn_contrib["locked_contributions"])
+          {
+            crypto::key_image image;
+            const std::string image_str = contribution["key_image"].get<std::string>();
+            if (tools::hex_to_type(image_str, image))
+              cache.locked_by_image[image] = contribution["amount"].get<std::uint64_t>();
+          }
+        }
+      }
 
       last_update = std::chrono::steady_clock::now();
       cache_initialized = true;
@@ -357,13 +403,6 @@ namespace lws
 
         std::vector<crypto::key_image> processed;
 
-        lws::db::account_address primary_address{req.address.view_public, req.address.spend_public};
-        cryptonote::account_public_address crypto_address;
-        crypto_address.m_view_public_key = primary_address.view_public;
-        crypto_address.m_spend_public_key = primary_address.spend_public;
-
-        std::string wallet_address = cryptonote::get_account_address_as_str(lws::config::network, false, crypto_address);
-
         auto master_node_data = get_master_node_cache();
         if (!master_node_data)
           return master_node_data.error();
@@ -408,61 +447,25 @@ namespace lws
               output.get_value<MONERO_FIELD(db::output, locked_key_image)>();
 
           auto it = std::find(processed.begin(), processed.end(), locked_key_image);
-          bool matched_master_node_lock = false;
 
           if (!(it != processed.end()) && locked_key_image != crypto::key_image{})
           {
-            for (const auto &item : (*master_node_data).blacklist["result"]["blacklist"])
+            // O(1) lookup against the maps built once per master-node cache
+            // refresh (10s TTL), instead of walking every masternode /
+            // contributor / contribution for this output.
+            const auto blacklisted = master_node_data->blacklist_by_image.find(locked_key_image);
+            if (blacklisted != master_node_data->blacklist_by_image.end())
             {
-              std::string blacklist_key_image_str = item["key_image"];
-              crypto::key_image blacklist_key_image;
-
-              if (!epee::string_tools::hex_to_pod(blacklist_key_image_str, blacklist_key_image))
-              {
-                MWARNING("Failed to convert blacklist key image string to crypto::key_image");
-                continue;
-              }
-
-              if (locked_key_image == blacklist_key_image)
-              {
-                
-                resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + std::uint64_t(item["amount"]));
-                processed.push_back(locked_key_image);
-                matched_master_node_lock = true;
-                break;
-              }
+              resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + blacklisted->second);
+              processed.push_back(locked_key_image);
             }
-
-            if (!matched_master_node_lock)
+            else
             {
-              for (auto &mn_all : (*master_node_data).master_nodes["result"]["master_node_states"])
+              const auto locked = master_node_data->locked_by_image.find(locked_key_image);
+              if (locked != master_node_data->locked_by_image.end())
               {
-                for (auto &mn_contrib : mn_all["contributors"])
-                {
-                  std::string address_str = mn_contrib["address"].get<std::string>();
-
-                  if (wallet_address != address_str)
-                    continue;
-
-                  for (auto const &contribution : mn_contrib["locked_contributions"])
-                  {
-                    crypto::key_image check_image;
-                    std::string key_image_str = contribution["key_image"].get<std::string>();
-                    if (tools::hex_to_type(key_image_str, check_image) && locked_key_image == check_image)
-                    {
-                      resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + std::uint64_t(contribution["amount"]));
-                      processed.push_back(locked_key_image);
-                      matched_master_node_lock = true;
-                      break;
-                    }
-                  }
-
-                  if (matched_master_node_lock)
-                    break;
-                }
-
-                if (matched_master_node_lock)
-                  break;
+                resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + locked->second);
+                processed.push_back(locked_key_image);
               }
             }
           }
@@ -502,12 +505,6 @@ namespace lws
         auto user = open_account(req.creds, std::move(disk));
         if (!user)
           return user.error();
-
-        lws::db::account_address primary_address{req.creds.address.view_public, req.creds.address.spend_public};
-        cryptonote::account_public_address crypto_address;
-        crypto_address.m_view_public_key = primary_address.view_public;
-        crypto_address.m_spend_public_key = primary_address.spend_public;
-        std::string wallet_address = cryptonote::get_account_address_as_str(lws::config::network, false, crypto_address);
 
         auto master_node_data = get_master_node_cache();
         if (!master_node_data)
@@ -549,54 +546,20 @@ namespace lws
 
           if (locked_key_image != crypto::key_image{})
           {
-            for (const auto& item : (*master_node_data).blacklist["result"]["blacklist"])
+            // O(1) lookup against the maps built once per master-node cache
+            // refresh (10s TTL), instead of walking every masternode /
+            // contributor / contribution for this output. Amount is still
+            // checked to match the prior per-entry comparison.
+            const auto blacklisted = master_node_data->blacklist_by_image.find(locked_key_image);
+            if (blacklisted != master_node_data->blacklist_by_image.end() && blacklisted->second == value_l)
             {
-              std::string blacklist_key_image_str = item["key_image"];
-              crypto::key_image blacklist_key_image;
-
-              if (!epee::string_tools::hex_to_pod(blacklist_key_image_str, blacklist_key_image))
-              {
-                std::cerr << "Failed to convert blacklist key image string to crypto::key_image." << std::endl;
-                continue;
-              }
-
-              if (locked_key_image == blacklist_key_image && value_l == item["amount"].get<std::uint64_t>())
-              {
-                should_skip_output = true;
-                break;
-              }
+              should_skip_output = true;
             }
-
-            if (!should_skip_output)
+            else
             {
-              for (const auto& mn_all : (*master_node_data).master_nodes["result"]["master_node_states"])
-              {
-                if (should_skip_output)
-                  break;
-
-                for (const auto& mn_contrib : mn_all["contributors"])
-                {
-                  std::string address_str = mn_contrib["address"].get<std::string>();
-
-                  if (wallet_address != address_str)
-                    continue;
-
-                  for (const auto& contribution : mn_contrib["locked_contributions"])
-                  {
-                    crypto::key_image check_image;
-                    std::string key_image_str = contribution["key_image"].get<std::string>();
-                    std::uint64_t conAmount = contribution["amount"].get<std::uint64_t>();
-
-                    if (tools::hex_to_type(key_image_str, check_image) && locked_key_image == check_image && value_l == conAmount)
-                    {
-                      should_skip_output = true;
-                      break;
-                    }
-                  }
-                  if (should_skip_output)
-                    break;
-                }
-              }
+              const auto locked = master_node_data->locked_by_image.find(locked_key_image);
+              if (locked != master_node_data->locked_by_image.end() && locked->second == value_l)
+                should_skip_output = true;
             }
           }
 

@@ -44,6 +44,8 @@ namespace
     const command_line::arg_descriptor<std::chrono::minutes::rep> rates_interval;
     const command_line::arg_descriptor<unsigned short> log_level;
     const command_line::arg_descriptor<std::string> config_file;
+    const command_line::arg_descriptor<std::uint64_t> db_map_size;
+    const command_line::arg_descriptor<unsigned> db_max_readers;
 
     static std::string get_default_zmq()
     {
@@ -76,6 +78,8 @@ namespace
       , rates_interval{"exchange-rate-interval", "Retrieve exchange rates in minute intervals from cryptocompare.com if greater than 0", 0}
       , log_level{"log-level", "Log level [0-4]", 1}
       , config_file{"config-file", "Specify any option in a config file; <name>=<value> on separate lines"}
+      , db_map_size{"db-map-size", "Initial LMDB memory-map size in bytes; 0 keeps the built-in default sizing", 0}
+      , db_max_readers{"db-max-readers", "Maximum concurrent LMDB reader slots", 1024}
     {}
 
     void prepare(boost::program_options::options_description& description) const
@@ -97,6 +101,8 @@ namespace
       command_line::add_arg(description, rates_interval);
       command_line::add_arg(description, log_level);
       command_line::add_arg(description, config_file);
+      command_line::add_arg(description, db_map_size);
+      command_line::add_arg(description, db_max_readers);
     }
   };
  struct program
@@ -110,6 +116,8 @@ namespace
     std::chrono::minutes rates_interval;
     std::size_t scan_threads;
     unsigned create_queue_max;
+    std::uint64_t db_map_size;
+    unsigned db_max_readers;
   };
 
   void print_help(std::ostream& out)
@@ -170,6 +178,8 @@ namespace
         std::chrono::minutes{command_line::get_arg(args, opts.rates_interval)},
         command_line::get_arg(args, opts.scan_threads),
         command_line::get_arg(args, opts.create_queue_max),
+        command_line::get_arg(args, opts.db_map_size),
+        command_line::get_arg(args, opts.db_max_readers),
     };
 
     prog.rest_config.threads = std::max(std::size_t(1), prog.rest_config.threads);
@@ -204,7 +214,7 @@ namespace
   {
     std::signal(SIGINT, [] (int) { lws::scanner::stop(); });
     fs::create_directories(prog.db_path);
-    auto disk = lws::db::storage::open(prog.db_path.c_str(), prog.create_queue_max);
+    auto disk = lws::db::storage::open(prog.db_path.c_str(), prog.create_queue_max, prog.db_map_size, prog.db_max_readers);
     MINFO("Using beldexd RPC at " << prog.daemon_rpc);
 
     lws::scanner::sync(disk.clone(),prog.daemon_rpc);

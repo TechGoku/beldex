@@ -266,6 +266,23 @@ namespace
     json.finish();
   }
 
+  void compact(program prog, std::ostream& out)
+  {
+    if (prog.arguments.size() != 1)
+      throw std::runtime_error{"compact requires 1 argument"};
+
+    // Safe to run against a live, running beldex-lws-daemon: LMDB snapshots
+    // the environment for the copy and does not block it. Writes a
+    // compacted copy to the given path; swapping it into place is a manual,
+    // separate step for the operator.
+    const std::string& dest_path = prog.arguments[0];
+    MONERO_UNWRAP(prog.disk.compact(dest_path.c_str()));
+
+    wire::json_stream_writer json{out};
+    wire::object(json, wire::field("compacted_to", dest_path));
+    json.finish();
+  }
+
   struct command
   {
     char const* const name;
@@ -277,6 +294,7 @@ namespace
   {
     {"accept_requests",       &accept_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]..."},
     {"add_account",           &add_account,     "\t\t<base58 address> <view key hex>"},
+    {"compact",               &compact,         "\t\t<destination path>"},
     {"create_admin",          &create_admin,    ""},
     {"debug_database",        &debug_database,  ""},
     {"list_accounts",         &list_accounts,   ""},

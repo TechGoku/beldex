@@ -217,10 +217,18 @@ namespace db
       return success();
     }
 
+    /*! \param append If true, `values` are known to be in ascending dup-sort
+        order for `key` (e.g. block hashes by height) and `MDB_APPENDDUP` is
+        used to skip the search/rebalance LMDB would otherwise do. A
+        `MDB_KEYEXIST` in this mode means the data was *not* actually in
+        order, so it is treated as a hard error instead of being skipped -
+        silently dropping an out-of-order entry would corrupt the sequence.
+        When false (default), behavior is unchanged: `MDB_NODUPDATA`, and an
+        existing duplicate is skipped and insertion continues. */
     template<typename K, typename V>
-    expect<void> bulk_insert(MDB_cursor& cur, K const& key, epee::span<V> values) noexcept
+    expect<void> bulk_insert(MDB_cursor& cur, K const& key, epee::span<V> values, bool append = false) noexcept
     {
-      // std::cout << " values.size() : " << values.size() << std::endl;
+      const unsigned put_flags = (append ? MDB_APPENDDUP : MDB_NODUPDATA) | MDB_MULTIPLE;
       while (!values.empty())
       {
         void const* const data = reinterpret_cast<void const*>(values.data());
@@ -228,16 +236,14 @@ namespace db
         MDB_val value_bytes[2] = {
           MDB_val{sizeof(V), const_cast<void*>(data)}, MDB_val{values.size(), nullptr}
         };
-        // std::cout << " before the mdb_cursor_put " << std::endl;
-        int err = mdb_cursor_put(
-          &cur, &key_bytes, value_bytes, (MDB_NODUPDATA | MDB_MULTIPLE)
-        );
+        int err = mdb_cursor_put(&cur, &key_bytes, value_bytes, put_flags);
+        if (err == MDB_KEYEXIST && append)
+          return {lmdb::error(err)};
         if (err && err != MDB_KEYEXIST)
           return {lmdb::error(err)};
 
         values.remove_prefix(value_bytes[1].mv_size + (err == MDB_KEYEXIST ? 1 : 0));
       }
-      // std::cout << " inside the bulk insert function" << std::endl;
       return success();
     }
 
@@ -1008,7 +1014,7 @@ namespace db
     return nullptr;
   }
 
-  storage storage::open(const char* path, unsigned create_queue_max)
+  storage storage::open(const char* path, unsigned create_queue_max, std::size_t map_size, unsigned max_readers)
   {
     // Generous initial memory-map: 8 GiB on 64-bit, 2 GiB where mdb_size_t is
     // 32-bit (so the constant cannot overflow the type). The LWS DB holds every
@@ -1017,11 +1023,15 @@ namespace db
     // space, not disk; the file grows on demand. LMDB silently raises this to the
     // used size for DBs already larger, and `try_write` resizes further if needed.
     static constexpr const mdb_size_t one_gib = mdb_size_t(1) << 30;
-    static constexpr const mdb_size_t initial_map_size =
+    static constexpr const mdb_size_t default_map_size =
       (sizeof(mdb_size_t) >= 8) ? (one_gib * 8) : (one_gib * 2);
+    static constexpr const unsigned default_max_readers = 1024;
+
+    const mdb_size_t effective_map_size = map_size ? mdb_size_t(map_size) : default_map_size;
+    const unsigned effective_max_readers = max_readers ? max_readers : default_max_readers;
     return {
       std::make_shared<storage_internal>(
-        MONERO_UNWRAP(lmdb::open_environment(path, 20, initial_map_size)), create_queue_max
+        MONERO_UNWRAP(lmdb::open_environment(path, 20, effective_map_size, effective_max_readers)), create_queue_max
       )
     };
   }
@@ -1032,6 +1042,12 @@ namespace db
   storage storage::clone() const noexcept
   {
     return storage{db};
+  }
+
+  expect<void> storage::compact(const char* dest_path) const
+  {
+    MONERO_PRECOND(db != nullptr);
+    return db->compact(dest_path);
   }
 
   expect<storage_reader> storage::start_read(lmdb::suspended_txn txn) const
@@ -1206,7 +1222,9 @@ namespace db
       {
         if (current == chain.end() || hashes.size() == hashes.capacity())
         {
-          MONERO_CHECK(bulk_insert(cur, blocks_version, epee::to_span(hashes)));
+          // Heights are strictly ascending here, so this is safe to insert
+          // with MDB_APPENDDUP (see #8 in LWS_OPTIMIZATION.md).
+          MONERO_CHECK(bulk_insert(cur, blocks_version, epee::to_span(hashes), /*append=*/true));
           if (current == chain.end())
           {
             // NB: do not dereference `current` here - it is the end iterator, and

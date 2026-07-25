@@ -54,7 +54,8 @@ namespace lmdb
     //! \param map_size Initial memory-map size in bytes; `0` keeps the LMDB
     //!   default (1 MiB). On 64-bit the map is sparse virtual address space, so
     //!   a large value does not preallocate disk - the file grows on demand.
-    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size = 0) noexcept;
+    //! \param max_readers Maximum concurrent reader slots (LMDB default 126).
+    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size = 0, unsigned max_readers = 1024) noexcept;
 
     //! Context given to LMDB.
     struct context
@@ -102,6 +103,16 @@ namespace lmdb
 
         //! Commit the read-write transaction.
         expect<void> commit(write_txn txn) noexcept;
+
+        /*!
+            Copy this environment, compacting free space out, to `dest_path`.
+            Safe to run against a live environment - LMDB takes an internal
+            read-txn snapshot for the duration of the copy, so it does not
+            block concurrent readers/writers. The result is a separate,
+            equivalent DB at `dest_path` for the operator to swap in during a
+            maintenance window; this call never touches the live mapped file.
+        */
+        expect<void> compact(const char* dest_path) const noexcept;
 
         /*!
             Create a write transaction, pass it to `f`, then try to commit

@@ -138,13 +138,16 @@ namespace db
 
       \param path Directory for LMDB storage
       \param create_queue_max Maximum number of create account requests allowed.
+      \param map_size Initial LMDB memory-map size in bytes; `0` keeps the
+        built-in default sizing (see `storage.cpp`).
+      \param max_readers Maximum concurrent LMDB reader slots.
 
       \throw std::system_error on any LMDB error (all treated as fatal).
       \throw std::bad_alloc If `std::shared_ptr` fails to allocate.
 
       \return A ready light-wallet server database.
     */
-    static storage open(const char* path, unsigned create_queue_max);
+    static storage open(const char* path, unsigned create_queue_max, std::size_t map_size = 0, unsigned max_readers = 0);
 
     storage(storage&&) = default;
     storage(storage const&) = delete;
@@ -156,6 +159,14 @@ namespace db
 
     //! \return A copy of the LMDB environment, but not reusable txn/cursors.
     storage clone() const noexcept;
+
+    /*!
+      Copy this database, compacting free space out, to `dest_path`. Safe to
+      run against a live, running server - does not block or otherwise
+      affect it. Produces a separate, equivalent DB for the operator to swap
+      in during a maintenance window.
+    */
+    expect<void> compact(const char* dest_path) const;
 
     // ! Rollback chain and accounts to `height`.
    expect<void> rollback(block_id height);
