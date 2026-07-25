@@ -210,15 +210,12 @@ namespace lws
         return blacklist.error();
 
       const std::lock_guard<std::mutex> lock{cache_mutex};
-      if (master_nodes->is_array() && !master_nodes->empty())
-        cache.master_nodes = std::move(master_nodes->at(0));
-      else
-        cache.master_nodes = std::move(*master_nodes);
-
-      if (blacklist->is_array() && !blacklist->empty())
-        cache.blacklist = std::move(blacklist->at(0));
-      else
-        cache.blacklist = std::move(*blacklist);
+      // Peel any envelope-level array wrapping (single, or doubly nested as
+      // get_output_distribution returns), leaving the envelope object.
+      cache.master_nodes = std::move(*master_nodes);
+      cache.blacklist = std::move(*blacklist);
+      unwrap_json_rpc(cache.master_nodes);
+      unwrap_json_rpc(cache.blacklist);
 
       // Some daemon builds also wrap "result" itself in a single-element array
       // (get_fee_estimate does; see deep_unwrap). Peel it in place so the
@@ -406,15 +403,17 @@ namespace lws
                 return make_error_code(std::errc::invalid_argument);
             }
 
-            unwrap_json_rpc(full_response); // daemon may wrap the envelope in an array
-
-            if (!full_response.contains("result"))
+            // The daemon may wrap the envelope (and/or the result) in a
+            // single-element array, sometimes doubly; peel both levels so the
+            // field reads below work regardless of nesting depth.
+            const json& env = deep_unwrap(full_response);
+            if (!env.is_object() || !env.contains("result"))
             {
                 MERROR("Missing 'result' in get_info response");
                 return make_error_code(std::errc::protocol_error);
             }
-    
-            const auto& result = deep_unwrap(full_response["result"]);
+
+            const auto& result = deep_unwrap(env.at("result"));
     
             try
             {
@@ -850,7 +849,7 @@ namespace lws
           json resp = std::move(*histogram_data);
           try
           {
-            for (const auto& raw : deep_unwrap(resp.at("result")).at("histogram"))
+            for (const auto& raw : deep_unwrap(deep_unwrap(resp).at("result")).at("histogram"))
             {
               const json& it = deep_unwrap(raw);
               lws::histogram histogram_resp{};
@@ -903,7 +902,7 @@ namespace lws
           json resp = std::move(*distribution_data);
           try
           {
-            const json& dists = deep_unwrap(resp.at("result")).at("distributions");
+            const json& dists = deep_unwrap(deep_unwrap(resp).at("result")).at("distributions");
             if (dists.size() != 1)
               return {lws::error::bad_daemon_response};
             const json& dist0 = deep_unwrap(dists.at(0));
@@ -974,7 +973,7 @@ namespace lws
             std::vector <get_keys_rpc> keys{};
             try
             {
-              for (const auto& raw : deep_unwrap(resp.at("result")).at("outs"))
+              for (const auto& raw : deep_unwrap(deep_unwrap(resp).at("result")).at("outs"))
               {
                 const json& it = deep_unwrap(raw);
                 get_keys_rpc key;
