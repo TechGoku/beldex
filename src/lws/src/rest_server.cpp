@@ -93,12 +93,27 @@ namespace lws
       return std::lower_bound(metas.begin(), metas.end(), id, by_output_id{});
     }
 
+    // Beldex's /json_rpc sometimes wraps the response envelope in a
+    // single-element array; unwrap it to the inner object so callers can index
+    // the envelope by key. (get_master_node_cache handled this ad hoc since
+    // 7d73ebe21; the fee / distribution / histogram / get_outs paths did not,
+    // which threw json type_error.305 "operator[] ... with array" while a
+    // client was creating a transaction.)
+    void unwrap_json_rpc(json& j)
+    {
+      if (j.is_array() && !j.empty())
+      {
+        json inner = std::move(j.at(0));
+        j = std::move(inner);
+      }
+    }
+
     expect<json> post_json_rpc(std::string method, json params = json::object())
     {
       json request_body = {
         {"jsonrpc", "2.0"},
         {"id", "0"},
-        {"method", std::move(method)}
+        {"method", method}
       };
       if (!params.empty())
         request_body["params"] = std::move(params);
@@ -119,11 +134,18 @@ namespace lws
       try
       {
         json parsed = json::parse(response.text);
+        unwrap_json_rpc(parsed);
+        if (!parsed.is_object())
+        {
+          MERROR("daemon RPC '" << method << "' returned a non-object response: "
+                 << response.text.substr(0, 300));
+          return make_error_code(std::errc::protocol_error);
+        }
         return parsed;
       }
       catch (const std::exception& e)
       {
-        MERROR("daemon RPC JSON parse failed: " << e.what());
+        MERROR("daemon RPC '" << method << "' JSON parse failed: " << e.what());
         return make_error_code(std::errc::invalid_argument);
       }
     }
@@ -343,7 +365,9 @@ namespace lws
                 MERROR("JSON parse failed: " << e.what());
                 return make_error_code(std::errc::invalid_argument);
             }
-    
+
+            unwrap_json_rpc(full_response); // daemon may wrap the envelope in an array
+
             if (!full_response.contains("result"))
             {
                 MERROR("Missing 'result' in get_info response");
@@ -582,17 +606,32 @@ namespace lws
         if (received < std::uint64_t(req.amount))
           return {lws::error::account_not_found};
 
-        if (resp["status"] == "Failed")
+        std::uint64_t fee_per_byte, fee_per_output, flash_fee_per_byte,
+                      flash_fee_per_output, flash_fee_fixed, quantization_mask;
+        try
         {
+          // resp is the unwrapped get_fee_estimate envelope (post_json_rpc /
+          // get_fee_estimate_cache). Guard field access so an unexpected daemon
+          // response becomes bad_daemon_response instead of an uncaught throw.
+          if (resp.value("status", std::string{}) == "Failed")
+            return {lws::error::bad_daemon_response};
+
+          const json& result = resp.at("result");
+          if (result.value("status", std::string{"OK"}) == "Failed")
+            return {lws::error::bad_daemon_response};
+
+          fee_per_byte         = result.at("fee_per_byte").get<std::uint64_t>();
+          fee_per_output       = result.at("fee_per_output").get<std::uint64_t>();
+          flash_fee_per_byte   = result.at("flash_fee_per_byte").get<std::uint64_t>();
+          flash_fee_per_output = result.at("flash_fee_per_output").get<std::uint64_t>();
+          flash_fee_fixed      = result.at("flash_fee_fixed").get<std::uint64_t>();
+          quantization_mask    = result.at("quantization_mask").get<std::uint64_t>();
+        }
+        catch (const std::exception& e)
+        {
+          MERROR("get_unspent_outs: unexpected get_fee_estimate response: " << e.what());
           return {lws::error::bad_daemon_response};
         }
-
-        const std::uint64_t fee_per_byte = resp["result"]["fee_per_byte"];
-        const std::uint64_t fee_per_output = resp["result"]["fee_per_output"];
-        const std::uint64_t flash_fee_per_byte = resp["result"]["flash_fee_per_byte"];
-        const std::uint64_t flash_fee_per_output = resp["result"]["flash_fee_per_output"];
-        const std::uint64_t flash_fee_fixed = resp["result"]["flash_fee_fixed"];
-        const std::uint64_t quantization_mask = resp["result"]["quantization_mask"];
 
         return response{fee_per_byte, fee_per_output,flash_fee_per_byte,flash_fee_per_output,flash_fee_fixed,quantization_mask,17,rpc::safe_uint64(received), std::move(unspent), std::move(req.creds.key)};
       }
@@ -754,31 +793,34 @@ namespace lws
 
           // epee::byte_slice msg = rpc::client::make_message("get_output_histogram", histogram_req.request);
           // MONERO_CHECK(client->send(std::move(msg), std::chrono::seconds{10}));
-          json output_histogram = {
-            {"jsonrpc","2.0"},
-            {"id","0"},
-            {"method","get_output_histogram"},
-            {"params",{{"amounts",histogram_req.request.amounts},{"min_count",histogram_req.request.min_count},{"max_count",histogram_req.request.max_count},{"unlocked",histogram_req.request.unlocked},{"recent_cutoff",histogram_req.request.recent_cutoff}}}
+          json histogram_params = {
+            {"amounts", histogram_req.request.amounts},
+            {"min_count", histogram_req.request.min_count},
+            {"max_count", histogram_req.request.max_count},
+            {"unlocked", histogram_req.request.unlocked},
+            {"recent_cutoff", histogram_req.request.recent_cutoff}
           };
-          // std::cout << "output_histogram : " << output_histogram.dump() << std::endl;
-          // auto histogram_resp = client->receive<histogram_rpc::Response>(std::chrono::minutes{3}, MLWS_CURRENT_LOCATION);
-          auto histogram_data = cpr::Post(cpr::Url{lws::daemon_add},
-                                          cpr::Body{output_histogram.dump()},
-                                          cpr::Header{{"Content-Type", "application/json"}},
-                                          cpr::Timeout{std::chrono::milliseconds{30000}});
+          auto histogram_data = post_json_rpc("get_output_histogram", std::move(histogram_params));
+          if (!histogram_data)
+            return histogram_data.error();
 
-          json resp = json::parse(histogram_data.text);
-          // if (!histogram_resp)
-          //   return histogram_resp.error();
-          // std::cout << "output_histogram resp : " << resp << std::endl;
-          for(auto it :resp["result"]["histogram"])
+          json resp = std::move(*histogram_data);
+          try
           {
-            lws::histogram histogram_resp{};
-            histogram_resp.amount = it["amount"];
-            histogram_resp.total_count = it["total_instances"];
-            histogram_resp.unlocked_count = it["unlocked_instances"];
-            histogram_resp.recent_count = it["recent_instances"];
-            histograms.push_back(histogram_resp);
+            for (const auto& it : resp.at("result").at("histogram"))
+            {
+              lws::histogram histogram_resp{};
+              histogram_resp.amount         = it.at("amount");
+              histogram_resp.total_count    = it.at("total_instances");
+              histogram_resp.unlocked_count = it.at("unlocked_instances");
+              histogram_resp.recent_count   = it.at("recent_instances");
+              histograms.push_back(histogram_resp);
+            }
+          }
+          catch (const std::exception& e)
+          {
+            MERROR("get_random_outs: unexpected get_output_histogram response: " << e.what());
+            return {lws::error::bad_daemon_response};
           }
 
           if (histograms.size() != histogram_req.request.amounts.size())
@@ -814,17 +856,21 @@ namespace lws
             return distribution_data.error();
 
           json resp = std::move(*distribution_data);
-          // std::cout << "get_output_distribution : " << resp << std::endl;
-          // if (!distribution_resp)
-          //   return distribution_resp.error();
-          for(auto it :resp["result"]["distributions"][0]["distribution"])
+          try
           {
-            distributions.push_back(it);
+            const json& dists = resp.at("result").at("distributions");
+            if (dists.size() != 1)
+              return {lws::error::bad_daemon_response};
+            if (dists.at(0).at("amount") != 0)
+              return {lws::error::bad_daemon_response};
+            for (const auto& it : dists.at(0).at("distribution"))
+              distributions.push_back(it.get<std::uint64_t>());
           }
-          if (resp["result"]["distributions"].size() != 1)
+          catch (const std::exception& e)
+          {
+            MERROR("get_random_outs: unexpected get_output_distribution response: " << e.what());
             return {lws::error::bad_daemon_response};
-          if (resp["result"]["distributions"][0]["amount"] != 0)
-            return {lws::error::bad_daemon_response};
+          }
 
           // distributions = std::move(distribution_resp->distributions[0].data.distribution);
 
@@ -868,41 +914,33 @@ namespace lws
               output_indices.push_back(it.index);
               i++;
             }
-            // std::cout << "amount index in get_outs : " << amount_index << std::endl;
-            json out_keys = {
-            {"jsonrpc","2.0"},
-            {"id","0"},
-            {"method","get_outs"},
-            {"params",{{"output_indices",output_indices},{"get_txid",false}}}
-           };
-            // std::cout << "out_keys : " << out_keys.dump() << std::endl;
-            // std::cout << "ids.size() :" << ids.size() << std::endl;
-            // expect<rpc::client> client = gclient.clone();
-            // if (!client)
-            //   return client.error();
+            json out_params = {
+              {"output_indices", std::move(output_indices)},
+              {"get_txid", false}
+            };
+            auto out_keys_data = post_json_rpc("get_outs", std::move(out_params));
+            if (!out_keys_data)
+              return out_keys_data.error();
 
-            // epee::byte_slice msg = rpc::client::make_message("get_output_keys", keys_req);
-            // MONERO_CHECK(client->send(std::move(msg), std::chrono::seconds{10}));
-            auto out_keys_data = cpr::Post(cpr::Url{lws::daemon_add},
-                                           cpr::Body{out_keys.dump()},
-                 cpr::Header{ { "Content-Type", "application/json" }},
-                 cpr::Timeout{std::chrono::milliseconds{30000}});
-
-            json resp = json::parse(out_keys_data.text);
-            // std::cout << "get_outs response : " << resp << std::endl;
+            json resp = std::move(*out_keys_data);
             using get_keys_rpc = cryptonote::rpc::output_key_mask_unlocked;
             std::vector <get_keys_rpc> keys{};
-            // auto keys_resp = client->receive<get_keys_rpc::Response>(std::chrono::seconds{10}, MLWS_CURRENT_LOCATION);
-            // if (!keys_resp)
-            //   return keys_resp.error();
-            for(auto it : resp["result"]["outs"])
+            try
             {
-              get_keys_rpc key;
-              std::string key_p = it["key"];
-              tools::hex_to_type(key_p,key.key);
-              tools::hex_to_type((std::string)it["mask"],key.mask);
-              key.unlocked = it["unlocked"];
-              keys.push_back(key);
+              for (const auto& it : resp.at("result").at("outs"))
+              {
+                get_keys_rpc key;
+                std::string key_p = it.at("key");
+                tools::hex_to_type(key_p, key.key);
+                tools::hex_to_type(it.at("mask").get<std::string>(), key.mask);
+                key.unlocked = it.at("unlocked");
+                keys.push_back(key);
+              }
+            }
+            catch (const std::exception& e)
+            {
+              MERROR("get_random_outs: unexpected get_outs response: " << e.what());
+              return {lws::error::bad_daemon_response};
             }
             return {std::move(keys)};
           }
@@ -1024,30 +1062,28 @@ namespace lws
           daemon_req.request.flash =false;
         }// Handles Flash Method from Client
 
-        // epee::byte_slice message = rpc::client::make_message("send_raw_tx_hex", daemon_req);
-        // MONERO_CHECK(client->send(std::move(message), std::chrono::seconds{10}));
-        json message = {
-            {"jsonrpc","2.0"},
-            {"id","0"},
-            {"method","send_raw_transaction"},
-            {"params",{{"tx",daemon_req.request.tx},{"flash",daemon_req.request.flash}}}
-          };
-          // std::cout <<"message : " << message.dump() << std::endl;
-        auto resp = cpr::Post(cpr::Url{lws::daemon_add},
-                              cpr::Body{message.dump()},
-                         cpr::Header{ { "Content-Type", "application/json" }},
-                         cpr::Timeout{std::chrono::milliseconds{30000}});
+        json send_params = {
+          {"tx", daemon_req.request.tx},
+          {"flash", daemon_req.request.flash}
+        };
+        auto daemon_data = post_json_rpc("send_raw_transaction", std::move(send_params));
+        if (!daemon_data)
+          return daemon_data.error();
 
-        json daemon_resp = json::parse(resp.text);
-        // std::cout <<"daemon_resp : " << daemon_resp << std::endl;
-        // const auto daemon_resp = client->receive<transaction_rpc::Response>(std::chrono::seconds{20}, MLWS_CURRENT_LOCATION);
-        // if (!daemon_resp)
-        //   return daemon_resp.error();
-        if (daemon_resp["result"]["not_relayed"] == true)
-          return {lws::error::tx_relay_failed};
-
-        if(daemon_resp["result"]["status"] == "Failed")
-          return {lws::error::status_failed};
+        json daemon_resp = std::move(*daemon_data);
+        try
+        {
+          const json& result = daemon_resp.at("result");
+          if (result.value("not_relayed", false))
+            return {lws::error::tx_relay_failed};
+          if (result.value("status", std::string{"OK"}) == "Failed")
+            return {lws::error::status_failed};
+        }
+        catch (const std::exception& e)
+        {
+          MERROR("submit_raw_tx: unexpected send_raw_transaction response: " << e.what());
+          return {lws::error::bad_daemon_response};
+        }
 
         return response{"OK"};
       }
