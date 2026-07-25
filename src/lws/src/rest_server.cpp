@@ -140,7 +140,15 @@ namespace lws
 
       if (response.status_code != 200)
       {
-        MERROR("daemon RPC call failed with HTTP code: " << response.status_code);
+        // status_code 0 means the HTTP request never completed (connection
+        // refused/reset, timeout, or empty reply). response.error carries the
+        // libcurl-level reason; log method + reason + url + timing so a code-0
+        // failure points at its actual cause instead of being anonymous.
+        MERROR("daemon RPC '" << method << "' failed: HTTP status " << response.status_code
+               << ", transport error [" << static_cast<int>(response.error.code) << "] "
+               << response.error.message << ", url=" << lws::daemon_add
+               << ", req_bytes=" << request_body.dump().size()
+               << ", elapsed=" << response.elapsed << "s");
         return make_error_code(std::errc::io_error);
       }
 
