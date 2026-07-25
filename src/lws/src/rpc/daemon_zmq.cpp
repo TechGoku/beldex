@@ -2,7 +2,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <string>
-#include <typeinfo>
 #include <utility>
 #include <vector>
 #include "crypto/crypto.h"            // monero/src
@@ -40,17 +39,10 @@ namespace
   {
     if (source.peek_token() == '"')
     {
-      std::string nested = source.string();
-      const std::size_t nsize = nested.size(); // diagnostics only
-      const std::string tail = nsize > 400 ? nested.substr(nsize - 400) : nested;
-      auto parsed = wire::json::from_bytes<T>(std::move(nested));
+      auto parsed = wire::json::from_bytes<T>(source.string());
       if (!parsed)
-      {
-        MERROR("stringified nested json parse failed for <" << typeid(T).name() << ">: "
-               << parsed.error().message() << " -- size=" << nsize
-               << " -- tail[-400:]: " << tail);
-        WIRE_DLOG_THROW(wire::error::schema::object, "invalid stringified nested json");
-      }
+        WIRE_DLOG_THROW(wire::error::schema::object,
+          "invalid stringified nested json: " << parsed.error().message());
       self.value = std::move(*parsed);
     }
     else
@@ -84,6 +76,7 @@ namespace
       wire::read_value(source, self.out->back());
       ++count;
     }
+    source.end_array(); // balance start_array() so depth() returns to 0
   }
 
   /*! Reads a block's `transactions`: a (possibly null) array whose elements are
@@ -128,6 +121,7 @@ namespace
       else
         source.skip_next_value(); // native non-object element -> skip
     }
+    source.end_array(); // balance start_array() so depth() returns to 0
   }
 }
 
@@ -149,6 +143,7 @@ namespace rpc
     ++count;
     if (!source.is_array_end(count))
       WIRE_DLOG_THROW(wire::error::schema::array, "minor_tx_hashes entry has extra elements");
+    source.end_array(); // balance start_array() so depth() returns to 0
   }
 } // rpc
 } // lws
