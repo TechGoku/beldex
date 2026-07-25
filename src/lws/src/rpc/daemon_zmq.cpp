@@ -1,9 +1,15 @@
 #include "daemon_zmq.h"
 
 #include <boost/optional/optional.hpp>
+#include <string>
+#include <utility>
+#include <vector>
 #include "crypto/crypto.h"            // monero/src
+#include "epee/hex.h"                 // monero/contrib/epee/include
+#include "epee/span.h"                // monero/contrib/epee/include
 #include "rpc/message_data_structs.h" // monero/src
 #include "wire/crypto.h"
+#include "wire/error.h"
 #include "wire/json.h"
 #include "wire/vector.h"
 #include "wire/read.h"
@@ -16,7 +22,80 @@ namespace
   constexpr const std::size_t default_inputs = 2;
   constexpr const std::size_t default_outputs = 4;
   constexpr const std::size_t default_txextra_size = 40000048;
+
+  /*! Beldex `get_blocks_fast` double-encodes each `block`, each `transaction`,
+      and `output_indices` as a JSON *string*. This wrapper reads the field once:
+      if the next value is a JSON string, parse its contents as `T`; otherwise
+      read `T` in place. Mirrors the old scanner's `is_string()` un-stringify,
+      but without a separate nlohmann parse + re-serialize + re-parse pass. */
+  template<typename T>
+  struct maybe_stringified
+  {
+    T value;
+  };
+
+  template<typename T>
+  void read_bytes(wire::json_reader& source, maybe_stringified<T>& self)
+  {
+    if (source.peek_token() == '"')
+    {
+      std::string nested = source.string();
+      auto parsed = wire::json::from_bytes<T>(std::move(nested));
+      if (!parsed)
+        WIRE_DLOG_THROW(wire::error::schema::object, "invalid stringified nested json");
+      self.value = std::move(*parsed);
+    }
+    else
+      wire::read_value(source, self.value); // already a native object/array
+  }
+
+  /*! Reads an array of hashes, silently dropping JSON `null` entries. Beldex
+      `get_blocks_fast` can include null placeholders in a block's `tx_hashes`;
+      the old nlohmann normalization dropped them before the struct parse. */
+  struct tx_hash_dropnull
+  {
+    std::vector<crypto::hash>* out;
+  };
+
+  void read_bytes(wire::json_reader& source, tx_hash_dropnull self)
+  {
+    self.out->clear();
+    std::size_t count = source.start_array();
+    while (!source.is_array_end(count))
+    {
+      if (source.try_read_null())
+      {
+        ++count;
+        continue;
+      }
+      self.out->emplace_back();
+      wire::read_value(source, self.out->back());
+      ++count;
+    }
+  }
 }
+
+namespace lws
+{
+namespace rpc
+{
+  //! Reads one Beldex `minor_tx_hashes` entry: the 2-element array `[height, hash]`.
+  static void read_bytes(wire::json_reader& source, minor_tx_hash_entry& self)
+  {
+    std::size_t count = source.start_array();
+    if (source.is_array_end(count))
+      WIRE_DLOG_THROW(wire::error::schema::array, "empty minor_tx_hashes entry");
+    wire::read_value(source, self.height);
+    ++count;
+    if (source.is_array_end(count))
+      WIRE_DLOG_THROW(wire::error::schema::array, "minor_tx_hashes entry missing hash");
+    wire::read_value(source, self.hash);
+    ++count;
+    if (!source.is_array_end(count))
+      WIRE_DLOG_THROW(wire::error::schema::array, "minor_tx_hashes entry has extra elements");
+  }
+} // rpc
+} // lws
 
 namespace rct
 {
@@ -29,7 +108,23 @@ namespace rct
 
   static void read_bytes(wire::json_reader& source, ecdhTuple& self)
   {
-    wire::object(source, WIRE_FIELD(mask), WIRE_FIELD(amount));
+    // Normalization moved here from the scanner's old nlohmann pre-pass so the
+    // response is parsed only once. Behaviour is byte-for-byte identical:
+    //   - mask is forced to all-zero (the real mask is recomputed by the
+    //     scanner during amount decoding), matching the old
+    //     `it["mask"] = "0000...0000"`.
+    //   - amount arrives as an 8-byte (16 hex) value; the old code appended 48
+    //     '0' chars when the length wasn't already 64, then read it as a
+    //     32-byte key (amount bytes first, remainder zero). Reproduced exactly.
+    self.mask = rct::key{}; // 32 zero bytes
+
+    std::string amount_hex;
+    wire::object(source, wire::field("amount", std::ref(amount_hex)));
+
+    if (amount_hex.size() != 64)
+      amount_hex.append(48, '0');
+    if (!epee::from_hex::to_buffer(epee::as_mut_byte_span(self.amount), amount_hex))
+      WIRE_DLOG_THROW(wire::error::schema::fixed_binary, "bad ecdh amount hex length");
   }
 
   static void read_bytes(wire::json_reader& source, rctSig& self)
@@ -149,25 +244,35 @@ namespace cryptonote
     self.vin.reserve(default_inputs);
     self.vout.reserve(default_outputs);
     self.extra.reserve(default_txextra_size);
+    // `rct_signatures` is optional: a default-constructed transaction already
+    // has `rct_signatures.type == RCTType::Null` (see transaction::set_null),
+    // so an absent field reproduces the old code's "add {rct_signatures:{type:0}}"
+    // fixup for a miner_tx that lacks it. (optional_field needs a boost::optional
+    // target, hence the temporary.)
+    boost::optional<rct::rctSig> rct_signatures;
     wire::object(source,
       WIRE_FIELD(version),
       WIRE_FIELD(unlock_time),
       wire::field("vin", std::ref(self.vin)),
       wire::field("vout", std::ref(self.vout)),
       WIRE_FIELD(extra),
-      wire::field("rct_signatures", std::ref(self.rct_signatures))
+      wire::optional_field("rct_signatures", std::ref(rct_signatures))
     );
+    if (rct_signatures)
+      self.rct_signatures = std::move(*rct_signatures);
   }
 
   static void read_bytes(wire::json_reader& source, block& self)
   {
     self.tx_hashes.reserve(default_transaction_count);
+    // `tx_hashes` is read with the null-dropping reader (see tx_hash_dropnull):
+    // Beldex can include null placeholders that the old nlohmann pass removed.
     wire::object(source,
       WIRE_FIELD(major_version),
       WIRE_FIELD(minor_version),
       WIRE_FIELD(timestamp),
       WIRE_FIELD(miner_tx),
-      WIRE_FIELD(tx_hashes),
+      wire::field("tx_hashes", tx_hash_dropnull{std::addressof(self.tx_hashes)}),
       WIRE_FIELD(prev_id),
       WIRE_FIELD(nonce)
     );
@@ -177,8 +282,23 @@ namespace cryptonote
   {
     static void read_bytes(wire::json_reader& source, block_with_transactions& self)
     {
-      self.transactions.reserve(default_transaction_count);
-      wire::object(source, WIRE_FIELD(block), WIRE_FIELD(transactions));
+      // Both `block` and each element of `transactions` arrive JSON-in-string;
+      // maybe_stringified un-stringifies each before reading it as its real type
+      // (reusing the block/transaction readers above, incl. ecdh normalization).
+      maybe_stringified<cryptonote::block> block;
+      std::vector<maybe_stringified<cryptonote::transaction>> transactions;
+      transactions.reserve(default_transaction_count);
+
+      wire::object(source,
+        wire::field("block", std::ref(block)),
+        wire::field("transactions", std::ref(transactions))
+      );
+
+      self.block = std::move(block.value);
+      self.transactions.clear();
+      self.transactions.reserve(transactions.size());
+      for (auto& tx : transactions)
+        self.transactions.push_back(std::move(tx.value));
     }
   } // rpc
 } // cryptonote
@@ -186,6 +306,29 @@ namespace cryptonote
 void lws::rpc::read_bytes(wire::json_reader& source, get_blocks_fast_response& self)
 {
   self.blocks.reserve(default_blocks_fetched);
-  self.output_indices.reserve(default_blocks_fetched);
-  wire::object(source, WIRE_FIELD(blocks), WIRE_FIELD(output_indices), WIRE_FIELD(start_height), WIRE_FIELD(current_height));
+
+  // `output_indices` arrives JSON-in-string (or, defensively, as a native
+  // array); un-stringify it the same way as block/transactions.
+  maybe_stringified<std::vector<std::vector<std::vector<std::uint64_t>>>> output_indices;
+  output_indices.value.reserve(default_blocks_fetched);
+
+  // `minor_tx_hashes` and `status` are optional and were consumed by the old
+  // scanner pre-pass before the struct parse; capture them here instead.
+  boost::optional<std::vector<minor_tx_hash_entry>> minor_tx_hashes;
+  boost::optional<std::string> status;
+
+  wire::object(source,
+    WIRE_FIELD(blocks),
+    wire::field("output_indices", std::ref(output_indices)),
+    WIRE_FIELD(start_height),
+    WIRE_FIELD(current_height),
+    wire::optional_field("minor_tx_hashes", std::ref(minor_tx_hashes)),
+    wire::optional_field("status", std::ref(status))
+  );
+
+  self.output_indices = std::move(output_indices.value);
+  if (minor_tx_hashes)
+    self.minor_tx_hashes = std::move(*minor_tx_hashes);
+  if (status)
+    self.status = std::move(*status);
 }

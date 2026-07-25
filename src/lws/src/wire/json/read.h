@@ -36,6 +36,21 @@ namespace wire
 
     // void enumConversion(json_reader& source,int& value);
 
+    //! \return The next non-whitespace character without consuming it (0 at
+    //!   end). Lets a reader branch on the upcoming value type, e.g. `'"'` for
+    //!   a string, `'{'`/`'['` for object/array, `'n'` for null.
+    char peek_token() { return get_next_token(); }
+
+    //! If the next value is JSON `null`, consume it and \return true; otherwise
+    //!   leave it in place and \return false.
+    bool try_read_null()
+    {
+      if (get_next_token() != 'n')
+        return false;
+      skip_value();
+      return true;
+    }
+
     //! \throw wire::exception if JSON parsing is incomplete.
     void check_complete() const override final;
 

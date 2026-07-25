@@ -418,6 +418,17 @@ namespace wire
     wire_read::array(source, dest);
   }
 
+  /*! Dispatch a single value read the same way the field machinery does:
+      unqualified `read_bytes` here finds the `wire::` overloads above by
+      same-namespace lookup and user overloads (cryptonote/rct/...) by ADL.
+      Lets a custom `read_bytes` read a nested value of arbitrary type without
+      the ADL pitfalls of calling `read_bytes` from another namespace. */
+  template<typename R, typename T>
+  inline void read_value(R& source, T& dest)
+  {
+    read_bytes(source, dest);
+  }
+
   template<typename... T>
   inline void object(reader& source, T... fields)
   {

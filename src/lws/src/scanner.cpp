@@ -455,7 +455,6 @@ namespace lws
 
         // ---- Main scan loop ----
         std::vector<crypto::hash> blockchain{};
-        json details;
 
         while (!self.update && scanner::is_running())
         {
@@ -463,124 +462,54 @@ namespace lws
 
           std::string raw_response = fetch_blocks(start_height);
 
-          json res = json::parse(raw_response);
-          details = res["result"];
-          if(details["status"]=="Failed")
-          {
+          // Single parse: the wire reader (daemon_zmq.cpp) now un-stringifies the
+          // nested block / transactions / output_indices and does the ecdh
+          // mask+amount normalization, the miner_tx rct default, and the
+          // tx_hashes null-drop internally. This replaces the old nlohmann
+          // "parse -> mutate DOM -> dump -> re-parse into struct" double pass.
+          auto fetched = MONERO_UNWRAP(
+            wire::json::from_bytes<rpc::json<rpc::get_blocks_fast>::response>(std::move(raw_response))
+          );
+
+          if (fetched.result.status == "Failed")
             throw std::runtime_error{"Daemon unexpectedly returned zero blocks and status failed"};
-          }
-          // ---- Parse minor_tx_hashes ----
+
+          // Per-height block-hash overrides (Beldex minor_tx_hashes).
           std::unordered_map<uint, crypto::hash> heightWithHash;
-          if (details.contains("minor_tx_hashes") &&
-              !details["minor_tx_hashes"].is_null())
-          {
-            json minorTxHashes = details["minor_tx_hashes"];
-          // std::cout<<"details  :: "<<details["minor_tx_hashes"]<<std::endl;
-          details.erase("minor_tx_hashes");
+          for (const auto& entry : fetched.result.minor_tx_hashes)
+            heightWithHash[static_cast<uint>(entry.height)] = entry.hash;
 
-          for (const auto& it : minorTxHashes)
+          // Post-parse fixups the old nlohmann pass performed on the mutated DOM,
+          // now applied to the typed data with identical logic.
           {
-            if (it.is_array() && it.size() == 2)
+            auto& blocks_v = fetched.result.blocks;
+            auto& indices_v = fetched.result.output_indices;
+            for (std::size_t ch = 0; ch < blocks_v.size(); ++ch)
             {
-              uint h = it[0].get<uint>();
-              std::string mHash = it[1].get<std::string>();
-              crypto::hash minorHash;
-              tools::hex_to_type(mHash, minorHash);
-              heightWithHash[h] = minorHash;
-            }
-            else
-              throw std::runtime_error("Invalid format in minor_tx_hashes entry");
-            }
-          }
-          else
-          {
-            if (details.contains("minor_tx_hashes"))
-              details.erase("minor_tx_hashes");
-          }
-
-          // ---- Parse output_indices ----
-          if (details["output_indices"].is_string())
-          {
-            std::string s = details["output_indices"];
-            details["output_indices"] = json::parse(s);
-          }
-
-          // ---- Parse blocks ----
-          int ch =0;
-          for (auto& t : details["blocks"])
-          {
-            if (t["block"].is_string())
-            {
-              std::string blk_str = t["block"];
-              t["block"] = json::parse(blk_str);
-            }
-            if(!t["block"]["miner_tx"].contains("rct_signatures"))
-            {
-              t["block"]["miner_tx"]["rct_signatures"]["type"] = 0;
-            }
-            json tx_hash_arr;
-            int tx_num = 0;
-            for(auto data :t["block"]["tx_hashes"])
-            {
-              if(!data.is_null())
-                tx_hash_arr[tx_num] = data;
-              tx_num++;
-            }
-            t["block"]["tx_hashes"] = tx_hash_arr;
-
-            for (auto& data : t["transactions"])
-            {
-              if (data.is_string())
+              auto& bwt = blocks_v[ch];
+              // If either the block's tx_hashes or its transactions came back
+              // empty, clear both so their counts agree.
+              if (bwt.block.tx_hashes.empty() || bwt.transactions.empty())
               {
-                std::string tx_str = data;
-                data = json::parse(tx_str);
+                bwt.transactions.clear();
+                bwt.block.tx_hashes.clear();
               }
-
-              if (!data.empty())
+              // output_indices[ch] carries the miner-tx indices as element 0, so
+              // it should hold transactions.size()+1 entries; if not, drop the
+              // empty inner arrays (mirrors the old size-mismatch fixup, incl.
+              // its size_t wrap when output_indices[ch] is empty).
+              if (ch < indices_v.size() &&
+                  bwt.transactions.size() != indices_v[ch].size() - 1)
               {
-                for (auto& it : data["rct_signatures"]["ecdhInfo"])
-                {
-                  it["mask"] = "0000000000000000000000000000000000000000000000000000000000000000";
-                      std::string s1=it["amount"];
-                      if (s1.length()!=64)
-                  {
-                      s1 = s1+"000000000000000000000000000000000000000000000000";
-                      it["amount"]= s1;
-                  }
-
-                }
-                  if(data["rct_signatures"].is_null())
-                {
-                  data["rct_signatures"] = json::value_t::object;
-                }
+                std::vector<std::vector<std::uint64_t>> filtered;
+                filtered.reserve(indices_v[ch].size());
+                for (auto& inner : indices_v[ch])
+                  if (!inner.empty())
+                    filtered.push_back(std::move(inner));
+                indices_v[ch] = std::move(filtered);
               }
             }
-
-            if(t["block"]["tx_hashes"].size() == 0 || t["transactions"].size() == 0)
-            {
-              t["transactions"] = json::array();
-              t["block"]["tx_hashes"] = json::array();
-            }
-            if(t["transactions"].size() != (details["output_indices"][ch].size()-1))
-            {
-              json indis;
-              for (auto& it : details["output_indices"][ch])
-              {
-                if (!it.empty())
-                  indis.push_back(it);
-              }
-              details["output_indices"][ch] = indis;
-            }
-            ch++;
           }
-          // std::cout << "entered in" << std::endl;
-          // std::cout <<"detat: "<< details << std::endl;
-          json final_res = {{"jsonnrpc", "2.0"}, {"id", 0}, {"result",details}};
-          // final_res["result"].erase("status");
-          // final_res["result"].erase("untrusted");
-          std::string resp = final_res.dump();
-
-          auto fetched = MONERO_UNWRAP(wire::json::from_bytes<rpc::json<rpc::get_blocks_fast>::response>(std::move(resp)));
 
           if (fetched.result.blocks.empty())
             throw std::runtime_error{"Daemon unexpectedly returned zero blocks"};
