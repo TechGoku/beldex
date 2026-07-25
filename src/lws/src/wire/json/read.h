@@ -51,6 +51,10 @@ namespace wire
       return true;
     }
 
+    //! Consume and discard the next value (any type). \throw wire::exception on
+    //!   invalid JSON syntax.
+    void skip_next_value() { skip_value(); }
+
     //! \throw wire::exception if JSON parsing is incomplete.
     void check_complete() const override final;
 

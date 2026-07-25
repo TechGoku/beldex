@@ -2,6 +2,7 @@
 
 #include <boost/optional/optional.hpp>
 #include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 #include "crypto/crypto.h"            // monero/src
@@ -40,9 +41,16 @@ namespace
     if (source.peek_token() == '"')
     {
       std::string nested = source.string();
+      const std::size_t nsize = nested.size(); // diagnostics only
+      const std::string tail = nsize > 400 ? nested.substr(nsize - 400) : nested;
       auto parsed = wire::json::from_bytes<T>(std::move(nested));
       if (!parsed)
+      {
+        MERROR("stringified nested json parse failed for <" << typeid(T).name() << ">: "
+               << parsed.error().message() << " -- size=" << nsize
+               << " -- tail[-400:]: " << tail);
         WIRE_DLOG_THROW(wire::error::schema::object, "invalid stringified nested json");
+      }
       self.value = std::move(*parsed);
     }
     else
@@ -60,6 +68,10 @@ namespace
   void read_bytes(wire::json_reader& source, tx_hash_dropnull self)
   {
     self.out->clear();
+    // Beldex sends `"tx_hashes": null` for a block with no non-coinbase txs;
+    // the old nlohmann path iterated the null as empty. Treat null as [].
+    if (source.try_read_null())
+      return;
     std::size_t count = source.start_array();
     while (!source.is_array_end(count))
     {
@@ -71,6 +83,50 @@ namespace
       self.out->emplace_back();
       wire::read_value(source, self.out->back());
       ++count;
+    }
+  }
+
+  /*! Reads a block's `transactions`: a (possibly null) array whose elements are
+      each JSON-in-string (or native). Null becomes empty, matching the old
+      nlohmann path. */
+  struct transactions_field
+  {
+    std::vector<cryptonote::transaction>* out;
+  };
+
+  void read_bytes(wire::json_reader& source, transactions_field self)
+  {
+    self.out->clear();
+    if (source.try_read_null()) // "transactions": null -> empty
+      return;
+    std::size_t count = source.start_array();
+    while (!source.is_array_end(count))
+    {
+      ++count;
+      // A real transaction is always a JSON object (native `{...}` or a
+      // stringified `"{...}"`). Beldex pads an empty block's transactions with
+      // a junk placeholder - a stringified empty array `"[]"` - which the old
+      // nlohmann path swallowed (it parsed to [], then the count fixup cleared
+      // the whole transactions list). Skip any element that is not an object.
+      const char tok = source.peek_token();
+      if (tok == '"')
+      {
+        std::string elem = source.string();
+        const std::size_t first = elem.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || elem[first] != '{')
+          continue; // junk placeholder (e.g. "[]") -> skip
+        auto parsed = wire::json::from_bytes<cryptonote::transaction>(std::move(elem));
+        if (!parsed)
+          WIRE_DLOG_THROW(wire::error::schema::object, "invalid stringified transaction");
+        self.out->push_back(std::move(*parsed));
+      }
+      else if (tok == '{')
+      {
+        self.out->emplace_back();
+        wire::read_value(source, self.out->back());
+      }
+      else
+        source.skip_next_value(); // native non-object element -> skip
     }
   }
 }
@@ -283,22 +339,18 @@ namespace cryptonote
     static void read_bytes(wire::json_reader& source, block_with_transactions& self)
     {
       // Both `block` and each element of `transactions` arrive JSON-in-string;
-      // maybe_stringified un-stringifies each before reading it as its real type
-      // (reusing the block/transaction readers above, incl. ecdh normalization).
+      // they are un-stringified before being read as their real type (reusing
+      // the block/transaction readers above, incl. ecdh normalization).
+      // `transactions` may also be null (empty block).
       maybe_stringified<cryptonote::block> block;
-      std::vector<maybe_stringified<cryptonote::transaction>> transactions;
-      transactions.reserve(default_transaction_count);
+      self.transactions.reserve(default_transaction_count);
 
       wire::object(source,
         wire::field("block", std::ref(block)),
-        wire::field("transactions", std::ref(transactions))
+        wire::field("transactions", transactions_field{std::addressof(self.transactions)})
       );
 
       self.block = std::move(block.value);
-      self.transactions.clear();
-      self.transactions.reserve(transactions.size());
-      for (auto& tx : transactions)
-        self.transactions.push_back(std::move(tx.value));
     }
   } // rpc
 } // cryptonote
