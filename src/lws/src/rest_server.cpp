@@ -93,17 +93,30 @@ namespace lws
       return std::lower_bound(metas.begin(), metas.end(), id, by_output_id{});
     }
 
-    // Beldex's /json_rpc sometimes wraps the response envelope in a
-    // single-element array; unwrap it to the inner object so callers can index
-    // the envelope by key. (get_master_node_cache handled this ad hoc since
-    // 7d73ebe21; the fee / distribution / histogram / get_outs paths did not,
-    // which threw json type_error.305 "operator[] ... with array" while a
-    // client was creating a transaction.)
+    // Beldex's /json_rpc wraps some responses in a single-element array, and
+    // does so inconsistently: sometimes the whole envelope ([{...}]), sometimes
+    // just the "result" ({"result":[{...}]}). Either form makes a string
+    // subscript / value() throw json type_error.305/306. These helpers peel any
+    // single-element array wrapper(s) so callers see the underlying object.
+    // (get_master_node_cache handled the envelope form ad hoc since 7d73ebe21;
+    // the tx-creation paths handled neither, which broke transaction building.)
+    //
+    // NB: only ever apply these to a value that must be an object (the envelope
+    // or the "result"); genuine data arrays (histograms, outs, distributions)
+    // are iterated directly and must never be passed here.
+    const json& deep_unwrap(const json& j)
+    {
+      const json* p = &j;
+      while (p->is_array() && p->size() == 1)
+        p = std::addressof(p->front());
+      return *p;
+    }
+
     void unwrap_json_rpc(json& j)
     {
-      if (j.is_array() && !j.empty())
+      while (j.is_array() && j.size() == 1)
       {
-        json inner = std::move(j.at(0));
+        json inner = std::move(j.front());
         j = std::move(inner);
       }
     }
@@ -207,32 +220,59 @@ namespace lws
       else
         cache.blacklist = std::move(*blacklist);
 
-      cache.blacklist_by_image.clear();
-      for (const auto& item : cache.blacklist["result"]["blacklist"])
+      // Some daemon builds also wrap "result" itself in a single-element array
+      // (get_fee_estimate does; see deep_unwrap). Peel it in place so the
+      // ["result"]["..."] walks below see the object, and guard the whole build
+      // so a malformed master-node/blacklist response yields a clean error
+      // instead of an uncaught throw out of get_address_info/get_unspent_outs.
+      const auto dearray_result = [] (json& env)
       {
-        crypto::key_image image;
-        const std::string image_str = item["key_image"];
-        if (epee::string_tools::hex_to_pod(image_str, image))
-          cache.blacklist_by_image[image] = item["amount"].get<std::uint64_t>();
-      }
-
-      cache.locked_by_image.clear();
-      for (const auto& mn_all : cache.master_nodes["result"]["master_node_states"])
-      {
-        if (!mn_all.contains("contributors"))
-          continue;
-        for (const auto& mn_contrib : mn_all["contributors"])
+        if (!env.is_object())
+          return;
+        const auto it = env.find("result");
+        if (it != env.end() && it->is_array() && it->size() == 1)
         {
-          if (!mn_contrib.contains("locked_contributions"))
+          json inner = std::move(it->front());
+          *it = std::move(inner);
+        }
+      };
+      dearray_result(cache.blacklist);
+      dearray_result(cache.master_nodes);
+
+      cache.blacklist_by_image.clear();
+      cache.locked_by_image.clear();
+      try
+      {
+        for (const auto& item : cache.blacklist["result"]["blacklist"])
+        {
+          crypto::key_image image;
+          const std::string image_str = item["key_image"];
+          if (epee::string_tools::hex_to_pod(image_str, image))
+            cache.blacklist_by_image[image] = item["amount"].get<std::uint64_t>();
+        }
+
+        for (const auto& mn_all : cache.master_nodes["result"]["master_node_states"])
+        {
+          if (!mn_all.contains("contributors"))
             continue;
-          for (const auto& contribution : mn_contrib["locked_contributions"])
+          for (const auto& mn_contrib : mn_all["contributors"])
           {
-            crypto::key_image image;
-            const std::string image_str = contribution["key_image"].get<std::string>();
-            if (tools::hex_to_type(image_str, image))
-              cache.locked_by_image[image] = contribution["amount"].get<std::uint64_t>();
+            if (!mn_contrib.contains("locked_contributions"))
+              continue;
+            for (const auto& contribution : mn_contrib["locked_contributions"])
+            {
+              crypto::key_image image;
+              const std::string image_str = contribution["key_image"].get<std::string>();
+              if (tools::hex_to_type(image_str, image))
+                cache.locked_by_image[image] = contribution["amount"].get<std::uint64_t>();
+            }
           }
         }
+      }
+      catch (const std::exception& e)
+      {
+        MERROR("get_master_node_cache: unexpected master-node/blacklist response: " << e.what());
+        return {lws::error::bad_daemon_response};
       }
 
       last_update = std::chrono::steady_clock::now();
@@ -374,7 +414,7 @@ namespace lws
                 return make_error_code(std::errc::protocol_error);
             }
     
-            const auto& result = full_response["result"];
+            const auto& result = deep_unwrap(full_response["result"]);
     
             try
             {
@@ -610,13 +650,15 @@ namespace lws
                       flash_fee_per_output, flash_fee_fixed, quantization_mask;
         try
         {
-          // resp is the unwrapped get_fee_estimate envelope (post_json_rpc /
-          // get_fee_estimate_cache). Guard field access so an unexpected daemon
-          // response becomes bad_daemon_response instead of an uncaught throw.
-          if (resp.value("status", std::string{}) == "Failed")
+          // resp is the get_fee_estimate envelope (post_json_rpc /
+          // get_fee_estimate_cache). deep_unwrap peels any single-element array
+          // wrapping at the envelope and/or result level; guarded so an
+          // unexpected daemon response becomes bad_daemon_response, not a throw.
+          const json& env = deep_unwrap(resp);
+          if (env.value("status", std::string{}) == "Failed")
             return {lws::error::bad_daemon_response};
 
-          const json& result = resp.at("result");
+          const json& result = deep_unwrap(env.at("result"));
           if (result.value("status", std::string{"OK"}) == "Failed")
             return {lws::error::bad_daemon_response};
 
@@ -629,7 +671,8 @@ namespace lws
         }
         catch (const std::exception& e)
         {
-          MERROR("get_unspent_outs: unexpected get_fee_estimate response: " << e.what());
+          MERROR("get_unspent_outs: unexpected get_fee_estimate response: " << e.what()
+                 << " -- body: " << resp.dump().substr(0, 400));
           return {lws::error::bad_daemon_response};
         }
 
@@ -807,8 +850,9 @@ namespace lws
           json resp = std::move(*histogram_data);
           try
           {
-            for (const auto& it : resp.at("result").at("histogram"))
+            for (const auto& raw : deep_unwrap(resp.at("result")).at("histogram"))
             {
+              const json& it = deep_unwrap(raw);
               lws::histogram histogram_resp{};
               histogram_resp.amount         = it.at("amount");
               histogram_resp.total_count    = it.at("total_instances");
@@ -819,7 +863,8 @@ namespace lws
           }
           catch (const std::exception& e)
           {
-            MERROR("get_random_outs: unexpected get_output_histogram response: " << e.what());
+            MERROR("get_random_outs: unexpected get_output_histogram response: " << e.what()
+                   << " -- body: " << resp.dump().substr(0, 400));
             return {lws::error::bad_daemon_response};
           }
 
@@ -858,17 +903,19 @@ namespace lws
           json resp = std::move(*distribution_data);
           try
           {
-            const json& dists = resp.at("result").at("distributions");
+            const json& dists = deep_unwrap(resp.at("result")).at("distributions");
             if (dists.size() != 1)
               return {lws::error::bad_daemon_response};
-            if (dists.at(0).at("amount") != 0)
+            const json& dist0 = deep_unwrap(dists.at(0));
+            if (dist0.at("amount") != 0)
               return {lws::error::bad_daemon_response};
-            for (const auto& it : dists.at(0).at("distribution"))
+            for (const auto& it : dist0.at("distribution"))
               distributions.push_back(it.get<std::uint64_t>());
           }
           catch (const std::exception& e)
           {
-            MERROR("get_random_outs: unexpected get_output_distribution response: " << e.what());
+            MERROR("get_random_outs: unexpected get_output_distribution response: " << e.what()
+                   << " -- body: " << resp.dump().substr(0, 400));
             return {lws::error::bad_daemon_response};
           }
 
@@ -927,8 +974,9 @@ namespace lws
             std::vector <get_keys_rpc> keys{};
             try
             {
-              for (const auto& it : resp.at("result").at("outs"))
+              for (const auto& raw : deep_unwrap(resp.at("result")).at("outs"))
               {
+                const json& it = deep_unwrap(raw);
                 get_keys_rpc key;
                 std::string key_p = it.at("key");
                 tools::hex_to_type(key_p, key.key);
@@ -939,7 +987,8 @@ namespace lws
             }
             catch (const std::exception& e)
             {
-              MERROR("get_random_outs: unexpected get_outs response: " << e.what());
+              MERROR("get_random_outs: unexpected get_outs response: " << e.what()
+                     << " -- body: " << resp.dump().substr(0, 400));
               return {lws::error::bad_daemon_response};
             }
             return {std::move(keys)};
@@ -1073,7 +1122,7 @@ namespace lws
         json daemon_resp = std::move(*daemon_data);
         try
         {
-          const json& result = daemon_resp.at("result");
+          const json& result = deep_unwrap(deep_unwrap(daemon_resp).at("result"));
           if (result.value("not_relayed", false))
             return {lws::error::tx_relay_failed};
           if (result.value("status", std::string{"OK"}) == "Failed")
@@ -1081,7 +1130,8 @@ namespace lws
         }
         catch (const std::exception& e)
         {
-          MERROR("submit_raw_tx: unexpected send_raw_transaction response: " << e.what());
+          MERROR("submit_raw_tx: unexpected send_raw_transaction response: " << e.what()
+                 << " -- body: " << daemon_resp.dump().substr(0, 400));
           return {lws::error::bad_daemon_response};
         }
 
