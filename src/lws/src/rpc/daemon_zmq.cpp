@@ -21,7 +21,13 @@ namespace
   constexpr const std::size_t default_transaction_count = 100;
   constexpr const std::size_t default_inputs = 2;
   constexpr const std::size_t default_outputs = 4;
-  constexpr const std::size_t default_txextra_size = 40000048;
+  // tx.extra is a few dozen bytes for a normal tx (pubkey + nonce) and at most
+  // a few KB for special txs; reserve a small amount to avoid reallocs. The
+  // previous value (~40 MB) reserved that much PER transaction, and a
+  // get_blocks_fast batch holds every parsed tx at once, so a tx-heavy batch
+  // reserved (txs x 40 MB) of address space at once - allocator thrash / OOM
+  // that manifested as the scanner hanging on large, tx-heavy accounts.
+  constexpr const std::size_t default_txextra_size = 1024;
 
   /*! Beldex `get_blocks_fast` double-encodes each `block`, each `transaction`,
       and `output_indices` as a JSON *string*. This wrapper reads the field once:
