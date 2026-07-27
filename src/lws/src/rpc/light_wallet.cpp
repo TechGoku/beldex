@@ -163,6 +163,19 @@ namespace lws
     convert_address(address, self.address);
   }
 
+  void rpc::read_bytes(wire::json_reader& source, get_address_txs_request& self)
+  {
+    std::string address;
+    boost::optional<std::uint64_t> min_height;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      wire::optional_field("min_height", std::ref(min_height))
+    );
+    convert_address(address, self.creds.address);
+    self.min_height = min_height.value_or(0);
+  }
+
   namespace rpc
   {
     namespace

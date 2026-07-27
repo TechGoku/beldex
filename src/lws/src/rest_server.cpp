@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <boost/utility/string_ref.hpp>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <unordered_set>
 #include <utility>
 #include <cpr/cpr.h>
+#include <zlib.h>
 
 #include "common/error.h"                       // beldex/src
 #include "common/hex.h"
@@ -38,6 +40,51 @@ namespace lws
   namespace
   {
     namespace http = epee::net_utils::http;
+
+    // ---- optional gzip of large REST responses (a transfer win for big
+    // accounts; a no-op for clients that don't advertise gzip) ----
+
+    //! \return true if the client's Accept-Encoding header advertises gzip.
+    bool client_accepts_gzip(const http::http_request_info& query)
+    {
+      for (const auto& field : query.m_header_info.m_etc_fields)
+      {
+        if (field.first.size() == sizeof("Accept-Encoding") - 1 &&
+            std::equal(
+              field.first.begin(), field.first.end(), "Accept-Encoding",
+              [](char a, char b) {
+                return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
+              }))
+          return field.second.find("gzip") != std::string::npos;
+      }
+      return false;
+    }
+
+    //! gzip-compress `in`; \return empty on failure so the caller keeps `in`.
+    std::string gzip_compress(const std::string& in)
+    {
+      if (in.size() > 0x7fffffffULL) // keep well within zlib's 32-bit avail_* fields
+        return {};
+      z_stream zs{};
+      // windowBits 15|16 selects the gzip (RFC 1952) wrapper. Level 1 (fastest):
+      // the payload is dominated by high-entropy hex, so higher levels spend CPU
+      // for little extra ratio.
+      if (deflateInit2(&zs, 1, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        return {};
+      std::string out;
+      out.resize(deflateBound(&zs, static_cast<uLong>(in.size())));
+      zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+      zs.avail_in = static_cast<uInt>(in.size());
+      zs.next_out = reinterpret_cast<Bytef*>(&out[0]);
+      zs.avail_out = static_cast<uInt>(out.size());
+      const int rc = deflate(&zs, Z_FINISH);
+      const uLong produced = zs.total_out;
+      deflateEnd(&zs);
+      if (rc != Z_STREAM_END)
+        return {};
+      out.resize(produced);
+      return out;
+    }
 
     struct context : epee::net_utils::connection_context_base
     {
@@ -691,12 +738,12 @@ namespace lws
 
     struct get_address_txs
     {
-      using request = rpc::account_credentials;
+      using request = rpc::get_address_txs_request;
       using response = rpc::get_address_txs_response;
 
       static expect<response> handle(const request& req, db::storage disk)
       {
-        auto user = open_account(req, std::move(disk));
+        auto user = open_account(req.creds, std::move(disk));
         if (!user)
           return user.error();
 
@@ -806,6 +853,23 @@ namespace lws
             if (!spend.is_end())
               next_spend = spend.get_value<MONERO_FIELD(db::spend, link)>();
           }
+        }
+
+        // Incremental fetch: when the client sends a min_height cursor, return
+        // only txs at/after it. The full merge above still runs (so totals stay
+        // cumulative and spend resolution is unaffected), but the response - the
+        // part that is transferred and parsed - shrinks to just the new txs.
+        if (req.min_height != 0)
+        {
+          auto& txs = resp.transactions;
+          txs.erase(
+            std::remove_if(
+              txs.begin(), txs.end(),
+              [min_height = req.min_height](const response::transaction& t)
+              {
+                return std::uint64_t(t.info.link.height) < min_height;
+              }),
+            txs.end());
         }
 
         return resp;
@@ -1171,17 +1235,19 @@ namespace lws
     // account with tens of thousands of txs each poll rebuilds and re-serializes
     // the whole history from LMDB - which is what makes large accounts hang.
     //
-    // Its response is a pure function of the account's scanned state and the
-    // chain tip (it reads neither the master-node cache nor any request
-    // parameter), so it stays byte-identical until the account scans a new
-    // block. Key the cache on (scan_height, last_block); a hit hands back a
-    // clone of the stored byte_slice (an O(1) refcount bump) with no DB reads
-    // and no serialization. Invalidation is automatic - the scanner advancing
-    // either height changes the key.
+    // Its response is a pure function of the account's scanned state, the chain
+    // tip, and the request's min_height cursor (it reads no master-node cache),
+    // so it stays byte-identical until the account scans a new block or the
+    // client moves its cursor. Key the cache on (scan_height, last_block,
+    // min_height); a hit hands back a clone of the stored byte_slice (an O(1)
+    // refcount bump) with no DB reads and no serialization. Invalidation is
+    // automatic - the scanner advancing either height, or the client advancing
+    // its cursor, changes the key.
     struct address_txs_cache_entry
     {
       db::block_id scan_height;
       db::block_id last_block;
+      std::uint64_t min_height;
       epee::byte_slice bytes;
     };
 
@@ -1199,14 +1265,15 @@ namespace lws
       if (!req)
         return req.error();
 
-      // Authenticate and read the two heights that key the cache. A cache hit is
+      // Authenticate and read the heights that key the cache. A cache hit is
       // only served after a successful view-key check (open_account).
-      auto user = open_account(*req, disk.clone());
+      auto user = open_account(req->creds, disk.clone());
       if (!user)
         return user.error();
 
       const std::uint32_t key = static_cast<std::uint32_t>(user->first.id);
       const db::block_id scan_height = user->first.scan_height;
+      const std::uint64_t min_height = req->min_height;
       const auto last = user->second.get_last_block();
       if (!last)
         return last.error();
@@ -1216,7 +1283,8 @@ namespace lws
       {
         const std::lock_guard<std::mutex> lock{cache_mutex};
         const auto it = cache.find(key);
-        if (it != cache.end() && it->second.scan_height == scan_height && it->second.last_block == last_block)
+        if (it != cache.end() && it->second.scan_height == scan_height &&
+            it->second.last_block == last_block && it->second.min_height == min_height)
           return it->second.bytes.clone();
       }
 
@@ -1244,7 +1312,7 @@ namespace lws
         }
         if (sz <= cache_max_bytes)
         {
-          cache.emplace(key, address_txs_cache_entry{scan_height, last_block, bytes->clone()});
+          cache.emplace(key, address_txs_cache_entry{scan_height, last_block, min_height, bytes->clone()});
           cache_bytes += sz;
         }
       }
@@ -1466,6 +1534,21 @@ namespace lws
       response.m_mime_tipe = "application/json";
       response.m_header_info.m_content_type = "application/json";
         response.m_body.assign(reinterpret_cast<const char*>(body->data()), body->size()); // \TODO Remove copy here too!s
+
+      // Compress large responses when the client advertises gzip. get_address_txs
+      // for a big account is hundreds of MB of hex + repetitive JSON that gzips
+      // well; this is a pure transfer win and a no-op for clients that do not
+      // send Accept-Encoding: gzip.
+      if (response.m_body.size() >= 1024 && client_accepts_gzip(query))
+      {
+        std::string compressed = gzip_compress(response.m_body);
+        if (!compressed.empty() && compressed.size() < response.m_body.size())
+        {
+          response.m_body = std::move(compressed);
+          response.m_additional_fields.emplace_back("Content-Encoding", "gzip");
+          response.m_additional_fields.emplace_back("Vary", "Accept-Encoding");
+        }
+      }
       return true;
     }
   };

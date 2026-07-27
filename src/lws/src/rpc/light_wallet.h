@@ -46,6 +46,17 @@ namespace rpc
     };
     void read_bytes(wire::json_reader&, account_credentials&);
 
+    //! get_address_txs request: credentials plus an optional incremental cursor.
+    //! `min_height` defaults to 0 (return the full history, unchanged behavior);
+    //! a client that sends the height it last synced to gets back only the txs
+    //! at height >= min_height, turning a full-history refresh into a small delta.
+    struct get_address_txs_request
+    {
+      account_credentials creds;
+      std::uint64_t min_height = 0; //!< return only txs with height >= min_height
+    };
+    void read_bytes(wire::json_reader&, get_address_txs_request&);
+
     struct get_address_info_response
     {
       get_address_info_response() noexcept
