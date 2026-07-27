@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <cpr/cpr.h>
 
@@ -472,7 +473,7 @@ namespace lws
         if (!user)
           return user.error();
 
-        std::vector<crypto::key_image> processed;
+        std::unordered_set<crypto::key_image, key_image_hash> processed;
 
         auto master_node_data = get_master_node_cache();
         if (!master_node_data)
@@ -517,9 +518,10 @@ namespace lws
           const crypto::key_image locked_key_image =
               output.get_value<MONERO_FIELD(db::output, locked_key_image)>();
 
-          auto it = std::find(processed.begin(), processed.end(), locked_key_image);
-
-          if (!(it != processed.end()) && locked_key_image != crypto::key_image{})
+          // Skip non-locked outputs up front (the common case), and use O(1)
+          // set membership instead of a linear scan of `processed` per output
+          // (the latter was O(n^2) for accounts with many locked outputs).
+          if (locked_key_image != crypto::key_image{} && !processed.count(locked_key_image))
           {
             // O(1) lookup against the maps built once per master-node cache
             // refresh (10s TTL), instead of walking every masternode /
@@ -528,7 +530,7 @@ namespace lws
             if (blacklisted != master_node_data->blacklist_by_image.end())
             {
               resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + blacklisted->second);
-              processed.push_back(locked_key_image);
+              processed.insert(locked_key_image);
             }
             else
             {
@@ -536,7 +538,7 @@ namespace lws
               if (locked != master_node_data->locked_by_image.end())
               {
                 resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + locked->second);
-                processed.push_back(locked_key_image);
+                processed.insert(locked_key_image);
               }
             }
           }
@@ -822,8 +824,8 @@ namespace lws
         
         std::vector<std::uint64_t> amounts = std::move(req.amounts.values);
 
-        // if (50 < req.count || 20 < amounts.size())
-        //   return {lws::error::exceeded_rest_request_limit};
+        if (50 < req.count || 20 < amounts.size())
+          return {lws::error::exceeded_rest_request_limit};
 
         const std::greater<std::uint64_t> rsort{};
         std::sort(amounts.begin(), amounts.end(), rsort);
@@ -1162,6 +1164,93 @@ namespace lws
       return wire::json::to_bytes<response>(*resp);
     }
 
+    // Per-account cache of the fully-serialized get_address_txs response.
+    //
+    // A light-wallet client re-requests its ENTIRE transaction history on every
+    // refresh; get_address_txs takes only credentials (no paging), so for an
+    // account with tens of thousands of txs each poll rebuilds and re-serializes
+    // the whole history from LMDB - which is what makes large accounts hang.
+    //
+    // Its response is a pure function of the account's scanned state and the
+    // chain tip (it reads neither the master-node cache nor any request
+    // parameter), so it stays byte-identical until the account scans a new
+    // block. Key the cache on (scan_height, last_block); a hit hands back a
+    // clone of the stored byte_slice (an O(1) refcount bump) with no DB reads
+    // and no serialization. Invalidation is automatic - the scanner advancing
+    // either height changes the key.
+    struct address_txs_cache_entry
+    {
+      db::block_id scan_height;
+      db::block_id last_block;
+      epee::byte_slice bytes;
+    };
+
+    expect<epee::byte_slice> call_get_address_txs(std::string&& root, db::storage disk)
+    {
+      using E = get_address_txs;
+      static std::mutex cache_mutex;
+      static std::unordered_map<std::uint32_t, address_txs_cache_entry> cache;
+      static std::size_t cache_bytes = 0;
+      // Bound total cached bytes so many distinct large accounts can't grow
+      // memory without limit (a single response larger than this is not cached).
+      constexpr const std::size_t cache_max_bytes = 256 * 1024 * 1024;
+
+      expect<E::request> req = wire::json::from_bytes<E::request>(std::move(root));
+      if (!req)
+        return req.error();
+
+      // Authenticate and read the two heights that key the cache. A cache hit is
+      // only served after a successful view-key check (open_account).
+      auto user = open_account(*req, disk.clone());
+      if (!user)
+        return user.error();
+
+      const std::uint32_t key = static_cast<std::uint32_t>(user->first.id);
+      const db::block_id scan_height = user->first.scan_height;
+      const auto last = user->second.get_last_block();
+      if (!last)
+        return last.error();
+      const db::block_id last_block = last->id;
+      user->second.finish_read();
+
+      {
+        const std::lock_guard<std::mutex> lock{cache_mutex};
+        const auto it = cache.find(key);
+        if (it != cache.end() && it->second.scan_height == scan_height && it->second.last_block == last_block)
+          return it->second.bytes.clone();
+      }
+
+      expect<E::response> resp = E::handle(*req, std::move(disk));
+      if (!resp)
+        return resp.error();
+
+      expect<epee::byte_slice> bytes = wire::json::to_bytes<E::response>(*resp);
+      if (!bytes)
+        return bytes.error();
+
+      const std::size_t sz = bytes->size();
+      {
+        const std::lock_guard<std::mutex> lock{cache_mutex};
+        const auto it = cache.find(key);
+        if (it != cache.end())
+        {
+          cache_bytes -= it->second.bytes.size();
+          cache.erase(it);
+        }
+        if (cache_bytes + sz > cache_max_bytes)
+        {
+          cache.clear();
+          cache_bytes = 0;
+        }
+        if (sz <= cache_max_bytes)
+        {
+          cache.emplace(key, address_txs_cache_entry{scan_height, last_block, bytes->clone()});
+          cache_bytes += sz;
+        }
+      }
+      return bytes;
+    }
+
     template<typename T>
     struct admin
     {
@@ -1223,7 +1312,7 @@ namespace lws
         {
       {"/daemon_status",         call<daemon_status>,          1024},
       {"/get_address_info",      call<get_address_info>, 2 * 1024},
-      {"/get_address_txs",       call<get_address_txs>,  2 * 1024},
+      {"/get_address_txs",       call_get_address_txs,   2 * 1024},
       {"/get_random_outs",       call<get_random_outs>,  2 * 1024},
             // {"/get_txt_records",       nullptr,                0       },
       {"/get_unspent_outs",      call<get_unspent_outs>, 2 * 1024},
@@ -1328,13 +1417,13 @@ namespace lws
         return true;
       }
 
-      // if (handler->max_size < query.m_body.size())
-      // {
-      //   MINFO("Client exceeded maximum body size (" << handler->max_size << " bytes)");
-      //   response.m_response_code = 400;
-      //   response.m_response_comment = "Bad Request";
-      //   return true;
-      // }
+      if (handler->max_size < query.m_body.size())
+      {
+        MINFO("Client exceeded maximum body size (" << handler->max_size << " bytes)");
+        response.m_response_code = 400;
+        response.m_response_comment = "Bad Request";
+        return true;
+      }
 
       if (query.m_http_method != http::http_method_post)
       {
