@@ -176,6 +176,19 @@ namespace lws
     self.min_height = min_height.value_or(0);
   }
 
+  void rpc::read_bytes(wire::json_reader& source, get_address_info_request& self)
+  {
+    std::string address;
+    boost::optional<std::uint64_t> min_height;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      wire::optional_field("min_height", std::ref(min_height))
+    );
+    convert_address(address, self.creds.address);
+    self.min_height = min_height.value_or(0);
+  }
+
   namespace rpc
   {
     namespace
@@ -266,6 +279,7 @@ namespace lws
   {
     wire::object(dest,
       wire::field("total_received", safe_uint64(self.total_received)),
+      wire::field("locked_funds", safe_uint64(self.locked_funds)),
       WIRE_FIELD_COPY(scanned_height),
       WIRE_FIELD_COPY(scanned_block_height),
       WIRE_FIELD_COPY(start_height),
@@ -287,15 +301,18 @@ namespace lws
   void rpc::read_bytes(wire::json_reader& source, get_unspent_outs_request& self)
   {
     std::string address;
+    boost::optional<std::uint64_t> min_height;
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
       WIRE_FIELD(amount),
       WIRE_OPTIONAL_FIELD(mixin),
       WIRE_OPTIONAL_FIELD(use_dust),
-      WIRE_OPTIONAL_FIELD(dust_threshold)
+      WIRE_OPTIONAL_FIELD(dust_threshold),
+      wire::optional_field("min_height", std::ref(min_height))
     );
     convert_address(address, self.creds.address);
+    self.min_height = min_height.value_or(0);
   }
   void rpc::write_bytes(wire::json_writer& dest, const get_unspent_outs_response& self)
   {

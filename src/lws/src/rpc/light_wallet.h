@@ -57,6 +57,19 @@ namespace rpc
     };
     void read_bytes(wire::json_reader&, get_address_txs_request&);
 
+    //! get_address_info request: credentials plus the same optional incremental
+    //! cursor as get_address_txs. `min_height` defaults to 0 (full history); a
+    //! client that sends the height it last synced to gets back only the
+    //! `spent_outputs` at height >= min_height, while the scalar totals stay
+    //! cumulative over the whole account. Turns the (potentially hundreds of MB)
+    //! spent_outputs dump into a small delta.
+    struct get_address_info_request
+    {
+      account_credentials creds;
+      std::uint64_t min_height = 0; //!< return only spent_outputs with height >= min_height
+    };
+    void read_bytes(wire::json_reader&, get_address_info_request&);
+
     struct get_address_info_response
     {
       get_address_info_response() noexcept
@@ -97,6 +110,7 @@ namespace rpc
       };
 
       safe_uint64 total_received;
+      safe_uint64 locked_funds; //!< server-authoritative (view-key derivable); cumulative even in an incremental response
       std::uint64_t scanned_height;
       std::uint64_t scanned_block_height;
       std::uint64_t start_height;
@@ -168,6 +182,7 @@ namespace rpc
       boost::optional<std::uint32_t> mixin;
       boost::optional<bool> use_dust;
       account_credentials creds;
+      std::uint64_t min_height = 0; //!< return only outputs received at height >= min_height (incremental unspent pool)
     };
     void read_bytes(wire::json_reader&, get_unspent_outs_request&);
 

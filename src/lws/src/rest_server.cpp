@@ -511,12 +511,12 @@ namespace lws
     
     struct get_address_info
     {
-      using request = rpc::account_credentials;
+      using request = rpc::get_address_info_request;
       using response = rpc::get_address_info_response;
 
       static expect<response> handle(const request &req, db::storage disk)
       {
-        auto user = open_account(req, std::move(disk));
+        auto user = open_account(req.creds, std::move(disk));
         if (!user)
           return user.error();
 
@@ -611,6 +611,28 @@ namespace lws
           resp.total_sent = rpc::safe_uint64(std::uint64_t(resp.total_sent) + meta->amount);
         }
 
+        // Incremental fetch: when the client sends a min_height cursor, return
+        // only the spent_outputs at/after it. The full walk above still runs, so
+        // every scalar (total_received, total_sent, locked_funds, heights) stays
+        // cumulative over the whole account; only the spent_outputs array - the
+        // part that is transferred and parsed, and the sole reason this response
+        // reaches hundreds of MB on a busy account - shrinks to the new entries.
+        // The client keeps its own persisted view of older candidate spends and
+        // filters them with its key images (which the server, being view-only,
+        // cannot do); it just receives new candidates as a small delta.
+        if (req.min_height != 0)
+        {
+          auto& outs = resp.spent_outputs;
+          outs.erase(
+            std::remove_if(
+              outs.begin(), outs.end(),
+              [min_height = req.min_height](const rpc::transaction_spend& s)
+              {
+                return std::uint64_t(s.possible_spend.link.height) < min_height;
+              }),
+            outs.end());
+        }
+
         return resp;
       }
     };//get_address_info
@@ -659,6 +681,16 @@ namespace lws
           const bool coinbase = (unpacked.first & lws::db::coinbase_output);
           if (out.spend_meta.amount < std::uint64_t(*req.dust_threshold) ||  (out.spend_meta.mixin_count < *req.mixin && !(coinbase == 1)))
             continue;
+
+          // Incremental unspent pool: when the client sends a min_height cursor,
+          // return only outputs received at/after it. The client persists the
+          // outputs (and their key images) it has already fetched and applies its
+          // own spent-filtering, so a refresh transfers just the new outputs
+          // instead of the account's entire receive history (hundreds of MB on a
+          // busy account). `received` below is then the delta sum, so the
+          // full-pool `received < amount` guard is skipped for incremental calls.
+          if (req.min_height != 0 && std::uint64_t(out.link.height) < req.min_height)
+            continue;
           
           bool should_skip_output = false;
           const std::uint64_t value_l = out.spend_meta.amount;
@@ -699,7 +731,10 @@ namespace lws
 
         }
 
-        if (received < std::uint64_t(req.amount))
+        // Only enforce the "enough funds" guard on a full-pool request. For an
+        // incremental (min_height) request `received` is just the delta, and the
+        // client aggregates coverage across its persisted pool itself.
+        if (req.min_height == 0 && received < std::uint64_t(req.amount))
           return {lws::error::account_not_found};
 
         std::uint64_t fee_per_byte, fee_per_output, flash_fee_per_byte,
@@ -746,6 +781,16 @@ namespace lws
         auto user = open_account(req.creds, std::move(disk));
         if (!user)
           return user.error();
+
+        // For the cumulative `locked_funds` scalar - the same master-node /
+        // unlock-time locked amount get_address_info reports, computed here so a
+        // client that only makes the cheap incremental get_address_txs call still
+        // gets a balance-relevant locked total without the 100+ MB address_info
+        // download.
+        auto master_node_data = get_master_node_cache();
+        if (!master_node_data)
+          return master_node_data.error();
+        std::unordered_set<crypto::key_image, key_image_hash> locked_processed;
 
         auto outputs = user->second.get_outputs(user->first.id);
         if (!outputs)
@@ -817,6 +862,35 @@ namespace lws
               metas.insert(find_metadata(metas, meta.id), meta);
 
             resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + amount);
+
+            // Cumulative locked_funds - identical logic to get_address_info, so
+            // the two endpoints agree. Master-node locked/blacklisted
+            // contributions (matched O(1) against the 10s-TTL cache maps) plus
+            // outputs still time-locked by unlock_time. This runs over every
+            // output regardless of min_height, so the scalar stays cumulative
+            // while the transactions array is filtered to the delta below.
+            const crypto::key_image locked_key_image =
+                output.get_value<MONERO_FIELD(db::output, locked_key_image)>();
+            if (locked_key_image != crypto::key_image{} && !locked_processed.count(locked_key_image))
+            {
+              const auto blacklisted = master_node_data->blacklist_by_image.find(locked_key_image);
+              if (blacklisted != master_node_data->blacklist_by_image.end())
+              {
+                resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + blacklisted->second);
+                locked_processed.insert(locked_key_image);
+              }
+              else
+              {
+                const auto locked = master_node_data->locked_by_image.find(locked_key_image);
+                if (locked != master_node_data->locked_by_image.end())
+                {
+                  resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + locked->second);
+                  locked_processed.insert(locked_key_image);
+                }
+              }
+            }
+            if (is_locked(output.get_value<MONERO_FIELD(db::output, unlock_time)>(), user->first.scan_height))
+              resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + meta.amount);
 
             ++output;
             if (!output.is_end())
