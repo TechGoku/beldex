@@ -172,6 +172,23 @@ namespace db
       return less<output_id>(left_bytes, right_bytes);
     }
 
+    /*! Smallest `T` (`output` or `spend`) that `output_compare` / `spend_compare`
+        consider to be at `height`. Both comparators order on `link.height` first
+        and break ties on fields that follow it in the struct, so zeroing
+        everything but the height yields a value that sorts at or before every
+        real record in that block - exactly the lower bound
+        `get_value_stream_from` needs to seek to the first record at or after
+        `height`. */
+    template<typename T>
+    T height_bound(block_id height) noexcept
+    {
+      static_assert(std::is_pod<T>(), "value type must be pod");
+      static_assert(offsetof(T, link) == 0, "link must lead T for the seek to work");
+      T bound{};
+      bound.link.height = height;
+      return bound;
+    }
+
     constexpr const lmdb::basic_table<unsigned, block_info> blocks{
       "blocks_by_id", (MDB_CREATE | MDB_DUPSORT), MONERO_SORT_BY(block_info, id)
     };
@@ -824,6 +841,15 @@ namespace db
     return outputs.get_value_stream(id, std::move(cur));
   }
 
+  expect<lmdb::value_stream<output, cursor::close_outputs>>
+  storage_reader::get_outputs(account_id id, block_id min_height, cursor::outputs cur) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+    MONERO_CHECK(check_cursor(*txn, db->tables.outputs, cur));
+    return outputs.get_value_stream_from(id, height_bound<output>(min_height), std::move(cur));
+  }
+
   expect<lmdb::value_stream<spend, cursor::close_spends>>
   storage_reader::get_spends(account_id id, cursor::spends cur) noexcept
   {
@@ -831,6 +857,15 @@ namespace db
     assert(db != nullptr);
     MONERO_CHECK(check_cursor(*txn, db->tables.spends, cur));
     return spends.get_value_stream(id, std::move(cur));
+  }
+
+  expect<lmdb::value_stream<spend, cursor::close_spends>>
+  storage_reader::get_spends(account_id id, block_id min_height, cursor::spends cur) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+    MONERO_CHECK(check_cursor(*txn, db->tables.spends, cur));
+    return spends.get_value_stream_from(id, height_bound<spend>(min_height), std::move(cur));
   }
 
   expect<lmdb::value_stream<db::key_image, cursor::close_images>>

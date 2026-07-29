@@ -401,6 +401,21 @@ namespace lws
     }
 
 
+    /*! A stream from `get_outputs`/`get_spends(id, min_height)` is positioned past
+        the start of the account's records, so its `count()` - which reports every
+        record at the key, not the remaining ones - would size a container for the
+        whole account and hand back the memory the seek just saved. Reserve a fixed
+        amount for incremental requests instead; the vector still grows on its own
+        if a client returns after an unusually long absence.
+
+        \return A `reserve()` size for a walk of `stream` bounded by `min_height`. */
+    template<typename Stream>
+    std::size_t reserve_for(const Stream& stream, const std::uint64_t min_height)
+    {
+      constexpr const std::size_t incremental_reserve = 1024;
+      return min_height ? incremental_reserve : stream.count();
+    }
+
     //! \return Account info from the DB, iff key matches address AND address is NOT hidden.
     expect<std::pair<db::account, db::storage_reader>> open_account(const rpc::account_credentials& creds, db::storage disk)
     {
@@ -528,11 +543,31 @@ namespace lws
 
         response resp{};
 
+        // Outputs are walked in full even for an incremental request, deliberately:
+        // a spend returned below is resolved against `metas` by output id, and a
+        // spend in a new block can consume an output received years earlier, so a
+        // seeked (partial) `metas` would trip the "no receive for spend" throw.
+        // Walking them also keeps total_received and locked_funds cumulative for
+        // free. Making this leg O(delta) too would need an output-id index, which
+        // is a schema change; not worth it unless it shows up in profiling.
         auto outputs = user->second.get_outputs(user->first.id);
         if (!outputs)
           return outputs.error();
 
-        auto spends = user->second.get_spends(user->first.id);
+        // Incremental fetch: when the client sends a min_height cursor, seek the
+        // spends cursor to it so only the new candidate spends are read. This is
+        // the array that makes the response reach hundreds of MB on a busy
+        // account, and the seek means the earlier spends cost nothing rather than
+        // being read and then discarded.
+        //
+        // The client keeps its own persisted view of older candidate spends and
+        // filters them with its key images (which the server, being view-only,
+        // cannot do); it just receives new candidates as a small delta. Note that
+        // `total_sent` is therefore delta-scoped for an incremental request, while
+        // the output-derived scalars below stay cumulative.
+        auto spends = req.min_height ?
+          user->second.get_spends(user->first.id, db::block_id(req.min_height)) :
+          user->second.get_spends(user->first.id);
         if (!spends)
           return spends.error();
 
@@ -596,7 +631,7 @@ namespace lws
           }
         }
 
-        resp.spent_outputs.reserve(spends->count());
+        resp.spent_outputs.reserve(reserve_for(*spends, req.min_height));
         for (auto const &spend : spends->make_range())
         {
           const auto meta = find_metadata(metas, spend.source);
@@ -609,28 +644,6 @@ namespace lws
 
           resp.spent_outputs.push_back({*meta, spend});
           resp.total_sent = rpc::safe_uint64(std::uint64_t(resp.total_sent) + meta->amount);
-        }
-
-        // Incremental fetch: when the client sends a min_height cursor, return
-        // only the spent_outputs at/after it. The full walk above still runs, so
-        // every scalar (total_received, total_sent, locked_funds, heights) stays
-        // cumulative over the whole account; only the spent_outputs array - the
-        // part that is transferred and parsed, and the sole reason this response
-        // reaches hundreds of MB on a busy account - shrinks to the new entries.
-        // The client keeps its own persisted view of older candidate spends and
-        // filters them with its key images (which the server, being view-only,
-        // cannot do); it just receives new candidates as a small delta.
-        if (req.min_height != 0)
-        {
-          auto& outs = resp.spent_outputs;
-          outs.erase(
-            std::remove_if(
-              outs.begin(), outs.end(),
-              [min_height = req.min_height](const rpc::transaction_spend& s)
-              {
-                return std::uint64_t(s.possible_spend.link.height) < min_height;
-              }),
-            outs.end());
         }
 
         return resp;
@@ -667,14 +680,27 @@ namespace lws
         if (!req.mixin)
           req.mixin = 0;
 
-        auto outputs = user->second.get_outputs(user->first.id);
+        // Incremental unspent pool: when the client sends a min_height cursor, walk
+        // only the outputs received at/after it. The client persists the outputs
+        // (and their key images) it has already fetched and applies its own
+        // spent-filtering, so a refresh transfers just the new outputs instead of
+        // the account's entire receive history (hundreds of MB on a busy account).
+        //
+        // The bound is a cursor seek rather than a filter, so the earlier outputs
+        // are never read - which also skips their per-output get_images sub-query
+        // below, the dominant cost of this endpoint on a large account. `received`
+        // is then the delta sum, so the full-pool `received < amount` guard is
+        // skipped for incremental calls.
+        auto outputs = req.min_height ?
+          user->second.get_outputs(user->first.id, db::block_id(req.min_height)) :
+          user->second.get_outputs(user->first.id);
         if (!outputs)
           return outputs.error();
 
         std::uint64_t received = 0;
         std::vector<std::pair<db::output, std::vector<crypto::key_image>>> unspent;
 
-        unspent.reserve(outputs->count());
+        unspent.reserve(reserve_for(*outputs, req.min_height));
         for (db::output const& out : outputs->make_range())
         {
           const std::pair<db::extra, std::uint8_t> unpacked = db::unpack(out.extra);
@@ -682,16 +708,6 @@ namespace lws
           if (out.spend_meta.amount < std::uint64_t(*req.dust_threshold) ||  (out.spend_meta.mixin_count < *req.mixin && !(coinbase == 1)))
             continue;
 
-          // Incremental unspent pool: when the client sends a min_height cursor,
-          // return only outputs received at/after it. The client persists the
-          // outputs (and their key images) it has already fetched and applies its
-          // own spent-filtering, so a refresh transfers just the new outputs
-          // instead of the account's entire receive history (hundreds of MB on a
-          // busy account). `received` below is then the delta sum, so the
-          // full-pool `received < amount` guard is skipped for incremental calls.
-          if (req.min_height != 0 && std::uint64_t(out.link.height) < req.min_height)
-            continue;
-          
           bool should_skip_output = false;
           const std::uint64_t value_l = out.spend_meta.amount;
           const crypto::key_image locked_key_image = out.locked_key_image;
@@ -792,11 +808,20 @@ namespace lws
           return master_node_data.error();
         std::unordered_set<crypto::key_image, key_image_hash> locked_processed;
 
+        // Outputs are walked in full even for an incremental request: they feed
+        // the cumulative scalars above, and `metas` must cover the whole account
+        // so that a spend in a new block can still resolve the (possibly very old)
+        // output it consumes.
         auto outputs = user->second.get_outputs(user->first.id);
         if (!outputs)
           return outputs.error();
 
-        auto spends = user->second.get_spends(user->first.id);
+        // Spends, by contrast, are only ever emitted, never aggregated into a
+        // scalar here - so an incremental request seeks straight to its cursor and
+        // never reads the earlier ones. Safe because `metas` is complete (above).
+        auto spends = req.min_height ?
+          user->second.get_spends(user->first.id, db::block_id(req.min_height)) :
+          user->second.get_spends(user->first.id);
         if (!spends)
           return spends.error();
 
@@ -929,10 +954,14 @@ namespace lws
           }
         }
 
-        // Incremental fetch: when the client sends a min_height cursor, return
-        // only txs at/after it. The full merge above still runs (so totals stay
-        // cumulative and spend resolution is unaffected), but the response - the
-        // part that is transferred and parsed - shrinks to just the new txs.
+        // Incremental fetch: drop the txs below the client's min_height cursor.
+        // Only output-derived entries can still be here - the spends cursor was
+        // seeked, so no old spend was merged in. Those are filtered after the
+        // merge rather than suppressed during it because the loop groups by
+        // comparing against `resp.transactions.back()`, and skipping a push
+        // mid-merge would mis-group a tx that has both outputs and spends. The
+        // vector is built regardless, since the outputs feed the cumulative
+        // total_received and locked_funds scalars.
         if (req.min_height != 0)
         {
           auto& txs = resp.transactions;

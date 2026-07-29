@@ -42,6 +42,19 @@ beldex-lws-rpc
 beldex-lws-wire-json
 )
 
+# Checks that get_outputs/get_spends(id, min_height) seek to exactly the tail of
+# the account's records; see ../tests/min_height_seek.cpp.
+if (BUILD_TESTS)
+  add_executable(lws-min-height-seek-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/min_height_seek.cpp)
+  target_link_libraries(lws-min-height-seek-test PRIVATE
+      beldex-lws-common
+      beldex-lws-db
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-min-height-seek COMMAND lws-min-height-seek-test)
+endif ()
+
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )
 # install(TARGETS beldex-lws-daemon DESTINATION bin)
 # install(TARGETS beldex-lws-admin DESTINATION bin)

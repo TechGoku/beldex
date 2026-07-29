@@ -100,9 +100,31 @@ namespace db
     expect<lmdb::value_stream<output, cursor::close_outputs>>
       get_outputs(account_id id, cursor::outputs cur = nullptr) noexcept;
 
+    /*! Outputs are stored sorted by `link.height`, so the tail of a large
+        account's history can be reached with a seek rather than a scan. Use this
+        instead of walking `get_outputs(id)` and discarding the early records:
+        the skipped records are never read from disk.
+
+        \note The returned stream is not positioned at the start of the account's
+            outputs, so its `count()` (every output, not the remaining ones) must
+            not be used to size a container, and `reset()` must not be called.
+
+        \return Outputs received by `id` in a block at or after `min_height`.
+    */
+    expect<lmdb::value_stream<output, cursor::close_outputs>>
+      get_outputs(account_id id, block_id min_height, cursor::outputs cur = nullptr) noexcept;
+
     //! \return All potential spends by `id`.
     expect<lmdb::value_stream<spend, cursor::close_spends>>
       get_spends(account_id id, cursor::spends cur = nullptr) noexcept;
+
+    /*! The `get_outputs(id, min_height)` treatment for spends; see there for the
+        `count()` / `reset()` caveats.
+
+        \return Potential spends by `id` in a block at or after `min_height`.
+    */
+    expect<lmdb::value_stream<spend, cursor::close_spends>>
+      get_spends(account_id id, block_id min_height, cursor::spends cur = nullptr) noexcept;
 
     //! \return All key images associated with `id`.
     expect<lmdb::value_stream<db::key_image, cursor::close_images>>

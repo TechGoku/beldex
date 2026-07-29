@@ -115,6 +115,48 @@ namespace lmdb
             }
             return value_stream<V, D>{std::move(cur)};
         }
+
+        /*!
+            Like `get_value_stream`, but skips the values at `key` that sort
+            below `lower_bound`, so a caller interested only in the tail of a
+            large duplicate set pays for a seek instead of a scan.
+
+            The table's value comparator decides "below": `lower_bound` should
+            be a value whose leading (sort-significant) fields are set and whose
+            remaining bytes are zero, which places it at-or-before the first real
+            record sharing those leading fields.
+
+            \note The returned stream is positioned past the start of the
+                duplicate set, so `value_stream::count()` (which reports every
+                duplicate at `key`, not the remaining ones) is not a valid size
+                for it, and `value_stream::reset()` would rewind past the seek.
+
+            \pre `cur != nullptr`.
+            \param cur Active cursor on table. Returned in object on success,
+                otherwise destroyed.
+            \return A handle to the first value at `key` that does not sort
+                below `lower_bound`, or an empty `value_stream`.
+        */
+        template<typename D>
+        expect<value_stream<V, D>>
+        static get_value_stream_from(K const& key, V const& lower_bound, std::unique_ptr<MDB_cursor, D> cur) noexcept
+        {
+            MONERO_PRECOND(cur != nullptr);
+
+            MDB_val key_bytes = lmdb::to_val(key);
+            MDB_val value_bytes = lmdb::to_val(lower_bound);
+            // MDB_GET_BOTH_RANGE matches `key` exactly, then positions within its
+            // duplicate set at the first value >= `lower_bound`. MDB_NOTFOUND
+            // means either no such key or every duplicate sorts below it.
+            const int err = mdb_cursor_get(cur.get(), &key_bytes, &value_bytes, MDB_GET_BOTH_RANGE);
+            if (err)
+            {
+                if (err != MDB_NOTFOUND)
+                    return {lmdb::error(err)};
+                cur.reset(); // return empty set
+            }
+            return value_stream<V, D>{std::move(cur)};
+        }
     };
 } // lmdb
 

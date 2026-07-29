@@ -179,6 +179,38 @@ Randomly selected outputs for use in a ring signature.
 > `outputs` is omitted by the server if the `amount` does not have enough
 > mixable outputs.
 
+### Incremental fetch (`min_height`)
+
+`get_address_info`, `get_address_txs` and `get_unspent_outs` each accept an
+optional `min_height`. It is a **cursor, not a filter**: the server seeks
+directly to the first stored record in a block at or after `min_height`, so the
+earlier records are never read. Without it, an account with a long history makes
+every one of these calls do work proportional to the account's entire lifetime,
+which is what makes large accounts time out.
+
+The intended client model is **fetch once, then delta**: do one unbounded call to
+build a local store, then pass `min_height` on every later call and merge what
+comes back.
+
+- `min_height` is **inclusive** - a record in exactly that block is returned.
+- Omitting it, or sending `0`, returns the full history, exactly as before.
+- A `min_height` above the chain tip is not an error; the arrays come back empty.
+- Seed it at `last_scanned_height - 10`, not at the exact last height, so a small
+  reorg cannot drop a tx. Every array is safe to de-duplicate on `hash` (txs),
+  `key_image` (spends) or `public_key` (outputs).
+
+Which scalars are cumulative and which describe only the delta depends on how
+much of the account the server still has to walk. The per-method tables below
+mark each one; a client that only ever sends `min_height` must accumulate the
+delta-scoped values itself.
+
+> `total_sent` is a **superset** of what the account actually spent: the server
+> holds only the view key, so it records a candidate spend whenever one of the
+> account's outputs appears as a ring member, including as another wallet's
+> mixin. It cannot be corrected server-side at any `min_height`. The client must
+> derive key images and subtract back the candidates that are not its own -
+> which is what `spent_outputs` is returned for.
+
 ### Methods
 #### `get_address_info`
 Returns the minimal set of information needed to calculate a wallet balance.
@@ -187,10 +219,11 @@ list of candidate spends is returned.
 
 **Request** object
 
-|   Field   |       Type       |            Description                |
-|-----------|------------------|---------------------------------------|
-| address   | `base58-address` | Address to retrieve                   |
-| view_key  | `binary`         | View key bytes for authorization      |
+|   Field      |       Type       |            Description                     |
+|--------------|------------------|--------------------------------------------|
+| address      | `base58-address` | Address to retrieve                        |
+| view_key     | `binary`         | View key bytes for authorization           |
+| min_height * | `uint64`         | Return only spends at/after this block      |
 
 > If `address` is not authorized, the server must return a HTTP 403
 > "Forbidden" error.
@@ -199,15 +232,20 @@ list of candidate spends is returned.
 
 |        Field         |          Type            |       Description         |
 |----------------------|--------------------------|---------------------------|
-| locked_funds         | `uint64-string`          | Sum of unspendable BDX    |
-| total_received       | `uint64-string`          | Sum of received BDX       |
-| total_sent           | `uint64-string`          | Sum of possibly spent BDX |
+| locked_funds         | `uint64-string`          | Sum of unspendable BDX (always cumulative) |
+| total_received       | `uint64-string`          | Sum of received BDX (always cumulative)    |
+| total_sent           | `uint64-string`          | Sum of possibly spent BDX (**delta-scoped** when `min_height` is sent) |
 | scanned_height       | `uint64`                 | Current tx scan progress  |
 | scanned_block_height | `uint64`                 | Current scan progress     |
 | start_height         | `uint64`                 | Start height of response  |
 | transaction_height   | `uint64`                 | Total txes sent in Beldex |
 | blockchain_height    | `uint64`                 | Current blockchain height |
-| spent_outputs        | array of `spend` objects | Possible spend info       |
+| spent_outputs        | array of `spend` objects | Possible spend info; limited to blocks at/after `min_height` |
+
+> `min_height` bounds `spent_outputs` and `total_sent` only. The received-output
+> scalars stay cumulative because the server must walk every output regardless,
+> to resolve which output each returned spend consumed - a spend in a new block
+> can consume an output received years earlier.
 
 
 #### `get_address_txs`
@@ -217,10 +255,11 @@ spends is returned.
 
 **Request** object
 
-|   Field  |        Type      |             Description               |
-|----------|------------------|---------------------------------------|
-| address  | `base58-address` | Address to retrieve                   |
-| view_key | `binary`         | View key bytes for authorization      |
+|   Field      |        Type      |             Description                  |
+|--------------|------------------|------------------------------------------|
+| address      | `base58-address` | Address to retrieve                      |
+| view_key     | `binary`         | View key bytes for authorization         |
+| min_height * | `uint64`         | Return only txes at/after this block     |
 
 > If `address` is not authorized, the server must return a HTTP 403
 > "Forbidden" error.
@@ -229,12 +268,18 @@ spends is returned.
 
 |        Field         |             Type               |       Description         |
 |----------------------|--------------------------------|---------------------------|
-| total_received       | `uint64-string`                | Sum of received outputs   |
+| total_received       | `uint64-string`                | Sum of received outputs (always cumulative) |
+| locked_funds         | `uint64-string`                | Sum of unspendable BDX (always cumulative)  |
 | scanned_height       | `uint64`                       | Current tx scan progress  |
 | scanned_block_height | `uint64`                       | Current scan progress     |
 | start_height         | `uint64`                       | Start height of response  |
 | blockchain_height    | `uint64`                       | Current blockchain height |
-| transactions         | array of `transaction` objects | Possible spend info       |
+| transactions         | array of `transaction` objects | Possible spend info; limited to blocks at/after `min_height` |
+
+> `locked_funds` is the same master-node / unlock-time locked total that
+> `get_address_info` reports, and is computed here as well so that a client
+> polling only this method has everything it needs for a balance without ever
+> downloading `spent_outputs`.
 
 #### `get_random_outs`
 Selects random outputs to use in a ring signature of a new transaction. If the
@@ -274,17 +319,21 @@ was actually spent.
 
 **Request** object
 
-|       Field      |       Type       |           Description            |
-|------------------|------------------|----------------------------------|
-| address          | `base58-address` | Address to create/probe          |
-| view_key         | `binary`         | View key bytes                   |
-| amount           | `uint64-string`  | BDX send amount                  |
-| mixin            | `uint32`         | Minimum mixin for source output  |
-| use_dust         | `boolean`        | Return all available outputs     |
-| dust_threshold * | `uint64-string`  | Ignore outputs below this amount |
+|       Field      |       Type       |           Description                |
+|------------------|------------------|--------------------------------------|
+| address          | `base58-address` | Address to create/probe              |
+| view_key         | `binary`         | View key bytes                       |
+| amount           | `uint64-string`  | BDX send amount                      |
+| mixin            | `uint32`         | Minimum mixin for source output      |
+| use_dust         | `boolean`        | Return all available outputs         |
+| dust_threshold * | `uint64-string`  | Ignore outputs below this amount     |
+| min_height *     | `uint64`         | Return only outputs at/after this block |
 
 > If the total received outputs for the address is less than `amount`, the
-> server shall return a HTTP 400 "Bad Request" error code.
+> server shall return a HTTP 400 "Bad Request" error code. This check is
+> **skipped** when `min_height` is sent, since the server then only sees the
+> delta; a client fetching incrementally is responsible for checking that its
+> own accumulated pool covers the amount.
 
 **Response** object
 
@@ -292,8 +341,14 @@ was actually spent.
 |--------------|---------------------------|-----------------------------------------|
 | per_byte_fee | `uint64-string`           | Estimated network fee                   |
 | fee_mask     | `uint64-string`           | Fee quantization mask                   |
-| amount       | `uint64-string`           | The total value in outputs              |
-| outputs      | array of `output` objects | Outputs possibly available for spending |
+| amount       | `uint64-string`           | Total value in `outputs` (**delta-scoped** when `min_height` is sent) |
+| outputs      | array of `output` objects | Outputs possibly available for spending; limited to blocks at/after `min_height` |
+
+> This is the method that benefits most from `min_height`: every returned output
+> carries its key images, which the server looks up per output, so an unbounded
+> call on a busy account is both the largest response and the slowest query.
+> Each output is immutable once scanned, so a client can persist the pool and
+> only ever ask for the delta.
 
 #### `import_request`
 Request an account scan from the genesis block.
