@@ -9,7 +9,9 @@
 // Covers the boundary cases the REST handlers rely on: min_height is inclusive,
 // min_height == 0 does not seek at all, a cursor past the chain tip yields an
 // empty stream rather than an error, and an account with no records does not
-// fault on the seek path.
+// fault on the seek path. Also simulates the handlers' whole-block pagination
+// loop (max_count + next_min_height) over the seek primitive and asserts that
+// walking every page reconstructs the full stream with no gap or overlap.
 //
 // Built as `lws-min-height-seek-test` when BUILD_TESTS=ON. Takes no arguments;
 // prints one line per case and exits non-zero on any failure.
@@ -212,6 +214,59 @@ int main()
       check(seeked_spends == tail(full_spend_heights, min_height),
             "spends at min_height=" + std::to_string(min_height) + " ("
               + std::to_string(seeked_spends.size()) + " of " + std::to_string(full_spend_heights.size()) + ")");
+    }
+
+    // Pagination: simulate the REST handler's whole-block page loop over the
+    // seek primitive - take up to max_count records, but stop only at a block
+    // boundary (never split a block), and resume at the returned next_min_height
+    // - and assert it reconstructs the full stream in order with a strictly
+    // advancing cursor (no gap, no overlap). Outputs have two records per block,
+    // so a page_size that lands mid-block exercises the whole-block straddle.
+    const auto page_once = [&](std::uint64_t min_height, std::uint64_t max_count,
+                               std::uint64_t& next_min_height) {
+      std::vector<std::uint64_t> page;
+      auto stream = min_height ?
+        reader->get_outputs(id, lws::db::block_id(min_height)) : reader->get_outputs(id);
+      if (!stream)
+        throw std::runtime_error{"page get_outputs seek failed"};
+      std::uint64_t returned = 0, last_h = 0;
+      next_min_height = 0;
+      for (const lws::db::output& o : stream->make_range())
+      {
+        const std::uint64_t h = std::uint64_t(o.link.height);
+        if (max_count != 0 && returned >= max_count && h != last_h)
+        {
+          next_min_height = h; // resume here next page (inclusive seek)
+          break;
+        }
+        page.push_back(h);
+        ++returned;
+        last_h = h;
+      }
+      return page;
+    };
+
+    for (const std::uint64_t page_size : {std::uint64_t(1), std::uint64_t(3),
+                                          std::uint64_t(7), std::uint64_t(1000)})
+    {
+      std::vector<std::uint64_t> walked;
+      std::uint64_t mh = 0, next = 0, pages = 0, iterations = 0;
+      bool cursor_ok = true, guard_ok = true;
+      do {
+        const auto page = page_once(mh, page_size, next);
+        walked.insert(walked.end(), page.begin(), page.end());
+        ++pages;
+        if (next != 0) // cursor must land strictly past the last returned block
+          cursor_ok = cursor_ok && (!page.empty() && next > page.back());
+        if (++iterations > blocks + 5) { guard_ok = false; break; } // runaway guard
+        mh = next;
+      } while (next != 0);
+
+      check(walked == full_out_heights,
+            "paged walk reconstructs full stream (page_size=" + std::to_string(page_size)
+              + ", " + std::to_string(pages) + " pages)");
+      check(cursor_ok, "cursor advances whole-block, no overlap (page_size=" + std::to_string(page_size) + ")");
+      check(guard_ok, "pagination terminates (page_size=" + std::to_string(page_size) + ")");
     }
 
     // An account with no records at all must not blow up on the seek path.

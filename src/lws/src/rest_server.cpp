@@ -408,11 +408,14 @@ namespace lws
         amount for incremental requests instead; the vector still grows on its own
         if a client returns after an unusually long absence.
 
-        \return A `reserve()` size for a walk of `stream` bounded by `min_height`. */
+        \return A `reserve()` size for a walk of `stream` bounded by `min_height`
+        and/or paginated by `max_count`. */
     template<typename Stream>
-    std::size_t reserve_for(const Stream& stream, const std::uint64_t min_height)
+    std::size_t reserve_for(const Stream& stream, const std::uint64_t min_height, const std::uint64_t max_count = 0)
     {
       constexpr const std::size_t incremental_reserve = 1024;
+      if (max_count) // one page; the vector still grows if a huge block overshoots
+        return std::min<std::size_t>(max_count, std::size_t{1} << 16);
       return min_height ? incremental_reserve : stream.count();
     }
 
@@ -631,9 +634,23 @@ namespace lws
           }
         }
 
-        resp.spent_outputs.reserve(reserve_for(*spends, req.min_height));
+        // Pagination: cap spent_outputs at max_count, stopping only at a block
+        // boundary (a block is never split across pages). next_min_height carries
+        // the first not-returned height back to the client for the next page. The
+        // output-derived scalars above stay cumulative regardless.
+        std::uint64_t returned = 0;
+        std::uint64_t last_returned_height = 0;
+
+        resp.spent_outputs.reserve(reserve_for(*spends, req.min_height, req.max_count));
         for (auto const &spend : spends->make_range())
         {
+          const std::uint64_t spend_height = std::uint64_t(spend.link.height);
+          if (req.max_count != 0 && returned >= req.max_count && spend_height != last_returned_height)
+          {
+            resp.next_min_height = spend_height; // resume here next page (inclusive seek)
+            break;
+          }
+
           const auto meta = find_metadata(metas, spend.source);
           if (meta == metas.end() || meta->id != spend.source)
           {
@@ -644,6 +661,8 @@ namespace lws
 
           resp.spent_outputs.push_back({*meta, spend});
           resp.total_sent = rpc::safe_uint64(std::uint64_t(resp.total_sent) + meta->amount);
+          ++returned;
+          last_returned_height = spend_height;
         }
 
         return resp;
@@ -700,9 +719,24 @@ namespace lws
         std::uint64_t received = 0;
         std::vector<std::pair<db::output, std::vector<crypto::key_image>>> unspent;
 
-        unspent.reserve(reserve_for(*outputs, req.min_height));
+        // Pagination: when the client sends max_count, return at most that many
+        // outputs, stopping only at a block boundary so a block is never split
+        // across pages. next_min_height carries the first not-returned height
+        // back to the client, which re-issues with min_height = next_min_height.
+        std::uint64_t next_min_height = 0;
+        std::uint64_t returned = 0;
+        std::uint64_t last_returned_height = 0;
+
+        unspent.reserve(reserve_for(*outputs, req.min_height, req.max_count));
         for (db::output const& out : outputs->make_range())
         {
+          const std::uint64_t out_height = std::uint64_t(out.link.height);
+          if (req.max_count != 0 && returned >= req.max_count && out_height != last_returned_height)
+          {
+            next_min_height = out_height; // resume here next page (inclusive seek)
+            break;
+          }
+
           const std::pair<db::extra, std::uint8_t> unpacked = db::unpack(out.extra);
           const bool coinbase = (unpacked.first & lws::db::coinbase_output);
           if (out.spend_meta.amount < std::uint64_t(*req.dust_threshold) ||  (out.spend_meta.mixin_count < *req.mixin && !(coinbase == 1)))
@@ -743,6 +777,9 @@ namespace lws
             unspent.back().second.reserve(images->count());
             auto range = images->make_range<MONERO_FIELD(db::key_image, value)>();
             std::copy(range.begin(), range.end(), std::back_inserter(unspent.back().second));
+
+            ++returned;
+            last_returned_height = out_height;
           }
 
         }
@@ -783,7 +820,7 @@ namespace lws
           return {lws::error::bad_daemon_response};
         }
 
-        return response{fee_per_byte, fee_per_output,flash_fee_per_byte,flash_fee_per_output,flash_fee_fixed,quantization_mask,17,rpc::safe_uint64(received), std::move(unspent), std::move(req.creds.key)};
+        return response{fee_per_byte, fee_per_output,flash_fee_per_byte,flash_fee_per_output,flash_fee_fixed,quantization_mask,17,rpc::safe_uint64(received), std::move(unspent), std::move(req.creds.key), next_min_height};
       }
     };//get_unspent_outs
 
@@ -973,6 +1010,27 @@ namespace lws
                 return std::uint64_t(t.info.link.height) < min_height;
               }),
             txs.end());
+        }
+
+        // Pagination: cap the transactions returned at max_count, extending the
+        // last kept block so a block is never split across pages. transactions
+        // are height-ascending (merge order, preserved by the filter above), so
+        // next_min_height = the first dropped tx's height resumes cleanly. Unlike
+        // the other two endpoints this truncates after the full merge - the output
+        // walk is structural (it feeds the cumulative scalars), so only the
+        // response is bounded here, matching the existing min_height filter.
+        if (req.max_count != 0 && resp.transactions.size() > req.max_count)
+        {
+          auto& txs = resp.transactions;
+          std::size_t cut = req.max_count;
+          const std::uint64_t boundary_h = std::uint64_t(txs[cut - 1].info.link.height);
+          while (cut < txs.size() && std::uint64_t(txs[cut].info.link.height) == boundary_h)
+            ++cut; // keep the whole block that straddles the cap
+          if (cut < txs.size())
+          {
+            resp.next_min_height = std::uint64_t(txs[cut].info.link.height);
+            txs.erase(txs.begin() + cut, txs.end()); // shrink only (transaction has no default ctor)
+          }
         }
 
         return resp;
@@ -1351,6 +1409,7 @@ namespace lws
       db::block_id scan_height;
       db::block_id last_block;
       std::uint64_t min_height;
+      std::uint64_t max_count;
       epee::byte_slice bytes;
     };
 
@@ -1377,6 +1436,7 @@ namespace lws
       const std::uint32_t key = static_cast<std::uint32_t>(user->first.id);
       const db::block_id scan_height = user->first.scan_height;
       const std::uint64_t min_height = req->min_height;
+      const std::uint64_t max_count = req->max_count;
       const auto last = user->second.get_last_block();
       if (!last)
         return last.error();
@@ -1387,7 +1447,8 @@ namespace lws
         const std::lock_guard<std::mutex> lock{cache_mutex};
         const auto it = cache.find(key);
         if (it != cache.end() && it->second.scan_height == scan_height &&
-            it->second.last_block == last_block && it->second.min_height == min_height)
+            it->second.last_block == last_block && it->second.min_height == min_height &&
+            it->second.max_count == max_count)
           return it->second.bytes.clone();
       }
 
@@ -1415,7 +1476,7 @@ namespace lws
         }
         if (sz <= cache_max_bytes)
         {
-          cache.emplace(key, address_txs_cache_entry{scan_height, last_block, min_height, bytes->clone()});
+          cache.emplace(key, address_txs_cache_entry{scan_height, last_block, min_height, max_count, bytes->clone()});
           cache_bytes += sz;
         }
       }

@@ -46,9 +46,13 @@ beldex-lws-wire-json
 # the account's records; see ../tests/min_height_seek.cpp.
 if (BUILD_TESTS)
   add_executable(lws-min-height-seek-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/min_height_seek.cpp)
+  # Order matters for static libs: beldex-lws-db (storage.cpp) references
+  # lws::error_category() in beldex-lws-common and wire::json_writer in
+  # beldex-lws-wire-json, so those must follow it on the link line.
   target_link_libraries(lws-min-height-seek-test PRIVATE
-      beldex-lws-common
       beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
       Boost::filesystem
       Threads::Threads
   )

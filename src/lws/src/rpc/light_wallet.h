@@ -54,6 +54,7 @@ namespace rpc
     {
       account_credentials creds;
       std::uint64_t min_height = 0; //!< return only txs with height >= min_height
+      std::uint64_t max_count = 0;  //!< 0 = unbounded; else cap transactions per page (whole blocks)
     };
     void read_bytes(wire::json_reader&, get_address_txs_request&);
 
@@ -67,6 +68,7 @@ namespace rpc
     {
       account_credentials creds;
       std::uint64_t min_height = 0; //!< return only spent_outputs with height >= min_height
+      std::uint64_t max_count = 0;  //!< 0 = unbounded; else cap spent_outputs per page (whole blocks)
     };
     void read_bytes(wire::json_reader&, get_address_info_request&);
 
@@ -81,6 +83,7 @@ namespace rpc
           start_height(0),
           transaction_height(0),
           blockchain_height(0),
+          next_min_height(0),
           spent_outputs()
           // rates(common_error::kInvalidArgument)
       {}
@@ -93,6 +96,7 @@ namespace rpc
       std::uint64_t start_height;
       std::uint64_t transaction_height;
       std::uint64_t blockchain_height;
+      std::uint64_t next_min_height; //!< 0 = last page; else min_height for the next page
       std::vector<transaction_spend> spent_outputs;
       // expect<lws::rates> rates;
     };
@@ -116,6 +120,7 @@ namespace rpc
       std::uint64_t start_height;
       std::uint64_t transaction_height;
       std::uint64_t blockchain_height;
+      std::uint64_t next_min_height; //!< 0 = last page; else min_height for the next page
       std::vector<transaction> transactions;
     };
     void write_bytes(wire::json_writer&, const get_address_txs_response&);
@@ -183,6 +188,7 @@ namespace rpc
       boost::optional<bool> use_dust;
       account_credentials creds;
       std::uint64_t min_height = 0; //!< return only outputs received at height >= min_height (incremental unspent pool)
+      std::uint64_t max_count = 0;  //!< 0 = unbounded; else cap outputs per page (whole blocks)
     };
     void read_bytes(wire::json_reader&, get_unspent_outs_request&);
 
@@ -201,6 +207,7 @@ namespace rpc
       safe_uint64 amount;
       std::vector<std::pair<db::output, std::vector<crypto::key_image>>> outputs;
       crypto::secret_key user_key;
+      std::uint64_t next_min_height; //!< 0 = last page; else min_height for the next page
     };
     void write_bytes(wire::json_writer&, const get_unspent_outs_response&);
 

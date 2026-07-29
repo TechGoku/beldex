@@ -167,26 +167,32 @@ namespace lws
   {
     std::string address;
     boost::optional<std::uint64_t> min_height;
+    boost::optional<std::uint64_t> max_count;
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
-      wire::optional_field("min_height", std::ref(min_height))
+      wire::optional_field("min_height", std::ref(min_height)),
+      wire::optional_field("max_count", std::ref(max_count))
     );
     convert_address(address, self.creds.address);
     self.min_height = min_height.value_or(0);
+    self.max_count = max_count.value_or(0);
   }
 
   void rpc::read_bytes(wire::json_reader& source, get_address_info_request& self)
   {
     std::string address;
     boost::optional<std::uint64_t> min_height;
+    boost::optional<std::uint64_t> max_count;
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
-      wire::optional_field("min_height", std::ref(min_height))
+      wire::optional_field("min_height", std::ref(min_height)),
+      wire::optional_field("max_count", std::ref(max_count))
     );
     convert_address(address, self.creds.address);
     self.min_height = min_height.value_or(0);
+    self.max_count = max_count.value_or(0);
   }
 
   namespace rpc
@@ -241,6 +247,7 @@ namespace lws
       WIRE_FIELD_COPY(start_height),
       WIRE_FIELD_COPY(transaction_height),
       WIRE_FIELD_COPY(blockchain_height),
+      WIRE_FIELD_COPY(next_min_height),
       WIRE_FIELD(spent_outputs)
       // WIRE_OPTIONAL_FIELD(rates)
     );
@@ -292,6 +299,7 @@ namespace lws
       WIRE_FIELD_COPY(start_height),
       WIRE_FIELD_COPY(transaction_height),
       WIRE_FIELD_COPY(blockchain_height),
+      WIRE_FIELD_COPY(next_min_height),
       wire::field("transactions", wire::as_array(boost::adaptors::index(self.transactions)))
     );
   }
@@ -309,6 +317,7 @@ namespace lws
   {
     std::string address;
     boost::optional<std::uint64_t> min_height;
+    boost::optional<std::uint64_t> max_count;
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
@@ -316,10 +325,12 @@ namespace lws
       WIRE_OPTIONAL_FIELD(mixin),
       WIRE_OPTIONAL_FIELD(use_dust),
       WIRE_OPTIONAL_FIELD(dust_threshold),
-      wire::optional_field("min_height", std::ref(min_height))
+      wire::optional_field("min_height", std::ref(min_height)),
+      wire::optional_field("max_count", std::ref(max_count))
     );
     convert_address(address, self.creds.address);
     self.min_height = min_height.value_or(0);
+    self.max_count = max_count.value_or(0);
   }
   void rpc::write_bytes(wire::json_writer& dest, const get_unspent_outs_response& self)
   {
@@ -338,6 +349,7 @@ namespace lws
       WIRE_FIELD_COPY(fork_version),
       // WIRE_FIELD_COPY(fee_mask),
       WIRE_FIELD_COPY(amount),
+      WIRE_FIELD_COPY(next_min_height),
       wire::field("outputs", wire::as_array(std::cref(self.outputs), expand))
     );
   }
