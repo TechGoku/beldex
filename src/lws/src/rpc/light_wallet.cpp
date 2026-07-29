@@ -215,6 +215,13 @@ namespace lws
   void rpc::write_bytes(wire::json_writer& dest, const transaction_spend& self)
   {
     wire::object(dest,
+      // The block this candidate spend was seen in. Without it a client that
+      // fetches spent_outputs incrementally (min_height) has no way to tell
+      // which window an entry belongs to - so it can neither de-duplicate the
+      // reorg-margin overlap between two fetches, nor confirm that the server
+      // honoured its cursor at all rather than silently ignoring the parameter
+      // (older builds skip unknown request fields). Cheap: already in `link`.
+      wire::field("height", std::uint64_t(self.possible_spend.link.height)),
       wire::field("amount", safe_uint64(self.meta.amount)),
       wire::field("key_image", std::cref(self.possible_spend.image)),
       wire::field("tx_pub_key", std::cref(self.meta.tx_public)),
