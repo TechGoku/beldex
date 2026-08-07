@@ -732,6 +732,21 @@ namespace db
     return blocks.get_value<block_info>(value);
   }
 
+  expect<crypto::hash> storage_reader::get_block_hash(const block_id height) noexcept
+  {
+    /* Declared in the header since the original import but never defined - the
+       only call sites were commented out, so nothing linked against it. Defined
+       here because the REST layer uses it to pin a cached account projection to a
+       specific chain branch (see account_index in rest_server.cpp).
+
+       A height that is not stored comes back as lmdb::error(MDB_NOTFOUND) rather
+       than throwing, which callers rely on to fall back cleanly. */
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+    MONERO_CHECK(check_cursor(*txn, db->tables.blocks, curs.blocks_cur));
+    return do_get_block_hash(*curs.blocks_cur, height);
+  }
+
   expect<int> storage_reader::get_chain_sync()
   {
     MONERO_PRECOND(txn != nullptr);

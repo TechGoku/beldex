@@ -220,14 +220,20 @@ namespace lws
   
   void rpc::write_bytes(wire::json_writer& dest, const transaction_spend& self)
   {
+    // The block this candidate spend was seen in. A client that fetches
+    // spent_outputs incrementally (min_height) needs it to tell which window an
+    // entry belongs to - so it can de-duplicate the reorg-margin overlap between
+    // two fetches, and confirm the server honoured its cursor at all rather than
+    // silently ignoring the parameter (older builds skip unknown request fields).
+    //
+    // Emitted only for such a client. A legacy caller sends neither min_height nor
+    // max_count, cannot use the field, and would just pay for it: ~18 bytes on
+    // every entry, which is megabytes of dead weight on an account with a large
+    // candidate-spend list. `with_height` is set at construction in rest_server.
+    const std::uint64_t height = std::uint64_t(self.possible_spend.link.height);
+    const std::uint64_t* const height_field = self.with_height ? std::addressof(height) : nullptr;
     wire::object(dest,
-      // The block this candidate spend was seen in. Without it a client that
-      // fetches spent_outputs incrementally (min_height) has no way to tell
-      // which window an entry belongs to - so it can neither de-duplicate the
-      // reorg-margin overlap between two fetches, nor confirm that the server
-      // honoured its cursor at all rather than silently ignoring the parameter
-      // (older builds skip unknown request fields). Cheap: already in `link`.
-      wire::field("height", std::uint64_t(self.possible_spend.link.height)),
+      wire::optional_field("height", height_field),
       wire::field("amount", safe_uint64(self.meta.amount)),
       wire::field("key_image", std::cref(self.possible_spend.image)),
       wire::field("tx_pub_key", std::cref(self.meta.tx_public)),

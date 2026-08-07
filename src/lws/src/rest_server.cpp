@@ -6,11 +6,13 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 #include <cpr/cpr.h>
 #include <zlib.h>
 
@@ -60,10 +62,16 @@ namespace lws
       return false;
     }
 
-    //! gzip-compress `in`; \return empty on failure so the caller keeps `in`.
-    std::string gzip_compress(const std::string& in)
+    /*! gzip-compress `size` bytes at `in`; \return empty on failure so the caller
+        keeps the plain body.
+
+        Takes a raw span rather than a `std::string` so the serialized response can
+        be compressed straight out of its `byte_slice`, without first being copied
+        into the response body. For a large account that copy was a full extra
+        allocation of the uncompressed payload. */
+    std::string gzip_compress(const void* in, std::size_t size)
     {
-      if (in.size() > 0x7fffffffULL) // keep well within zlib's 32-bit avail_* fields
+      if (size > 0x7fffffffULL) // keep well within zlib's 32-bit avail_* fields
         return {};
       z_stream zs{};
       // windowBits 15|16 selects the gzip (RFC 1952) wrapper. Level 1 (fastest):
@@ -72,9 +80,9 @@ namespace lws
       if (deflateInit2(&zs, 1, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
         return {};
       std::string out;
-      out.resize(deflateBound(&zs, static_cast<uLong>(in.size())));
-      zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
-      zs.avail_in = static_cast<uInt>(in.size());
+      out.resize(deflateBound(&zs, static_cast<uLong>(size)));
+      zs.next_in = reinterpret_cast<Bytef*>(const_cast<void*>(in));
+      zs.avail_in = static_cast<uInt>(size);
       zs.next_out = reinterpret_cast<Bytef*>(&out[0]);
       zs.avail_out = static_cast<uInt>(out.size());
       const int rc = deflate(&zs, Z_FINISH);
@@ -419,6 +427,203 @@ namespace lws
       return min_height ? incremental_reserve : stream.count();
     }
 
+    /*! One output's contribution to the `locked_funds` scalar.
+
+        Kept separately from `spend_meta_` because that struct is ordered by output
+        id for `find_metadata`, whereas this is only ever summed. */
+    struct locked_entry
+    {
+      std::uint64_t amount;
+      std::uint64_t unlock_time;
+      crypto::key_image image;
+    };
+
+    /*! Cached projection of one account's output table.
+
+        `get_address_info` has to resolve every returned spend against the output it
+        consumed (`metas`), and has to report a cumulative `total_received` - which
+        together forced a full walk of the account's outputs on EVERY request, even
+        an incremental one, and even though nothing below the client's cursor could
+        have changed. On a large account that walk dominates the request, and the
+        endpoint is polled continuously for the wallet balance.
+
+        Outputs are append-only, so the walk is cached here and extended with only
+        the new records once the scanner advances. Holds ~112 bytes/output rather
+        than the 264-byte `db::output`.
+
+        `locked_funds` is deliberately NOT cached: it depends on live master-node
+        state (10s TTL) and, for timestamp-based unlock times, on wall-clock time.
+        It is recomputed per request from `locked`, which is a RAM scan with no LMDB
+        I/O. */
+    struct account_index
+    {
+      db::block_id scan_height;                    //!< every output in a block <= this is present
+      crypto::hash scan_hash;                      //!< "our" block hash at `scan_height`
+      std::uint64_t total_received;
+      std::vector<db::output::spend_meta_> metas;  //!< sorted by id, for find_metadata
+      std::vector<locked_entry> locked;            //!< output-walk order
+    };
+
+    std::size_t index_bytes(const account_index& self) noexcept
+    {
+      return sizeof(account_index)
+        + self.metas.capacity() * sizeof(db::output::spend_meta_)
+        + self.locked.capacity() * sizeof(locked_entry);
+    }
+
+    /*! \return Cached output projection for `user`, extended or rebuilt as needed.
+
+        Entries are immutable once published, so a caller can hold the returned
+        pointer without keeping the cache locked. An advance in `scan_height` builds
+        a fresh entry (copy-on-extend) rather than mutating the shared one. */
+    expect<std::shared_ptr<const account_index>>
+    get_account_index(db::storage_reader& reader, const db::account& user)
+    {
+      struct index_slot
+      {
+        std::shared_ptr<const account_index> value;
+        std::chrono::steady_clock::time_point last_access;
+      };
+
+      static std::mutex index_mutex;
+      static std::unordered_map<std::uint32_t, index_slot> cache;
+      static std::size_t cache_bytes = 0;
+      // Bound total cached bytes so many distinct large accounts cannot grow memory
+      // without limit (a single projection larger than this is never cached).
+      constexpr const std::size_t cache_max_bytes = 256 * 1024 * 1024;
+
+      const std::uint32_t key = std::uint32_t(user.id);
+      const auto now = std::chrono::steady_clock::now();
+
+      /* Scan height alone is not a safe identity for the account's output set. A
+         reorg rolls the account back and re-scans forward, and if it lands on the
+         same height again with no request in between, the height would look like an
+         exact hit while the cached records came from the abandoned branch. The
+         block hash at `scan_height` pins the branch too. One point lookup, against
+         the full output walk it protects.
+
+         If the hash is unavailable (e.g. a brand-new account whose scan height has
+         no stored block) the cache is bypassed for this request rather than risked;
+         the endpoint still answers, just without the memoization. */
+      const expect<crypto::hash> scan_hash = reader.get_block_hash(user.scan_height);
+      const bool cacheable = bool(scan_hash);
+
+      std::shared_ptr<const account_index> base{};
+      if (cacheable)
+      {
+        const std::lock_guard<std::mutex> lock{index_mutex};
+        const auto it = cache.find(key);
+        if (it != cache.end())
+        {
+          it->second.last_access = now;
+          if (it->second.value->scan_height == user.scan_height &&
+              it->second.value->scan_hash == *scan_hash)
+            return it->second.value; // exact hit - no DB reads at all
+          if (user.scan_height <= it->second.value->scan_height)
+          {
+            // Scan height moved backwards, or stayed put on a different branch:
+            // records cached above the fork may be gone. Rebuild from scratch.
+            cache_bytes -= index_bytes(*it->second.value);
+            cache.erase(it);
+          }
+          else
+            base = it->second.value; // extend with the delta below
+        }
+      }
+
+      /* Extending assumes the records at or below the cached height are still the
+         ones on the current chain. A reorg could have rewritten history below the
+         cached height and re-scanned past it, so re-check that entry's branch
+         before building on it. Only runs when the scanner has advanced, not on
+         every request. */
+      if (base)
+      {
+        const expect<crypto::hash> base_hash = reader.get_block_hash(base->scan_height);
+        if (!base_hash || !(*base_hash == base->scan_hash))
+          base.reset(); // history below the cursor changed - rebuild from scratch
+      }
+
+      auto fresh = std::make_shared<account_index>();
+      fresh->scan_height = user.scan_height;
+      fresh->scan_hash = cacheable ? *scan_hash : crypto::hash{};
+      fresh->total_received = 0;
+      if (base)
+      {
+        fresh->metas = base->metas;
+        fresh->locked = base->locked;
+        fresh->total_received = base->total_received;
+      }
+
+      /* Seek past what is already held. `base->scan_height` is the last block whose
+         outputs are all present - the scanner commits outputs and the account's
+         scan height in one transaction - so resume at the block after it. */
+      auto outputs = base ?
+        reader.get_outputs(user.id, db::block_id(std::uint64_t(base->scan_height) + 1)) :
+        reader.get_outputs(user.id);
+      if (!outputs)
+        return outputs.error();
+
+      if (!base) // count() is only meaningful on a stream that was not seeked
+      {
+        fresh->metas.reserve(outputs->count());
+        fresh->locked.reserve(outputs->count());
+      }
+
+      for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
+      {
+        const db::output::spend_meta_ meta =
+          output.get_value<MONERO_FIELD(db::output, spend_meta)>();
+
+        // these outputs will usually be in correct order post ringct
+        if (fresh->metas.empty() || fresh->metas.back().id < meta.id)
+          fresh->metas.push_back(meta);
+        else
+          fresh->metas.insert(find_metadata(fresh->metas, meta.id), meta);
+
+        fresh->total_received += meta.amount;
+        fresh->locked.push_back(
+          locked_entry{
+            meta.amount,
+            output.get_value<MONERO_FIELD(db::output, unlock_time)>(),
+            output.get_value<MONERO_FIELD(db::output, locked_key_image)>()
+          }
+        );
+      }
+
+      std::shared_ptr<const account_index> result = fresh;
+      if (cacheable)
+      {
+        const std::lock_guard<std::mutex> lock{index_mutex};
+        const auto it = cache.find(key);
+        if (it != cache.end())
+        {
+          cache_bytes -= index_bytes(*it->second.value);
+          cache.erase(it);
+        }
+        const std::size_t sz = index_bytes(*result);
+        // Evict least-recently-used until the new entry fits, rather than clearing
+        // everything: a rebuild costs a full output walk, so dropping every account
+        // on one overshoot would stampede.
+        while (!cache.empty() && cache_max_bytes < cache_bytes + sz)
+        {
+          auto oldest = cache.begin();
+          for (auto i = cache.begin(); i != cache.end(); ++i)
+          {
+            if (i->second.last_access < oldest->second.last_access)
+              oldest = i;
+          }
+          cache_bytes -= index_bytes(*oldest->second.value);
+          cache.erase(oldest);
+        }
+        if (sz <= cache_max_bytes)
+        {
+          cache.emplace(key, index_slot{result, now});
+          cache_bytes += sz;
+        }
+      }
+      return result;
+    }
+
     //! \return Account info from the DB, iff key matches address AND address is NOT hidden.
     expect<std::pair<db::account, db::storage_reader>> open_account(const rpc::account_credentials& creds, db::storage disk)
     {
@@ -546,16 +751,22 @@ namespace lws
 
         response resp{};
 
-        // Outputs are walked in full even for an incremental request, deliberately:
-        // a spend returned below is resolved against `metas` by output id, and a
-        // spend in a new block can consume an output received years earlier, so a
-        // seeked (partial) `metas` would trip the "no receive for spend" throw.
-        // Walking them also keeps total_received and locked_funds cumulative for
-        // free. Making this leg O(delta) too would need an output-id index, which
-        // is a schema change; not worth it unless it shows up in profiling.
-        auto outputs = user->second.get_outputs(user->first.id);
-        if (!outputs)
-          return outputs.error();
+        // Only an incremental/paginated caller can use the per-spend `height`
+        // field; a legacy caller would just pay for the bytes. See write_bytes for
+        // transaction_spend.
+        const bool incremental = (req.min_height != 0 || req.max_count != 0);
+
+        /* The output side is served from the cached projection (see account_index)
+           rather than re-walked here. It is needed in full regardless of the
+           client's cursor - a spend returned below is resolved against `metas` by
+           output id, and a spend in a new block can consume an output received
+           years earlier, so a seeked (partial) `metas` would trip the "no receive
+           for spend" throw - but it is also identical between requests until the
+           scanner advances, which is what makes it cacheable. */
+        auto index = get_account_index(user->second, user->first);
+        if (!index)
+          return index.error();
+        const account_index& outputs = **index;
 
         // Incremental fetch: when the client sends a min_height cursor, seek the
         // spends cursor to it so only the new candidate spends are read. This is
@@ -584,53 +795,45 @@ namespace lws
         resp.scanned_block_height = resp.scanned_height;
         resp.start_height = std::uint64_t(user->first.start_height);
 
-        std::vector<db::output::spend_meta_> metas{};
-        metas.reserve(outputs->count());
+        const std::vector<db::output::spend_meta_>& metas = outputs.metas;
 
-        for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
+        resp.total_received = rpc::safe_uint64(outputs.total_received);
+
+        /* locked_funds is recomputed on every request rather than cached with the
+           projection: the master-node blacklist and locked contributions come from
+           the daemon on a 10s TTL, and a timestamp-based unlock_time is measured
+           against wall-clock time, so neither is a pure function of the account's
+           scanned state. This loop touches only RAM - no LMDB reads. */
+        for (const locked_entry& out : outputs.locked)
         {
-          const db::output::spend_meta_ meta =
-              output.get_value<MONERO_FIELD(db::output, spend_meta)>(); // For each output, it extracts metadata which includes the amount of that output (meta.amount).
-
-          // these outputs will usually be in correct order post ringct
-          if (metas.empty() || metas.back().id < meta.id)
-            metas.push_back(meta);
-          else
-            metas.insert(find_metadata(metas, meta.id), meta);
-
-          resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + meta.amount);
-
-          const crypto::key_image locked_key_image =
-              output.get_value<MONERO_FIELD(db::output, locked_key_image)>();
-
           // Skip non-locked outputs up front (the common case), and use O(1)
           // set membership instead of a linear scan of `processed` per output
           // (the latter was O(n^2) for accounts with many locked outputs).
-          if (locked_key_image != crypto::key_image{} && !processed.count(locked_key_image))
+          if (out.image != crypto::key_image{} && !processed.count(out.image))
           {
             // O(1) lookup against the maps built once per master-node cache
             // refresh (10s TTL), instead of walking every masternode /
             // contributor / contribution for this output.
-            const auto blacklisted = master_node_data->blacklist_by_image.find(locked_key_image);
+            const auto blacklisted = master_node_data->blacklist_by_image.find(out.image);
             if (blacklisted != master_node_data->blacklist_by_image.end())
             {
               resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + blacklisted->second);
-              processed.insert(locked_key_image);
+              processed.insert(out.image);
             }
             else
             {
-              const auto locked = master_node_data->locked_by_image.find(locked_key_image);
+              const auto locked = master_node_data->locked_by_image.find(out.image);
               if (locked != master_node_data->locked_by_image.end())
               {
                 resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + locked->second);
-                processed.insert(locked_key_image);
+                processed.insert(out.image);
               }
             }
           }
 
-          if (is_locked(output.get_value<MONERO_FIELD(db::output, unlock_time)>(), user->first.scan_height))
+          if (is_locked(out.unlock_time, user->first.scan_height))
           {
-            resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + meta.amount);
+            resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + out.amount);
           }
         }
 
@@ -659,7 +862,7 @@ namespace lws
             };
           }
 
-          resp.spent_outputs.push_back({*meta, spend});
+          resp.spent_outputs.push_back({*meta, spend, incremental});
           resp.total_sent = rpc::safe_uint64(std::uint64_t(resp.total_sent) + meta->amount);
           ++returned;
           last_returned_height = spend_height;
@@ -835,6 +1038,11 @@ namespace lws
         if (!user)
           return user.error();
 
+        // Only an incremental/paginated caller can use the per-spend `height`
+        // field; a legacy caller would just pay for the bytes. See write_bytes
+        // for transaction_spend.
+        const bool incremental = (req.min_height != 0 || req.max_count != 0);
+
         // For the cumulative `locked_funds` scalar - the same master-node /
         // unlock-time locked amount get_address_info reports, computed here so a
         // client that only makes the cheap incremental get_address_txs call still
@@ -972,7 +1180,7 @@ namespace lws
             if (resp.transactions.empty() || resp.transactions.back().info.link.tx_hash != next_spend.tx_hash)
             {
               resp.transactions.push_back({});
-              resp.transactions.back().spends.push_back({*meta, *spend});
+              resp.transactions.back().spends.push_back({*meta, *spend, incremental});
               resp.transactions.back().info.link.height = resp.transactions.back().spends.back().possible_spend.link.height;
               resp.transactions.back().info.link.tx_hash = resp.transactions.back().spends.back().possible_spend.link.tx_hash;
               resp.transactions.back().info.spend_meta.mixin_count =
@@ -981,7 +1189,7 @@ namespace lws
               resp.transactions.back().info.unlock_time = resp.transactions.back().spends.back().possible_spend.unlock_time;
             }
             else
-              resp.transactions.back().spends.push_back({*meta, *spend});
+              resp.transactions.back().spends.push_back({*meta, *spend, incremental});
 
             resp.transactions.back().spent += meta->amount;
 
@@ -1697,22 +1905,30 @@ namespace lws
       response.m_response_comment = "OK";
       response.m_mime_tipe = "application/json";
       response.m_header_info.m_content_type = "application/json";
-        response.m_body.assign(reinterpret_cast<const char*>(body->data()), body->size()); // \TODO Remove copy here too!s
 
       // Compress large responses when the client advertises gzip. get_address_txs
       // for a big account is hundreds of MB of hex + repetitive JSON that gzips
       // well; this is a pure transfer win and a no-op for clients that do not
       // send Accept-Encoding: gzip.
-      if (response.m_body.size() >= 1024 && client_accepts_gzip(query))
+      //
+      // Compress before materializing the plain body: zlib reads straight from the
+      // serialized slice, so a compressible response is copied into `m_body` once
+      // (compressed) instead of twice (plain, then compressed). Only the
+      // uncompressible/non-gzip path pays the plain copy.
+      bool body_set = false;
+      if (body->size() >= 1024 && client_accepts_gzip(query))
       {
-        std::string compressed = gzip_compress(response.m_body);
-        if (!compressed.empty() && compressed.size() < response.m_body.size())
+        std::string compressed = gzip_compress(body->data(), body->size());
+        if (!compressed.empty() && compressed.size() < body->size())
         {
           response.m_body = std::move(compressed);
           response.m_additional_fields.emplace_back("Content-Encoding", "gzip");
           response.m_additional_fields.emplace_back("Vary", "Accept-Encoding");
+          body_set = true;
         }
       }
+      if (!body_set)
+        response.m_body.assign(reinterpret_cast<const char*>(body->data()), body->size());
       return true;
     }
   };

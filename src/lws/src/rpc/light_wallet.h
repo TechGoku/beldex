@@ -36,6 +36,8 @@ namespace rpc
       transaction_spend() = delete;
       lws::db::output::spend_meta_ meta;
       lws::db::spend possible_spend;
+      //! Emit the `height` field; set only for an incremental/paginated request.
+      bool with_height;
     };
     void write_bytes(wire::json_writer&, const transaction_spend&);
 
