@@ -213,6 +213,43 @@ namespace rpc
     };
     void write_bytes(wire::json_writer&, const get_unspent_outs_response&);
 
+    /*! `report_key_images` request.
+
+      The client derives key images for its own outputs - which the view-only
+      server cannot - and reports the ones it has resolved as real spends. The
+      server records them (see `db::spent_output`) so it can answer questions
+      that need true spentness, above all selecting outputs to cover a send
+      amount rather than returning the entire pool.
+
+      `global_index` identifies the output: every output stored by the scanner
+      uses `output_id{0, <global index>}`, so the low word is sufficient. */
+    //! \note Default-constructible on purpose: the array reader populates a
+    //!   `std::vector` via `emplace_back()`, so a deleted default ctor cannot be
+    //!   used here (unlike the write-only response types below).
+    struct key_image_report
+    {
+      std::uint64_t global_index;
+      crypto::key_image image;
+    };
+    void read_bytes(wire::json_reader&, key_image_report&);
+
+    struct report_key_images_request
+    {
+      account_credentials creds;
+      std::vector<key_image_report> key_images;
+    };
+    void read_bytes(wire::json_reader&, report_key_images_request&);
+
+    struct report_key_images_response
+    {
+      report_key_images_response() = delete;
+      //! Entries newly recorded; below `received` when some were already known
+      //! or could not be matched to an on-chain image for that output.
+      std::uint64_t accepted;
+      std::uint64_t received;
+    };
+    void write_bytes(wire::json_writer&, report_key_images_response);
+
     struct import_response
     {
       import_response() = delete;

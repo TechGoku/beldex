@@ -198,6 +198,24 @@ namespace db
   };
   WIRE_DECLARE_OBJECT(key_image);
 
+  /*! An `output` a client has proven spent by reporting its key image.
+
+    The server holds only the view key, so it cannot derive key images and cannot
+    tell a real spend from its own output appearing as somebody else's ring
+    member - which is why `spend`s are only ever "candidates" and `total_sent` is
+    a superset. A client that holds the spend key can resolve this, and reports
+    the result here so the server can answer questions that need real spentness
+    (selecting outputs to cover a send amount, above all).
+
+    A reported image is only accepted once the server has seen it on-chain
+    against that output, so a malformed or invented claim is rejected. */
+  struct spent_output
+  {
+    output_id source;        //!< Output that was spent; first for LMDB optimizations
+    crypto::key_image image; //!< Client-derived key image that spent `source`
+  };
+  static_assert(sizeof(spent_output) == (8 * 2) + 32, "padding in spent_output");
+
   struct request_info
   {
     account_address address;//!< Must be first for LMDB optimizations

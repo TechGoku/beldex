@@ -120,6 +120,21 @@ namespace db
       right_bytes.remove_prefix(sizeof(crypto::hash));
       return less<output_id>(left_bytes, right_bytes);
     }
+    /*! Orders `spent_output` by `source` alone, so the table holds at most one
+        record per output - an output has exactly one true key image, and a client
+        re-reporting it must not accumulate duplicates. Also lets `MDB_GET_BOTH`
+        resolve a record from the output id without knowing the image. */
+    int spent_output_compare(MDB_val const* left, MDB_val const* right) noexcept
+    {
+      if (left == nullptr || right == nullptr)
+      {
+        assert("MDB_val nullptr" == 0);
+        return -1;
+      }
+      static_assert(offsetof(spent_output, source) == 0, "source must lead spent_output");
+      return less<output_id>(lmdb::to_byte_span(*left), lmdb::to_byte_span(*right));
+    }
+
     // copied from /src/blockchain_db/lmdb/db_lmdb.cpp
     int compare_string(const MDB_val *a, const MDB_val *b)
     {
@@ -212,6 +227,9 @@ namespace db
     };
     constexpr const lmdb::basic_table<request, request_info> requests{
       "requests_by_type,address", (MDB_CREATE | MDB_DUPSORT), MONERO_COMPARE(request_info, address.spend_public)
+    };
+    constexpr const lmdb::basic_table<account_id, spent_output> spent_outs{
+      "spent_by_account_id,output_id", (MDB_CREATE | MDB_DUPSORT), &spent_output_compare
     };
     constexpr const lmdb::basic_table<char *, unsigned> properties{
       "properties", (MDB_CREATE), &compare_string
@@ -555,6 +573,7 @@ namespace db
     MDB_dbi images;
     MDB_dbi requests;
     MDB_dbi properties;  // *** ADDED ***
+    MDB_dbi spent_outs;
   } tables;
 
   const unsigned create_queue_max;
@@ -685,6 +704,9 @@ namespace db
     tables.images      = images.open(*txn).value();
     tables.requests    = requests.open(*txn).value();
     tables.properties  = properties.open(*txn).value();  // *** ADDED ***
+    // Created empty on first open with this build; nothing to migrate and no
+    // rescan, since it is filled by clients reporting rather than by the scanner.
+    tables.spent_outs  = spent_outs.open(*txn).value();
 
     unsigned current_version = 0;
     {
@@ -881,6 +903,15 @@ namespace db
     assert(db != nullptr);
     MONERO_CHECK(check_cursor(*txn, db->tables.spends, cur));
     return spends.get_value_stream_from(id, height_bound<spend>(min_height), std::move(cur));
+  }
+
+  expect<lmdb::value_stream<spent_output, cursor::close_spent_outs>>
+  storage_reader::get_spent_outs(account_id id, cursor::spent_outs cur) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+    MONERO_CHECK(check_cursor(*txn, db->tables.spent_outs, cur));
+    return spent_outs.get_value_stream(id, std::move(cur));
   }
 
   expect<lmdb::value_stream<db::key_image, cursor::close_images>>
@@ -1675,6 +1706,71 @@ namespace db
         return {lmdb::error(err)};
 
       return success();
+    });
+  }
+
+  expect<std::size_t>
+  storage::mark_spent(account_address const& address, epee::span<const spent_output> spent)
+  {
+    MONERO_PRECOND(db != nullptr);
+    if (spent.empty())
+      return std::size_t(0);
+
+    return db->try_write([this, &address, spent] (MDB_txn& txn) -> expect<std::size_t>
+    {
+      cursor::accounts_by_address accounts_ba_cur;
+      cursor::images images_cur;
+      cursor::spent_outs spent_cur;
+
+      MONERO_CHECK(check_cursor(txn, this->db->tables.accounts_ba, accounts_ba_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.images, images_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.spent_outs, spent_cur));
+
+      MDB_val key = lmdb::to_val(by_address_version);
+      MDB_val value = lmdb::to_val(address);
+
+      int err = mdb_cursor_get(accounts_ba_cur.get(), &key, &value, MDB_GET_BOTH);
+      if (err == MDB_NOTFOUND)
+        return {lws::error::account_not_found};
+      if (err)
+        return {lmdb::error(err)};
+
+      const expect<account_lookup> lookup =
+        accounts_by_address.get_value<MONERO_FIELD(account_by_address, lookup)>(value);
+      if (!lookup)
+        return lookup.error();
+
+      std::size_t accepted = 0;
+      for (const spent_output& entry : spent)
+      {
+        /* Only accept an image the chain has already shown against this output.
+           The server cannot derive key images, so it cannot check that the client
+           computed the right one - but it can check the claim corresponds to
+           something real, which stops a client bug from making live funds vanish
+           from its own balance. A claim that fails is skipped rather than failing
+           the batch, so one stale entry cannot block the rest. */
+        db::key_image probe{entry.image, {}};
+        MDB_val image_key = lmdb::to_val(entry.source);
+        MDB_val image_value = lmdb::to_val(probe);
+
+        err = mdb_cursor_get(images_cur.get(), &image_key, &image_value, MDB_GET_BOTH);
+        if (err == MDB_NOTFOUND)
+          continue;
+        if (err)
+          return {lmdb::error(err)};
+
+        MDB_val spent_key = lmdb::to_val(lookup->id);
+        MDB_val spent_value = lmdb::to_val(entry);
+
+        err = mdb_cursor_put(spent_cur.get(), &spent_key, &spent_value, MDB_NODUPDATA);
+        if (err == MDB_KEYEXIST)
+          continue; // already recorded; re-reporting is a no-op
+        if (err)
+          return {lmdb::error(err)};
+
+        ++accepted;
+      }
+      return accepted;
     });
   }
 

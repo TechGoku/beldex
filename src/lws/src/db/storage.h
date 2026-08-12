@@ -36,6 +36,7 @@ namespace db
     MONERO_CURSOR(spends);
     MONERO_CURSOR(images);
     MONERO_CURSOR(requests);
+    MONERO_CURSOR(spent_outs);
 
     MONERO_CURSOR(blocks);
     MONERO_CURSOR(accounts_by_address);
@@ -130,6 +131,14 @@ namespace db
     expect<lmdb::value_stream<db::key_image, cursor::close_images>>
       get_images(output_id id, cursor::images cur = nullptr) noexcept;
 
+    /*! Outputs `id` has reported spent (see `db::spent_output`). Ordered by
+        `source`, so a caller resolving many outputs can merge against the
+        `outputs` walk instead of doing a lookup per record.
+
+        \return Outputs known to be spent by `id`, or an empty stream. */
+    expect<lmdb::value_stream<spent_output, cursor::close_spent_outs>>
+      get_spent_outs(account_id id, cursor::spent_outs cur = nullptr) noexcept;
+
     //! \return All `request_info`s.
     expect<lmdb::key_stream<request, request_info, cursor::close_requests>>
       get_requests(cursor::requests cur = nullptr) noexcept;
@@ -214,6 +223,21 @@ namespace db
 
     //! Add an account, for immediate inclusion in the active list.
     expect<void> add_account(account_address const& address, crypto::secret_key const& key, account_flags flags =  static_cast<account_flags>(0)) noexcept;
+
+    /*!
+      Record outputs of `address` as spent, as proven by the client-supplied key
+      images in `spent` (see `db::spent_output`).
+
+      Each entry is verified before it is stored: the named output must belong to
+      `address`, and the key image must already be recorded on-chain against that
+      output. An entry failing either check is skipped rather than failing the
+      batch, so one stale record from a client cannot block the rest. Re-reporting
+      an output already marked spent is a no-op.
+
+      \return Number of entries newly recorded.
+    */
+    expect<std::size_t>
+      mark_spent(account_address const& address, epee::span<const spent_output> spent);
 
     //! Reset `addresses` to `height` for scanning.
     expect<std::vector<account_address>>

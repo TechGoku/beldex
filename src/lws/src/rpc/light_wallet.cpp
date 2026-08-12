@@ -360,6 +360,30 @@ namespace lws
     );
   }
 
+  void rpc::read_bytes(wire::json_reader& source, key_image_report& self)
+  {
+    wire::object(source,
+      wire::field("global_index", std::ref(self.global_index)),
+      wire::field("key_image", std::ref(self.image))
+    );
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, report_key_images_request& self)
+  {
+    std::string address;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      wire::field("key_images", std::ref(self.key_images))
+    );
+    convert_address(address, self.creds.address);
+  }
+
+  void rpc::write_bytes(wire::json_writer& dest, const report_key_images_response self)
+  {
+    wire::object(dest, WIRE_FIELD_COPY(accepted), WIRE_FIELD_COPY(received));
+  }
+
   void rpc::write_bytes(wire::json_writer& dest, const import_response& self)
   {
     wire::object(dest,

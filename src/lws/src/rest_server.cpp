@@ -902,6 +902,40 @@ namespace lws
         if (!req.mixin)
           req.mixin = 0;
 
+        /* Parsed up-front rather than just before the response is built: the
+           amount-aware stop condition below needs the fee schedule to size its
+           headroom, and a malformed fee response should fail the request before
+           any of the walking work is done. */
+        std::uint64_t fee_per_byte, fee_per_output, flash_fee_per_byte,
+                      flash_fee_per_output, flash_fee_fixed, quantization_mask;
+        try
+        {
+          // resp is the get_fee_estimate envelope (post_json_rpc /
+          // get_fee_estimate_cache). deep_unwrap peels any single-element array
+          // wrapping at the envelope and/or result level; guarded so an
+          // unexpected daemon response becomes bad_daemon_response, not a throw.
+          const json& env = deep_unwrap(resp);
+          if (env.value("status", std::string{}) == "Failed")
+            return {lws::error::bad_daemon_response};
+
+          const json& result = deep_unwrap(env.at("result"));
+          if (result.value("status", std::string{"OK"}) == "Failed")
+            return {lws::error::bad_daemon_response};
+
+          fee_per_byte         = result.at("fee_per_byte").get<std::uint64_t>();
+          fee_per_output       = result.at("fee_per_output").get<std::uint64_t>();
+          flash_fee_per_byte   = result.at("flash_fee_per_byte").get<std::uint64_t>();
+          flash_fee_per_output = result.at("flash_fee_per_output").get<std::uint64_t>();
+          flash_fee_fixed      = result.at("flash_fee_fixed").get<std::uint64_t>();
+          quantization_mask    = result.at("quantization_mask").get<std::uint64_t>();
+        }
+        catch (const std::exception& e)
+        {
+          MERROR("get_unspent_outs: unexpected get_fee_estimate response: " << e.what()
+                 << " -- body: " << resp.dump().substr(0, 400));
+          return {lws::error::bad_daemon_response};
+        }
+
         // Incremental unspent pool: when the client sends a min_height cursor, walk
         // only the outputs received at/after it. The client persists the outputs
         // (and their key images) it has already fetched and applies its own
@@ -919,6 +953,57 @@ namespace lws
         if (!outputs)
           return outputs.error();
 
+        /* Outputs the client has proven spent (see /report_key_images). Loaded
+           once per request into a set, since the walk below tests every output
+           against it. Absent for an account that has never reported, which just
+           leaves the walk behaving as it always did. */
+        std::unordered_set<std::uint64_t> reported_spent{};
+        {
+          auto known_spent = user->second.get_spent_outs(user->first.id);
+          if (known_spent)
+          {
+            for (db::spent_output const& entry : known_spent->make_range())
+              reported_spent.insert(entry.source.low);
+          }
+          else if (known_spent != lmdb::error(MDB_NOTFOUND))
+            return known_spent.error();
+        }
+
+        /* Amount-aware selection. When the client names a non-zero `amount`, stop
+           once enough is held to cover it - the point of the whole exercise, since
+           returning the entire receive history is what makes a large account
+           unusable on the send path.
+
+           `amount` 0 keeps its old meaning of "everything", which is what every
+           existing client sends and what a sweep needs, so this is inert until a
+           client opts in.
+
+           Deliberately over-supplied. The fee is computed in the client - the WASM
+           sizes it from the inputs it actually picks - so the server does not try
+           to be exact; it only has to hand over comfortably more than the client
+           can need. The asymmetry is the whole argument: excess simply comes back
+           as change, whereas a client handed too little fails outright with
+           needMoreMoneyThanFound. It also drops dust, and drops anything it finds
+           spent but has not reported yet, so some of what is sent will not survive
+           its filters.
+
+           Both steps saturate, so a large `amount` cannot wrap the target to a
+           small one and cut the walk short. */
+        constexpr const std::uint64_t overprovision_factor = 2;
+        constexpr const std::uint64_t min_selected_outputs = 50;
+
+        const std::uint64_t requested = std::uint64_t(req.amount);
+        std::uint64_t target = 0;
+        if (requested != 0)
+        {
+          const std::uint64_t fee_ceiling =
+            (fee_per_byte * 100000u) + (fee_per_output * 32u) + flash_fee_fixed;
+          const std::uint64_t needed =
+            (UINT64_MAX - fee_ceiling < requested) ? UINT64_MAX : (requested + fee_ceiling);
+          target = (UINT64_MAX / overprovision_factor < needed) ?
+            UINT64_MAX : (needed * overprovision_factor);
+        }
+
         std::uint64_t received = 0;
         std::vector<std::pair<db::output, std::vector<crypto::key_image>>> unspent;
 
@@ -934,11 +1019,33 @@ namespace lws
         for (db::output const& out : outputs->make_range())
         {
           const std::uint64_t out_height = std::uint64_t(out.link.height);
-          if (req.max_count != 0 && returned >= req.max_count && out_height != last_returned_height)
+          /* Stop at a page cap, or once the named amount is comfortably covered.
+             Either way only on a block boundary, so a block is never split across
+             responses and the resume cursor stays a clean inclusive seek.
+
+             The value target is paired with a floor on the number of outputs, so a
+             single large output cannot end the walk on its own: the client may
+             discard some of what it is sent, and one output that covers the amount
+             is no use once discarded.
+
+             If the account simply does not hold enough, neither condition ever
+             fires, the walk runs to the end of the stream, and everything found is
+             returned with next_min_height 0. Sending the whole pool is the right
+             answer there - the client is the one that can judge coverage, and it
+             needs every candidate to do it. */
+          if (out_height != last_returned_height &&
+              ((req.max_count != 0 && returned >= req.max_count) ||
+               (target != 0 && received >= target && returned >= min_selected_outputs)))
           {
             next_min_height = out_height; // resume here next page (inclusive seek)
             break;
           }
+
+          /* Proven spent by the client, so it is not spendable and would only pad
+             the response. The server cannot determine this itself - it has no
+             spend key - which is why this set is reported rather than derived. */
+          if (!reported_spent.empty() && reported_spent.count(out.spend_meta.id.low))
+            continue;
 
           const std::pair<db::extra, std::uint8_t> unpacked = db::unpack(out.extra);
           const bool coinbase = (unpacked.first & lws::db::coinbase_output);
@@ -987,44 +1094,14 @@ namespace lws
 
         }
 
-        // Only enforce the "enough funds" guard on a full-pool request. For an
-        // incremental (min_height) or paged (max_count) request `received` covers
-        // just that slice, so comparing it against the whole send amount would
-        // reject an account that does hold the funds; the client aggregates
-        // coverage across the pool it assembles itself.
-        if (req.min_height == 0 && req.max_count == 0 && received < std::uint64_t(req.amount))
-          return {lws::error::account_not_found};
-
-        std::uint64_t fee_per_byte, fee_per_output, flash_fee_per_byte,
-                      flash_fee_per_output, flash_fee_fixed, quantization_mask;
-        try
-        {
-          // resp is the get_fee_estimate envelope (post_json_rpc /
-          // get_fee_estimate_cache). deep_unwrap peels any single-element array
-          // wrapping at the envelope and/or result level; guarded so an
-          // unexpected daemon response becomes bad_daemon_response, not a throw.
-          const json& env = deep_unwrap(resp);
-          if (env.value("status", std::string{}) == "Failed")
-            return {lws::error::bad_daemon_response};
-
-          const json& result = deep_unwrap(env.at("result"));
-          if (result.value("status", std::string{"OK"}) == "Failed")
-            return {lws::error::bad_daemon_response};
-
-          fee_per_byte         = result.at("fee_per_byte").get<std::uint64_t>();
-          fee_per_output       = result.at("fee_per_output").get<std::uint64_t>();
-          flash_fee_per_byte   = result.at("flash_fee_per_byte").get<std::uint64_t>();
-          flash_fee_per_output = result.at("flash_fee_per_output").get<std::uint64_t>();
-          flash_fee_fixed      = result.at("flash_fee_fixed").get<std::uint64_t>();
-          quantization_mask    = result.at("quantization_mask").get<std::uint64_t>();
-        }
-        catch (const std::exception& e)
-        {
-          MERROR("get_unspent_outs: unexpected get_fee_estimate response: " << e.what()
-                 << " -- body: " << resp.dump().substr(0, 400));
-          return {lws::error::bad_daemon_response};
-        }
-
+        /* No "enough funds" rejection. The old guard compared `received` against
+           the requested amount and returned 403, which was already wrong for a
+           sliced response (min_height / max_count see one window, not the pool).
+           It is wrong for an amount-aware response too: falling short of the target
+           means the account holds less than asked, and the useful answer is every
+           candidate output it does hold, so the client can apply its own filters
+           and report the shortfall itself. It owns the fee arithmetic and the
+           spent-filtering, so it is the only side that can judge coverage. */
         return response{fee_per_byte, fee_per_output,flash_fee_per_byte,flash_fee_per_output,flash_fee_fixed,quantization_mask,17,rpc::safe_uint64(received), std::move(unspent), std::move(req.creds.key), next_min_height};
       }
     };//get_unspent_outs
@@ -1494,6 +1571,45 @@ namespace lws
       }
     };
 
+    /*! Record which outputs the client has resolved as really spent.
+
+        The server holds only the view key, so it cannot derive key images and
+        cannot tell a real spend from one of its own outputs being used as another
+        wallet's ring member. The client can, and reports the result here. With
+        that, get_unspent_outs can select outputs to cover a named amount instead
+        of returning the account's whole receive history. */
+    struct report_key_images
+    {
+      using request = rpc::report_key_images_request;
+      using response = rpc::report_key_images_response;
+
+      static expect<response> handle(request req, db::storage disk)
+      {
+        { // authenticate and confirm the account is visible before writing
+          auto user = open_account(req.creds, disk.clone());
+          if (!user)
+            return user.error();
+          user->second.finish_read();
+        }
+
+        std::vector<db::spent_output> spent{};
+        spent.reserve(req.key_images.size());
+        for (const rpc::key_image_report& entry : req.key_images)
+        {
+          // The scanner stores every output as output_id{0, <global index>}, so
+          // the low word alone identifies it.
+          spent.push_back(db::spent_output{db::output_id{0, entry.global_index}, entry.image});
+        }
+
+        const expect<std::size_t> accepted =
+          disk.mark_spent(req.creds.address, epee::to_span(spent));
+        if (!accepted)
+          return accepted.error();
+
+        return response{std::uint64_t(*accepted), std::uint64_t(req.key_images.size())};
+      }
+    };
+
     struct login
     {
       using request = rpc::login_request;
@@ -1760,6 +1876,9 @@ namespace lws
       {"/get_unspent_outs",      call<get_unspent_outs>, 2 * 1024},
       {"/import_request",        call<import_request>,   2 * 1024},
       {"/login",                 call<login>,            2 * 1024},
+      // Batches of {global_index, key_image}; ~100 bytes each in JSON, so this
+      // admits a few thousand per call and the client chunks a long backlog.
+      {"/report_key_images",     call<report_key_images>, 512 * 1024},
       {"/submit_raw_tx",         call<submit_raw_tx>,   50 * 1024}
     };
     constexpr const endpoint admin_endpoints[] =
