@@ -988,9 +988,11 @@ namespace lws
         }
 
         // Only enforce the "enough funds" guard on a full-pool request. For an
-        // incremental (min_height) request `received` is just the delta, and the
-        // client aggregates coverage across its persisted pool itself.
-        if (req.min_height == 0 && received < std::uint64_t(req.amount))
+        // incremental (min_height) or paged (max_count) request `received` covers
+        // just that slice, so comparing it against the whole send amount would
+        // reject an account that does hold the funds; the client aggregates
+        // coverage across the pool it assembles itself.
+        if (req.min_height == 0 && req.max_count == 0 && received < std::uint64_t(req.amount))
           return {lws::error::account_not_found};
 
         std::uint64_t fee_per_byte, fee_per_output, flash_fee_per_byte,
