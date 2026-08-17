@@ -183,6 +183,29 @@ namespace rct {
         END_SERIALIZE()
     };
 
+    // 3-layer CLSAG over (G, G, X) for spending a tx_out_zarcanum (HF21+ private tokens).
+    // Layer 0 (G): stealth address ownership.
+    // Layer 1 (G): amount-commitment difference vs. the pseudo-output is a commitment to 0.
+    // Layer 2 (X): blinded-token-id difference vs. the pseudo-output is a commitment to 0.
+    struct clsag_ggx {
+        keyV s_g; // responses for layers 0/1 (G), size = ring size
+        keyV s_x; // responses for layer 2 (X), size = ring size
+        key c1;
+
+        key I; // signing key image (layer 0)
+        key D; // auxiliary key image, amount-commitment layer (layer 1)
+        key E; // auxiliary key image, token-id layer (layer 2)
+
+        BEGIN_SERIALIZE_OBJECT()
+            FIELD(s_g)
+            FIELD(s_x)
+            FIELD(c1)
+            // FIELD(I) - not serialized, it can be reconstructed
+            FIELD(D)
+            FIELD(E)
+        END_SERIALIZE()
+    };
+
     //contains the data for an Borromean sig
     // also contains the "Ci" values such that
     // \sum Ci = C
@@ -277,6 +300,8 @@ namespace rct {
     size_t n_bulletproof_plus_max_amounts(const BulletproofPlus &proof);
     size_t n_bulletproof_plus_amounts(const std::vector<BulletproofPlus> &proofs);
     size_t n_bulletproof_plus_max_amounts(const std::vector<BulletproofPlus> &proofs);
+
+    // HF21 proof wrapper types are defined below (after token_proofs.h include)
 
     template <typename Archive, typename T>
     auto start_array(Archive& ar, std::string_view tag, std::vector<T>& v, size_t size) {
@@ -615,10 +640,12 @@ namespace rct {
     xmr_amount b2d(bits amountb);
 
     inline const rct::key &pk2rct(const crypto::public_key &pk) { return (const rct::key&)pk; }
+    inline const rct::key &tid2rct(const crypto::token_id &tid) { return (const rct::key&)tid; }
     inline const rct::key &sk2rct(const crypto::secret_key &sk) { return (const rct::key&)sk; }
     inline const rct::key &ki2rct(const crypto::key_image &ki) { return (const rct::key&)ki; }
     inline const rct::key &hash2rct(const crypto::hash &h) { return (const rct::key&)h; }
     inline const crypto::public_key &rct2pk(const rct::key &k) { return (const crypto::public_key&)k; }
+    inline const crypto::token_id &rct2tid(const rct::key &k) { return (const crypto::token_id&)k; }
     inline const crypto::secret_key &rct2sk(const rct::key &k) { return (const crypto::secret_key&)k; }
     inline const crypto::key_image &rct2ki(const rct::key &k) { return (const crypto::key_image&)k; }
     inline const crypto::hash &rct2hash(const rct::key &k) { return (const crypto::hash&)k; }
@@ -669,3 +696,115 @@ VARIANT_TAG(rct::multisig_kLRki, "rct_multisig_kLR", 0x9d);
 VARIANT_TAG(rct::multisig_out, "rct_multisig_out", 0x9e);
 VARIANT_TAG(rct::clsag, "rct_clsag", 0x9f);
 VARIANT_TAG(rct::BulletproofPlus, "rct_bulletproof_plus", 0xa0);
+
+// HF21: token proof primitives — included after rct namespace so rct::key is defined
+#include "crypto/token_proofs.h"
+
+// Re-open rct namespace to define proof wrapper structs that depend on
+// both rct::key (defined above) and crypto::*_proof_s (defined in token_proofs.h).
+namespace rct {
+
+    // ── Private token proof wrappers (HF21+) ────────────────────────────
+    // Embedded in transaction::token_proofs.
+
+    struct zc_token_surjection_proof
+    {
+      std::vector<crypto::BGE_proof_s> bge_proofs; // one per ZC output
+      BEGIN_SERIALIZE_OBJECT() FIELD(bge_proofs) END_SERIALIZE()
+    };
+
+    struct zc_balance_proof
+    {
+      key P{};
+      // Proves P = secret_x*X (the mask/G-component is forced to exactly
+      // zero by construction -- see cryptonote_tx_utils.cpp's balancing-mask
+      // fixup), AND binds P to tx_pub_key = tx_key.sec*G under one shared
+      // challenge.
+      crypto::double_schnorr_sig_s dss;
+      BEGIN_SERIALIZE_OBJECT() FIELD(P) FIELD(dss) END_SERIALIZE()
+    };
+
+    struct token_operation_proof
+    {
+      // flags: bit 0 = composition_proof present
+      uint8_t flags = 0;
+      // Proves A = sum_masks*G + secret_x_mint*X, where A = C - declared_amount*token_id
+      // and C is the TDO's amount_commitment (see token_history_utils.cpp).
+      // C is built on minted outputs' blinded token ids T_j = token_id + r_j*X
+      // (see rct::commitToken), hence the X-component secret_x_mint =
+      // Σ(r_j*amount_j) over the minted outputs alongside the usual mask sum.
+      crypto::linear_composition_proof_s composition_proof{};
+
+      bool has_composition_proof() const { return flags & 1; }
+
+      BEGIN_SERIALIZE_OBJECT()
+        FIELD(flags)
+        if (has_composition_proof()) FIELD(composition_proof)
+      END_SERIALIZE()
+    };
+
+    struct token_operation_ownership_proof
+    {
+      crypto::schnorr_sig_s sig;
+      BEGIN_SERIALIZE_OBJECT() FIELD(sig) END_SERIALIZE()
+    };
+
+    // HF21: ring signature spending a single tx_out_zarcanum (confidential
+    // token) input. Like Zano (where ZC_sig is a signature_v, not a proof_v),
+    // this is stored under the transaction's signatures (transaction::zc_sig),
+    // NOT in transaction::token_proofs -- so it is intentionally absent from
+    // token_proof_v below.
+    struct ZC_sig
+    {
+      clsag_ggx clsag_sig;
+      key       pseudo_out_amount_commitment;
+      key       pseudo_out_blinded_token_id;
+      BEGIN_SERIALIZE_OBJECT()
+        FIELD(clsag_sig)
+        FIELD(pseudo_out_amount_commitment)
+        FIELD(pseudo_out_blinded_token_id)
+      END_SERIALIZE()
+    };
+
+    // HF21: range proof for zarcanum output amounts (prevents integer
+    // overflow / negative-amount inflation attacks). One per transaction,
+    // covering every zarcanum output in that tx. aggregation_proof binds the
+    // real per-output commitments to the fixed-generator auxiliary
+    // commitments that bpp (an unmodified Bulletproof+) range-proves.
+    struct zc_outs_range_proof
+    {
+      BulletproofPlus                       bpp;
+      crypto::vector_ug_aggregation_proof_s aggregation_proof;
+      BEGIN_SERIALIZE_OBJECT()
+        FIELD(bpp)
+        FIELD(aggregation_proof)
+      END_SERIALIZE()
+    };
+
+    using token_proof_v = std::variant<
+      zc_token_surjection_proof,
+      zc_balance_proof,
+      token_operation_proof,
+      token_operation_ownership_proof,
+      zc_outs_range_proof
+    >;
+
+    // HF21: transaction signature variant, modeled on Zano's signature_v.
+    // Currently the only alternative is ZC_sig (private-token input
+    // signatures); wrapping it in a variant makes each element serialize under
+    // its own "ZC_sig" tag inside the tx "signatures" array (transaction::zc_sig),
+    // matching Zano's `"signatures": [ { "ZC_sig": {...} } ]` shape. Add further
+    // signature kinds here as alternatives if/when needed.
+    using signature_v = std::variant<ZC_sig>;
+
+} // namespace rct (continued)
+
+// Variant tag registration for binary serialization of token_proof_v
+VARIANT_TAG(rct::zc_token_surjection_proof,       "zc_surjection", 0xb0);
+VARIANT_TAG(rct::zc_balance_proof,                "zc_balance",    0xb1);
+VARIANT_TAG(rct::token_operation_proof,           "token_op_proof",0xb2);
+VARIANT_TAG(rct::token_operation_ownership_proof, "token_owner",   0xb3);
+// ZC_sig is a signature_v alternative (transaction::zc_sig), not an
+// token_proof_v member; its tag lets it serialize as { "ZC_sig": {...} }.
+VARIANT_TAG(rct::ZC_sig,                          "ZC_sig",        0xb4);
+VARIANT_TAG(rct::zc_outs_range_proof,             "zc_range_proof",0xb5);

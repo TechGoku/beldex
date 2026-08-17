@@ -29,13 +29,19 @@
 //
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 #include <fmt/core.h>
+#include <algorithm>
 #include <boost/asio/ip/address.hpp>
 #include <boost/algorithm/string.hpp>
+#include <cctype>
 #include <cstdint>
 #include "cryptonote_basic/cryptonote_basic_impl.h"
 #include <chrono>
 #include <exception>
+#include <limits>
 #include <oxenc/base64.h>
+#include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
 
 #include "wallet_rpc_server_error_codes.h"
 #include "wallet_rpc_server.h"
@@ -44,7 +50,10 @@
 #include "common/i18n.h"
 #include "common/signal_handler.h"
 #include "cryptonote_config.h"
+#include "cryptonote_basic/token_descriptor_operation_utils.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
+#include "common/file.h"
+#include "common/fs.h"
 #include "cryptonote_basic/account.h"
 #include "multisig/multisig.h"
 #include "epee/string_tools.h"
@@ -74,6 +83,173 @@ namespace
   const command_line::arg_descriptor<bool> arg_prompt_for_password = {"prompt-for-password", "Prompts for password when not provided", false};
 
   constexpr const char default_rpc_username[] = "beldex";
+
+  bool validate_token_descriptor_for_deploy(const cryptonote::token_descriptor_base& descriptor, std::string& error)
+  {
+    auto ticker_ok = [](std::string_view ticker) {
+      return !ticker.empty() && ticker.size() <= 14 &&
+             std::all_of(ticker.begin(), ticker.end(), [](unsigned char c) { return std::isalnum(c); });
+    };
+    auto full_name_ok = [](std::string_view name) {
+      return !name.empty() &&
+             std::all_of(name.begin(), name.end(), [](unsigned char c) {
+               return std::isalnum(c) || c == ' ' || c == '_' || c == '-' || c == '.';
+             });
+    };
+
+    if (!ticker_ok(descriptor.ticker))
+    {
+      error = "ticker is invalid; expected 1-14 alphanumeric characters";
+      return false;
+    }
+    if (!full_name_ok(descriptor.full_name))
+    {
+      error = "full_name contains unsupported characters";
+      return false;
+    }
+    if (descriptor.decimal_point > 18)
+    {
+      error = "decimal_point must be <= 18";
+      return false;
+    }
+    if (descriptor.total_max_supply == 0)
+    {
+      error = "total_max_supply must be greater than 0";
+      return false;
+    }
+    if (descriptor.current_supply > descriptor.total_max_supply)
+    {
+      error = "current_supply cannot exceed total_max_supply";
+      return false;
+    }
+    if (descriptor.meta_info.length() > 4096)
+    {
+      error = "meta_info cannot exceed 4096 characters";
+      return false;
+    }
+    return true;
+  }
+
+  bool load_token_descriptor_from_json(
+      std::string_view data,
+      cryptonote::token_descriptor_base& descriptor,
+      std::string& error)
+  {
+    rapidjson::Document json;
+    if (json.Parse(data.data(), data.size()).HasParseError())
+    {
+      error = "Token specification is not valid JSON";
+      return false;
+    }
+    if (!json.IsObject())
+    {
+      error = "Token specification root must be a JSON object";
+      return false;
+    }
+
+    auto assign_string = [&](const char* field, std::string& target) -> bool {
+      if (!json.HasMember(field))
+        return true;
+      if (!json[field].IsString())
+      {
+        error = std::string{field} + " must be a string";
+        return false;
+      }
+      target = json[field].GetString();
+      return true;
+    };
+    auto assign_uint64 = [&](const char* field, uint64_t& target) -> bool {
+      if (!json.HasMember(field))
+        return true;
+      if (!json[field].IsUint64())
+      {
+        error = std::string{field} + " must be an unsigned integer";
+        return false;
+      }
+      target = json[field].GetUint64();
+      return true;
+    };
+    auto assign_uint8 = [&](const char* field, uint8_t& target) -> bool {
+      if (!json.HasMember(field))
+        return true;
+      if (!json[field].IsUint())
+      {
+        error = std::string{field} + " must be an unsigned integer";
+        return false;
+      }
+      unsigned value = json[field].GetUint();
+      if (value > std::numeric_limits<uint8_t>::max())
+      {
+        error = std::string{field} + " is out of range";
+        return false;
+      }
+      target = static_cast<uint8_t>(value);
+      return true;
+    };
+    auto assign_bool = [&](const char* field, bool& target) -> bool {
+      if (!json.HasMember(field))
+        return true;
+      if (!json[field].IsBool())
+      {
+        error = std::string{field} + " must be a boolean";
+        return false;
+      }
+      target = json[field].GetBool();
+      return true;
+    };
+
+    if (!assign_uint8("version", descriptor.version) ||
+        !assign_uint64("total_max_supply", descriptor.total_max_supply) ||
+        !assign_uint64("current_supply", descriptor.current_supply) ||
+        !assign_uint8("decimal_point", descriptor.decimal_point) ||
+        !assign_string("ticker", descriptor.ticker) ||
+        !assign_string("full_name", descriptor.full_name) ||
+        !assign_string("meta_info", descriptor.meta_info))
+      return false;
+
+    if (json.HasMember("owner"))
+    {
+      const auto& owner = json["owner"];
+      if (!owner.IsString())
+      {
+        error = "owner must be a hex-encoded public key or address";
+        return false;
+      }
+      std::string owner_str = owner.GetString();
+
+      cryptonote::address_parse_info owner_info;
+      if (cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::MAINNET, owner_str) ||
+          cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::TESTNET, owner_str))
+      {
+        if (owner_info.is_subaddress)
+        {
+          error = "owner cannot be a subaddress";
+          return false;
+        }
+        descriptor.owner = owner_info.address.m_spend_public_key;
+      } else if (!tools::hex_to_type(owner_str, descriptor.owner)) {
+        error = "owner must be a hex-encoded public key or valid address";
+        return false;
+      }
+    }
+
+    return validate_token_descriptor_for_deploy(descriptor, error);
+  }
+
+  bool load_token_descriptor_from_json_file(
+      const fs::path& filename,
+      cryptonote::token_descriptor_base& descriptor,
+      std::string& error)
+  {
+    std::string data;
+    if (!tools::slurp_file(filename, data))
+    {
+      error = "Failed to read token specification file";
+      return false;
+    }
+
+    return load_token_descriptor_from_json(data, descriptor, error);
+  }
 
   std::optional<tools::password_container> password_prompter(const char *prompt, bool verify)
   {
@@ -641,6 +817,53 @@ namespace tools
       }
       std::vector<wallet::transfer_details> transfers;
       m_wallet->get_transfers(transfers);
+      std::map<crypto::token_id, std::string> token_tickers;
+      // HF21: aggregate per-token balances from ZC transfer details
+      {
+        std::map<crypto::token_id, uint64_t> token_total, token_unlocked;
+        const uint64_t blockchain_height = m_wallet->get_blockchain_current_height();
+        for (const auto& td : transfers)
+        {
+          if (!td.is_zarcanum() || td.m_spent) continue;
+          if (!req.all_accounts && td.m_subaddr_index.major != req.account_index) continue;
+          if (!req.address_indices.empty() && req.address_indices.count(td.m_subaddr_index.minor) == 0) continue;
+          const uint64_t unlock_time = td.m_tx.unlock_time;
+          const bool unlocked = (unlock_time == 0) ||
+              (unlock_time < cryptonote::MAX_BLOCK_NUMBER
+                  ? blockchain_height >= unlock_time
+                  : (uint64_t)std::time(nullptr) >= unlock_time);
+          token_total[td.m_token_id] += td.m_amount;
+          if (unlocked) token_unlocked[td.m_token_id] += td.m_amount;
+        }
+        for (const auto& [token_id, total] : token_total)
+        {
+          GET_BALANCE::token_balance_entry entry{};
+          entry.token_id         = tools::type_to_hex(token_id);
+          try {
+            const auto res_info = m_wallet->json_rpc("get_token_info", {{"token_id", entry.token_id}});
+            if (res_info.contains("ticker") && res_info["ticker"].is_string())
+              token_tickers[token_id] = res_info["ticker"].get<std::string>();
+          } catch (...) {}        
+          entry.ticker           = token_tickers[token_id];
+          entry.balance          = total;
+          entry.unlocked_balance = token_unlocked.count(token_id) ? token_unlocked.at(token_id) : 0;
+          // Resolve the human-readable ticker from the daemon's token descriptor
+          // (the wallet doesn't cache it). Best-effort: if the daemon is
+          // unreachable or the token isn't found, leave it empty rather than
+          // failing the whole balance query.
+          entry.ticker = "";
+          try {
+            nlohmann::json info_req = nlohmann::json::object();
+            info_req["token_id"] = entry.token_id;
+            nlohmann::json info_res = m_wallet->json_rpc("get_token_info", info_req);
+            entry.ticker = info_res.value("ticker", "");
+          } catch (const std::exception&) {
+            // leave ticker empty on lookup failure
+          }
+          res.token_balances.emplace_back(std::move(entry));
+        }
+      }
+
       for (const auto& p : balance_per_subaddress_per_account)
       {
         uint32_t account_index = p.first;
@@ -655,6 +878,12 @@ namespace tools
         {
           for (const auto& i : balance_per_subaddress)
             address_indices.insert(i.first);
+          // HF21: track token subaddresses
+          for (const auto& td : transfers)
+          {
+            if (td.is_zarcanum() && !td.m_spent && td.m_subaddr_index.major == account_index)
+              address_indices.insert(td.m_subaddr_index.minor);
+          }
         }
         for (uint32_t i : address_indices)
         {
@@ -668,7 +897,31 @@ namespace tools
           info.blocks_to_unlock = unlocked_balance_per_subaddress[i].second.first;
           info.time_to_unlock = unlocked_balance_per_subaddress[i].second.second;
           info.label = m_wallet->get_subaddress_label(index);
-          info.num_unspent_outputs = std::count_if(transfers.begin(), transfers.end(), [&](const wallet::transfer_details& td) { return !td.m_spent && td.m_subaddr_index == index; });
+          
+          // HF21: per-token balances for this specific subaddress
+          std::map<crypto::token_id, uint64_t> subaddr_token_total, subaddr_token_unlocked;
+          const uint64_t blockchain_height = m_wallet->get_blockchain_current_height();
+          for (const auto& td : transfers)
+          {
+            if (!td.is_zarcanum() || td.m_spent) continue;
+            if (td.m_subaddr_index != index) continue;
+            const uint64_t unlock_time = td.m_tx.unlock_time;
+            const bool unlocked = (unlock_time == 0) ||
+                (unlock_time < cryptonote::MAX_BLOCK_NUMBER
+                    ? blockchain_height >= unlock_time
+                    : (uint64_t)std::time(nullptr) >= unlock_time);
+            subaddr_token_total[td.m_token_id] += td.m_amount;
+            if (unlocked) subaddr_token_unlocked[td.m_token_id] += td.m_amount;
+          }
+          for (const auto& [token_id, total] : subaddr_token_total)
+          {
+            GET_BALANCE::token_balance_entry entry{};
+            entry.token_id         = tools::type_to_hex(token_id);
+            entry.ticker           = token_tickers[token_id];
+            entry.balance          = total;
+            entry.unlocked_balance = subaddr_token_unlocked.count(token_id) ? subaddr_token_unlocked.at(token_id) : 0;
+            info.token_balances.emplace_back(std::move(entry));
+          }
           res.per_subaddress.emplace_back(std::move(info));
         }
       }
@@ -899,20 +1152,73 @@ namespace tools
   }
 
   //------------------------------------------------------------------------------------------------------------------------------
+  enum class token_prefixed_address_mode
+  {
+    plain_address,
+    native_prefixed_address,
+    token_prefixed_address,
+  };
+
+  static bool parse_token_prefixed_address(std::string_view raw, crypto::token_id& token_id, std::string& address, token_prefixed_address_mode* mode = nullptr)
+  {
+    const size_t sep = raw.find(':');
+    address = std::string{raw};
+    token_id = crypto::null_tid;
+    if (mode)
+      *mode = token_prefixed_address_mode::plain_address;
+    if (sep == std::string_view::npos)
+      return true;
+
+    const std::string token_hex = std::string{raw.substr(0, sep)};
+    const std::string parsed_address = std::string{raw.substr(sep + 1)};
+    if (token_hex == "bdx" && !parsed_address.empty())
+    {
+      address = parsed_address;
+      if (mode)
+        *mode = token_prefixed_address_mode::native_prefixed_address;
+      return true;
+    }
+    if (token_hex.size() != 64 || parsed_address.empty())
+      return true;
+    if (!tools::hex_to_type(token_hex, token_id))
+      return false;
+
+    address = std::move(parsed_address);
+    if (mode)
+      *mode = token_prefixed_address_mode::token_prefixed_address;
+    return true;
+  }
+
+  //------------------------------------------------------------------------------------------------------------------------------
   void wallet_rpc_server::validate_transfer(const std::list<wallet::transfer_destination>& destinations, const std::string& payment_id, std::vector<cryptonote::tx_destination_entry>& dsts, std::vector<uint8_t>& extra, bool at_least_one_destination)
   {
     crypto::hash8 integrated_payment_id = crypto::null_hash8;
     std::string extra_nonce;
     for (auto it = destinations.begin(); it != destinations.end(); it++)
     {
-      cryptonote::address_parse_info info = extract_account_addr(m_wallet->nettype(), it->address);
+      crypto::token_id parsed_token_id = crypto::null_tid;
+      std::string parsed_address;
+      if (!parse_token_prefixed_address(it->address, parsed_token_id, parsed_address))
+        throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse token_id"};
+
+      cryptonote::address_parse_info info = extract_account_addr(m_wallet->nettype(), parsed_address);
 
       cryptonote::tx_destination_entry de;
-      de.original = it->address;
+      de.original = parsed_address;
       de.addr = info.address;
       de.is_subaddress = info.is_subaddress;
       de.amount = it->amount;
       de.is_integrated = info.has_payment_id;
+      de.token_id = parsed_token_id;
+      if (!it->token_id.empty()) {
+        crypto::token_id explicit_token_id = crypto::null_tid;
+        if (!tools::hex_to_type(it->token_id, explicit_token_id))
+          throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse token_id"};
+        if (de.token_id != crypto::null_tid && de.token_id != explicit_token_id)
+          throw wallet_rpc_error{error_code::BAD_HEX, "Conflicting token ids in destination"};
+        de.token_id = explicit_token_id;
+      }
+
       dsts.push_back(de);
 
       if (info.has_payment_id)
@@ -975,8 +1281,16 @@ namespace tools
   //------------------------------------------------------------------------------------------------------------------------------
   static uint64_t total_amount(const wallet::pending_tx &ptx)
   {
+    // HF21: only sum NATIVE (BDX) destinations. A tx may carry destinations of
+    // different kinds (BDX and/or one private token), whose atomic units
+    // are NOT comparable, so summing them into one number is meaningless (e.g.
+    // 10 token-atoms + 10 BDX-atoms != 10000000010 of anything). Per-destination
+    // amounts -- including token destinations -- are still reported in
+    // amounts_by_dest, and the caller knows which token each is from its request.
     uint64_t amount = 0;
-    for (const auto &dest: ptx.dests) amount += dest.amount;
+    for (const auto &dest: ptx.dests)
+      if (!dest.is_zarcanum())
+        amount += dest.amount;
     return amount;
   }
   //------------------------------------------------------------------------------------------------------------------------------
@@ -1018,15 +1332,26 @@ namespace tools
         abd.amounts.push_back(dst.amount);
       fill(amounts_by_dest, abd);
 
-      // add spent key images
+      // add spent key images. HF21: a private-token transfer spends both
+      // native txin_to_key inputs (fee/change) and txin_zc_input inputs (the
+      // token), so accept either -- both carry a k_image. Mirrors wallet2.cpp's
+      // all_known_txin_type collection.
       tools::wallet_rpc::key_image_list key_image_list;
-      bool all_are_txin_to_key = std::all_of(ptx.tx.vin.begin(), ptx.tx.vin.end(), [&](const cryptonote::txin_v& s_e) -> bool
+      bool all_known_txin_type = std::all_of(ptx.tx.vin.begin(), ptx.tx.vin.end(), [&](const cryptonote::txin_v& s_e) -> bool
       {
-        CHECKED_GET_SPECIFIC_VARIANT(s_e, cryptonote::txin_to_key, in, false);
-        key_image_list.key_images.push_back(tools::type_to_hex(in.k_image));
-        return true;
+        if (std::holds_alternative<cryptonote::txin_to_key>(s_e))
+        {
+          key_image_list.key_images.push_back(tools::type_to_hex(std::get<cryptonote::txin_to_key>(s_e).k_image));
+          return true;
+        }
+        else if (std::holds_alternative<cryptonote::txin_zc_input>(s_e))
+        {
+          key_image_list.key_images.push_back(tools::type_to_hex(std::get<cryptonote::txin_zc_input>(s_e).k_image));
+          return true;
+        }
+        return false;
       });
-      THROW_WALLET_EXCEPTION_IF(!all_are_txin_to_key, error::unexpected_txin_type, ptx.tx);
+      THROW_WALLET_EXCEPTION_IF(!all_known_txin_type, error::unexpected_txin_type, ptx.tx);
       fill(spent_key_images, key_image_list);
 
     }
@@ -1457,6 +1782,12 @@ namespace tools
     destination.back().address = req.address;
     validate_transfer(destination, req.payment_id, dsts, extra, true);
 
+    crypto::token_id parsed_token_id = crypto::null_tid;
+    std::string parsed_address;
+    token_prefixed_address_mode address_mode = token_prefixed_address_mode::plain_address;
+    if (!parse_token_prefixed_address(req.address, parsed_token_id, parsed_address, &address_mode))
+      throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse token_id"};
+
     if (req.outputs < 1)
       throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Amount of outputs should be greater than 0."};
 
@@ -1473,7 +1804,14 @@ namespace tools
 
     {
       uint32_t priority = convert_priority(req.priority);
-      std::vector<wallet2::pending_tx> ptx_vector = m_wallet->create_transactions_all(req.below_amount, dsts[0].addr, dsts[0].is_subaddress, req.outputs, cryptonote::TX_OUTPUT_DECOYS, req.unlock_time, priority, extra, req.account_index, subaddr_indices);
+      const auto requested_token_id = dsts[0].token_id == crypto::null_tid
+          ? std::optional<crypto::token_id>{}
+          : std::optional<crypto::token_id>{dsts[0].token_id};
+      const auto selection_mode =
+          address_mode == token_prefixed_address_mode::plain_address && !requested_token_id.has_value()
+              ? wallet2::sweep_selection_mode::native_and_all_tokens
+              : wallet2::sweep_selection_mode::native_only;
+      std::vector<wallet2::pending_tx> ptx_vector = m_wallet->create_transactions_all(req.below_amount, dsts[0].addr, dsts[0].is_subaddress, req.outputs, cryptonote::TX_OUTPUT_DECOYS, req.unlock_time, priority, extra, req.account_index, subaddr_indices, requested_token_id, cryptonote::txtype::standard, selection_mode);
 
       fill_response(ptx_vector, req.get_tx_keys, res.tx_key_list, res.amount_list, res.amounts_by_dest_list, res.fee_list, res.multisig_txset, res.unsigned_txset, req.do_not_relay, priority == tx_priority_flash,
             res.tx_hash_list, req.get_tx_hex, res.tx_blob_list, req.get_tx_metadata, res.tx_metadata_list, res.spent_key_images_list);
@@ -1505,15 +1843,16 @@ namespace tools
 
     {
       uint32_t priority = convert_priority(req.priority);
-      std::vector<wallet2::pending_tx> ptx_vector = m_wallet->create_transactions_single(ki, dsts[0].addr, dsts[0].is_subaddress, req.outputs, cryptonote::TX_OUTPUT_DECOYS, req.unlock_time, priority, extra);
+      const auto requested_token_id = dsts[0].token_id == crypto::null_tid
+          ? std::optional<crypto::token_id>{}
+          : std::optional<crypto::token_id>{dsts[0].token_id};
+      std::vector<wallet2::pending_tx> ptx_vector = m_wallet->create_transactions_single(ki, dsts[0].addr, dsts[0].is_subaddress, req.outputs, cryptonote::TX_OUTPUT_DECOYS, req.unlock_time, priority, extra, requested_token_id);
 
       if (ptx_vector.empty())
         throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "No outputs found"};
       if (ptx_vector.size() > 1)
         throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Multiple transactions are created, which is not supposed to happen"};
       const wallet2::pending_tx &ptx = ptx_vector[0];
-      if (ptx.selected_transfers.size() > 1)
-        throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "The transaction uses multiple inputs, which is not supposed to happen"};
 
       fill_response(ptx_vector, req.get_tx_key, res.tx_key, res.amount, res.amounts_by_dest, res.fee, res.multisig_txset, res.unsigned_txset, req.do_not_relay, priority == tx_priority_flash,
           res.tx_hash, req.get_tx_hex, res.tx_blob, req.get_tx_metadata, res.tx_metadata, res.spent_key_images);
@@ -1948,8 +2287,16 @@ namespace tools
     cryptonote::address_parse_info info;
     if(!get_account_address_from_str(info, m_wallet->nettype(), req.address))
       throw wallet_rpc_error{error_code::WRONG_ADDRESS, "Invalid address"};
+    std::map<crypto::token_id, uint64_t> token_received;
 
-    m_wallet->check_tx_key(txid, tx_key, additional_tx_keys, info.address, res.received, res.in_pool, res.confirmations);
+    m_wallet->check_tx_key(txid, tx_key, additional_tx_keys, info.address, res.received, res.in_pool, res.confirmations, token_received);
+    for (const auto& [tid, amount] : token_received)
+    {
+      wallet_rpc::token_received_entry entry;
+      entry.token_id = tools::type_to_hex(tid);
+      entry.amount = amount;
+      res.token_received.push_back(entry);
+    }
     return res;
   }
   //------------------------------------------------------------------------------------------------------------------------------
@@ -1984,7 +2331,15 @@ namespace tools
       throw wallet_rpc_error{error_code::WRONG_ADDRESS, "Invalid address"};
 
     {
-      res.good = m_wallet->check_tx_proof(txid, info.address, info.is_subaddress, req.message, req.signature, res.received, res.in_pool, res.confirmations);
+      std::map<crypto::token_id, uint64_t> token_received;
+      res.good = m_wallet->check_tx_proof(txid, info.address, info.is_subaddress, req.message, req.signature, res.received, res.in_pool, res.confirmations, token_received);
+      for (const auto& [tid, amount] : token_received)
+      {
+        wallet_rpc::token_received_entry entry;
+        entry.token_id = tools::type_to_hex(tid);
+        entry.amount = amount;
+        res.token_received.push_back(entry);
+      }
     }
     return res;
   }
@@ -2043,7 +2398,8 @@ namespace tools
     if (info.is_subaddress)
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Address must not be a subaddress"};
 
-    res.good = m_wallet->check_reserve_proof(info.address, req.message, req.signature, res.total, res.spent);
+    std::map<crypto::token_id, std::pair<uint64_t, uint64_t>> token_totals;
+    res.good = m_wallet->check_reserve_proof(info.address, req.message, req.signature, res.total, res.spent, token_totals);
     return res;
   }
   //------------------------------------------------------------------------------------------------------------------------------
@@ -3647,6 +4003,366 @@ namespace {
     m_stop = true;
   }
 
+  // HF21: deploy a new private token
+  DEPLOY_NEW_TOKEN::response wallet_rpc_server::invoke(DEPLOY_NEW_TOKEN::request&& req)
+  {
+    require_open();
+    DEPLOY_NEW_TOKEN::response res{};
+
+    // 1. Validate request
+    if (req.json_string.empty())
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "json_string is required"};
+
+    // 2. Load descriptor from inline JSON
+    cryptonote::token_descriptor_base descriptor{};
+    std::string error;
+    if (!load_token_descriptor_from_json(req.json_string, descriptor, error))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error};
+
+    // 3. Validate descriptor
+    if (!validate_token_descriptor_for_deploy(descriptor, error))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Invalid descriptor: " + error};
+
+    // 4. Set owner to wallet's spend key if not provided
+    const auto owner = m_wallet->get_account().get_keys().m_account_address.m_spend_public_key;
+    if (descriptor.owner == crypto::null_pkey)
+      descriptor.owner = owner;
+    else if (descriptor.owner != owner)
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Token owner must be this wallet's spend key"};
+
+    // 5. Verify hard fork version
+    if (!m_wallet->get_hard_fork_version())
+      throw wallet_rpc_error{error_code::HF_QUERY_FAILED, tools::ERR_MSG_NETWORK_VERSION_QUERY_FAILED};
+
+    // 6. Create TDO (Token Descriptor Operation)
+    cryptonote::tx_extra_token_descriptor_operation tdo{};
+    tdo.operation_type = cryptonote::token_descriptor_operation_type::register_token;
+    tdo.fields         = static_cast<uint8_t>(cryptonote::token_field_descriptor |
+                                               cryptonote::token_field_token_id_salt);
+    tdo.descriptor     = descriptor;
+    tdo.token_id_salt  = crypto::rand<uint32_t>();
+
+    // 7. Encode TDO into tx extra
+    std::vector<uint8_t> extra;
+    if (!cryptonote::add_token_descriptor_operation_to_tx_extra(extra, tdo))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to encode token descriptor into tx extra"};
+
+    // 8. Calculate token ID
+    const crypto::token_id token_id = cryptonote::get_or_calculate_token_id(tdo);
+
+    // 9. Create destination with initial supply
+    std::vector<cryptonote::tx_destination_entry> dsts;
+    if (descriptor.current_supply > 0)
+    {
+      cryptonote::tx_destination_entry dest;
+      dest.addr = m_wallet->get_account().get_keys().m_account_address;
+      dest.amount = descriptor.current_supply;
+      dest.token_id = token_id;
+      dest.is_subaddress = false;
+      dsts.push_back(dest);
+    }
+
+    // 10. Create transaction
+    std::set<uint32_t> subaddr_indices = req.subaddr_indices;
+    auto ptx_vector = m_wallet->create_token_deploy_tx(
+        dsts, token_id, cryptonote::TX_OUTPUT_DECOYS, req.priority, extra,
+        req.account_index, subaddr_indices);
+
+    if (ptx_vector.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "No outputs found or daemon not ready"};
+    if (ptx_vector.size() != 1)
+      throw wallet_rpc_error{error_code::TX_TOO_LARGE, "Transaction would be too large. Try a simpler token deployment."};
+
+    // 11. Relay or mark as pending
+    if (!req.do_not_relay)
+      m_wallet->commit_tx(ptx_vector.front());
+
+    // 12. Build response
+    res.token_id = tools::type_to_hex(token_id);
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(ptx_vector.front().tx));
+    res.ticker = descriptor.ticker;
+    res.full_name = descriptor.full_name;
+    res.tx_fee = ptx_vector.front().fee;
+
+    if (req.get_tx_key)
+      res.tx_key = tools::type_to_hex(ptx_vector.front().tx_key);
+
+    if (req.get_tx_hex)
+      res.tx_hex = oxenc::to_hex(cryptonote::tx_to_blob(ptx_vector.front().tx));
+
+    return res;
+  }
+  GET_OWNED_TOKENS::response wallet_rpc_server::invoke(GET_OWNED_TOKENS::request&& req)
+  {
+    require_open();
+    GET_OWNED_TOKENS::response res{};
+
+    nlohmann::json list_res;
+    try {
+      nlohmann::json list_req = nlohmann::json::object();
+      list_req["count"] = 1000000;
+      list_req["offset"] = 0;
+      list_res = m_wallet->json_rpc("get_token_list", list_req);
+    } catch (const std::exception& e) {
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to fetch token list from daemon: " + std::string(e.what())};
+    }
+
+    std::string requested_owner = tools::type_to_hex(m_wallet->get_account().get_keys().m_account_address.m_spend_public_key);
+    if (!req.owner.empty())
+    {
+      cryptonote::address_parse_info owner_info{};
+      crypto::public_key owner_spend_key{};
+
+      if (get_account_address_from_str(owner_info, m_wallet->nettype(), req.owner))
+        requested_owner = tools::type_to_hex(owner_info.address.m_spend_public_key);
+      else if (tools::hex_to_type(req.owner, owner_spend_key))
+        requested_owner = tools::type_to_hex(owner_spend_key);
+      else
+        throw wallet_rpc_error{error_code::WRONG_ADDRESS, "Invalid owner address or spend public key"};
+    }
+
+    if (list_res.contains("token_ids") && list_res["token_ids"].is_array()) {
+      for (const auto& token_id_val : list_res["token_ids"]) {
+        std::string token_id_hex = token_id_val.get<std::string>();
+        
+        nlohmann::json info_res;
+        try {
+          nlohmann::json info_req = nlohmann::json::object();
+          info_req["token_id"] = token_id_hex;
+          info_res = m_wallet->json_rpc("get_token_info", info_req);
+        } catch (const std::exception&) {
+          continue;
+        }
+
+        const std::string owner_hex = info_res.value("owner", "");
+        if (owner_hex != requested_owner)
+          continue;
+
+        std::string meta_info = info_res.value("meta_info", "");
+        std::string full_name = info_res.value("full_name", "");
+        const auto it_supply = info_res.find("current_supply");
+        const auto it_ticker = info_res.find("ticker");
+        const auto it_decimal = info_res.find("decimal_point");
+        const auto it_max_supply = info_res.find("total_max_supply");
+        
+        if (it_supply == info_res.end() || it_ticker == info_res.end() || it_decimal == info_res.end() || it_max_supply == info_res.end())
+          continue;
+
+        if (it_max_supply.value() == 0)
+          continue;
+
+        res.tokens.push_back({
+          token_id_hex,
+          full_name,
+          it_ticker->get<std::string>(),
+          it_max_supply->get<uint64_t>(),
+          it_supply->get<uint64_t>(),
+          (uint8_t)it_decimal->get<uint64_t>(),
+          meta_info
+        });
+      }
+    }
+
+    return res;
+  }
+
+  // HF21: Mint additional tokens for an existing private token
+  MINT_TOKEN::response wallet_rpc_server::invoke(MINT_TOKEN::request&& req)
+  {
+    require_open();
+    MINT_TOKEN::response res{};
+    crypto::token_id token_id;
+    if (!tools::hex_to_type(req.token_id, token_id))
+      throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse token_id"};
+    cryptonote::account_public_address dest_addr = m_wallet->get_account().get_keys().m_account_address;
+    bool is_subaddress = false;
+    std::vector<cryptonote::tx_destination_entry> dsts;
+    cryptonote::tx_destination_entry dst;
+    dst.amount = req.amount;
+    dst.addr = dest_addr;
+    dst.is_subaddress = is_subaddress;
+    dst.token_id = token_id;
+    dsts.push_back(dst);
+
+    // Create the TDO for emission
+    cryptonote::tx_extra_token_descriptor_operation tdo{};
+    tdo.operation_type = cryptonote::token_descriptor_operation_type::mint_token;
+    tdo.fields         = static_cast<uint8_t>(cryptonote::token_field_token_id | cryptonote::token_field_amount);
+    tdo.token_id       = token_id;
+    tdo.amount         = req.amount;
+    std::vector<uint8_t> extra;
+    if (!cryptonote::add_token_descriptor_operation_to_tx_extra(extra, tdo))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to encode token descriptor into tx extra"};
+    auto ptx_vector = m_wallet->create_token_mint_tx(
+        dsts, token_id, cryptonote::TX_OUTPUT_DECOYS, req.priority, extra,
+        req.account_index, req.subaddr_indices);
+    if (ptx_vector.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "No outputs found or daemon not ready"};
+    if (ptx_vector.size() != 1)
+      throw wallet_rpc_error{error_code::TX_TOO_LARGE, "Transaction would be too large."};
+    if (!req.do_not_relay)
+      m_wallet->commit_tx(ptx_vector.front());
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(ptx_vector.front().tx));
+    if (req.get_tx_key)
+      res.tx_key = tools::type_to_hex(ptx_vector.front().tx_key);
+    if (req.get_tx_hex)
+      res.tx_blob = oxenc::to_hex(cryptonote::tx_to_blob(ptx_vector.front().tx));
+    if (req.get_tx_metadata)
+    {
+      std::string metadata = m_wallet->dump_tx_to_str(ptx_vector);
+      res.tx_metadata = oxenc::to_hex(metadata);
+    }
+    res.fee = ptx_vector.front().fee;
+    return res;
+  }
+
+  // HF21: Burn supply from an existing private token
+  BURN_TOKEN::response wallet_rpc_server::invoke(BURN_TOKEN::request&& req)
+  {
+    require_open();
+    BURN_TOKEN::response res{};
+
+    crypto::token_id token_id;
+    if (!tools::hex_to_type(req.token_id, token_id) || token_id == crypto::null_tid)
+      throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse token_id"};
+    if (req.amount == 0)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Amount must be greater than 0"};
+
+    std::vector<uint8_t> extra;
+    cryptonote::tx_extra_token_descriptor_operation tdo{};
+    tdo.operation_type = cryptonote::token_descriptor_operation_type::burn_token;
+    tdo.fields         = static_cast<uint8_t>(cryptonote::token_field_token_id |
+                                              cryptonote::token_field_amount);
+    tdo.token_id       = token_id;
+    tdo.amount         = req.amount;
+
+    if (!cryptonote::add_token_descriptor_operation_to_tx_extra(extra, tdo))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to encode token burn operation into tx extra"};
+
+    auto ptx_vector = m_wallet->create_token_burn_tx(
+        token_id, req.amount, cryptonote::TX_OUTPUT_DECOYS, req.priority, extra,
+        req.account_index, req.subaddr_indices);
+
+    if (ptx_vector.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "No outputs found or daemon not ready"};
+    if (ptx_vector.size() != 1)
+      throw wallet_rpc_error{error_code::TX_TOO_LARGE, "Transaction would be too large."};
+
+    if (!req.do_not_relay)
+      m_wallet->commit_tx(ptx_vector.front());
+
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(ptx_vector.front().tx));
+    if (req.get_tx_key)
+      res.tx_key = tools::type_to_hex(ptx_vector.front().tx_key);
+    if (req.get_tx_hex)
+      res.tx_blob = oxenc::to_hex(cryptonote::tx_to_blob(ptx_vector.front().tx));
+    if (req.get_tx_metadata)
+    {
+      std::string metadata = m_wallet->dump_tx_to_str(ptx_vector);
+      res.tx_metadata = oxenc::to_hex(metadata);
+    }
+    res.fee = ptx_vector.front().fee;
+    return res;
+  }
+
+  // HF21: Update an existing private token metadata
+  UPDATE_TOKEN::response wallet_rpc_server::invoke(UPDATE_TOKEN::request&& req)
+  {
+    require_open();
+    UPDATE_TOKEN::response res{};
+
+    if (req.account_index != 0 || !req.subaddr_indices.empty())
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "update_token must be issued from the primary account without subaddress switches"};
+
+    crypto::token_id token_id;
+    if (!tools::hex_to_type(req.token_id, token_id))
+      throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse token_id"};
+
+    if (req.json_filename.empty() && req.json_string.empty())
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "json_filename or json_string is required"};
+
+    nlohmann::json info_res;
+    try {
+      nlohmann::json info_req = nlohmann::json::object();
+      info_req["token_id"] = req.token_id;
+      info_res = m_wallet->json_rpc("get_token_info", info_req);
+    } catch (const std::exception& e) {
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to fetch token info from daemon: " + std::string(e.what())};
+    }
+
+    std::string requested_owner = tools::type_to_hex(m_wallet->get_account().get_keys().m_account_address.m_spend_public_key);
+    if (!info_res.contains("owner") || info_res["owner"].get<std::string>() != requested_owner) {
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "This wallet does not own the token: " + req.token_id};
+    }
+
+    cryptonote::token_descriptor_base adb{};
+    adb.version = info_res.value("version", 1);
+    adb.total_max_supply = info_res.value("total_max_supply", (uint64_t)0);
+    adb.current_supply = info_res.value("current_supply", (uint64_t)0);
+    adb.decimal_point = info_res.value("decimal_point", 0);
+    adb.ticker = info_res.value("ticker", "");
+    adb.full_name = info_res.value("full_name", "");
+    adb.meta_info = info_res.value("meta_info", "");
+    tools::hex_to_type(info_res.value("owner", ""), adb.owner);
+
+    // update_token may only change meta_info (consensus rejects changes to
+    // supply/ticker/full_name/decimal_point). `adb` already holds the LIVE
+    // on-chain descriptor; load the JSON file into a copy and adopt ONLY its
+    // meta_info, preserving every other field from the chain. This avoids a
+    // spurious rejection when the file's current_supply has drifted from the
+    // on-chain supply after mint_token operations -- the caller's file need only
+    // carry the new meta_info, the rest is taken from the current descriptor.
+    cryptonote::token_descriptor_base file_adb = adb;
+    std::string error;
+    bool loaded = false;
+    if (!req.json_string.empty())
+      loaded = load_token_descriptor_from_json(req.json_string, file_adb, error);
+    else
+      loaded = load_token_descriptor_from_json_file(fs::u8path(req.json_filename), file_adb, error);
+
+    if (!loaded)
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error + (req.json_string.empty() ? (": " + req.json_filename) : "")};
+
+    if (file_adb.meta_info == adb.meta_info)
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "update_token: meta_info is unchanged, nothing to update"};
+    adb.meta_info = file_adb.meta_info;
+
+    cryptonote::tx_extra_token_descriptor_operation tdo{};
+    tdo.operation_type = cryptonote::token_descriptor_operation_type::update_token;
+    tdo.fields         = static_cast<uint8_t>(cryptonote::token_field_descriptor |
+                                               cryptonote::token_field_token_id);
+    tdo.descriptor     = adb;
+    tdo.token_id       = token_id;
+
+    std::vector<uint8_t> extra;
+    if (!cryptonote::add_token_descriptor_operation_to_tx_extra(extra, tdo))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to encode token descriptor into tx extra"};
+
+    auto ptx_vector = m_wallet->create_token_update_tx(
+        token_id, cryptonote::TX_OUTPUT_DECOYS, req.priority, extra,
+        req.account_index, req.subaddr_indices);
+
+    if (ptx_vector.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "No outputs found or daemon not ready"};
+    if (ptx_vector.size() != 1)
+      throw wallet_rpc_error{error_code::TX_TOO_LARGE, "Transaction would be too large."};
+
+    if (!req.do_not_relay)
+      m_wallet->commit_tx(ptx_vector.front());
+
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(ptx_vector.front().tx));
+    if (req.get_tx_key)
+      res.tx_key = tools::type_to_hex(ptx_vector.front().tx_key);
+    if (req.get_tx_hex)
+      res.tx_blob = oxenc::to_hex(cryptonote::tx_to_blob(ptx_vector.front().tx));
+    if (req.get_tx_metadata)
+    {
+      std::string metadata = m_wallet->dump_tx_to_str(ptx_vector);
+      res.tx_metadata = oxenc::to_hex(metadata);
+    }
+    res.fee = ptx_vector.front().fee;
+    return res;
+  }
 }
 
 int main(int argc, char **argv)

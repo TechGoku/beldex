@@ -148,3 +148,24 @@ constexpr uint64_t burn_needed(cryptonote::hf hf_version, mapping_years map_year
 }
 }; // namespace bns
 
+namespace cryptonote { enum class token_descriptor_operation_type : uint8_t; }
+
+namespace tokens
+{
+constexpr uint64_t burn_needed(cryptonote::hf hf_version, cryptonote::token_descriptor_operation_type op_type)
+{
+  uint64_t basic_fee = 100 * beldex::COIN; 
+
+  switch (static_cast<uint8_t>(op_type))
+  {
+    case 1: // register_token (deploy_new_token)
+      return basic_fee * 2; // Higher fee (e.g. 200 BDX)
+    case 2: // mint_token
+      return basic_fee / 2;  // Slightly low (e.g. 50 BDX)
+    case 3: // update_token
+      return basic_fee / 10; // Very low fee (e.g. 10 BDX)
+    default:
+      return 0;
+  }
+}
+}; // namespace tokens

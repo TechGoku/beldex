@@ -47,6 +47,7 @@ static constexpr std::array mainnet_hard_forks =
   hard_fork{hf::hf19_enhance_bns,       0,  3546545, 1725514200 }, // Thursday, September 5, 2024 5:30:00 AM (UTC)
   hard_fork{hf::hf20_bulletproof_plus,  0,  4939540, 1765105200 }, // Sunday, December 7, 2025 4:30:00 AM (UTC)
   hard_fork{hf::hf21_bulletproof_plus,  0,  5518799, 1782501791 }, // Sunday, December 7, 2025 4:30:00 AM (UTC)
+  hard_fork{hf::hf22_private_tokens,    0, 99999999, 9999999999 }, // TBD: mainnet height pending testnet validation
 };
 
 static constexpr std::array testnet_hard_forks =
@@ -61,6 +62,11 @@ static constexpr std::array testnet_hard_forks =
   hard_fork{hf::hf18_bns,               0,  1251330, 1701063000 }, // Monday, November 27, 2023 5:30:00 AM
   hard_fork{hf::hf19_enhance_bns,       0,  1997558, 1723447800 }, // Monday, Aug 12, 2024 7:30:00 AM
   hard_fork{hf::hf20_bulletproof_plus,  0,  3262180, 1761388200 }, // Saturday, Oct 25, 2025 10:30:00 AM
+  // TBD: set this to a real testnet height before activating. The feature
+  // branch carried toy heights here (hf8@20 ... hf21@100) which would have
+  // replaced the live testnet schedule above, so those are deliberately not
+  // taken -- only this one entry is new.
+  hard_fork{hf::hf22_private_tokens,    0, 99999999, 9999999999 }, // TBD: testnet activation height
 };
 
 static constexpr std::array devnet_hard_forks =
