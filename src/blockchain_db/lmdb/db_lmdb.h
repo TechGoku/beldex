@@ -432,7 +432,6 @@ private:
   void migrate_5_6();
   void migrate_6_7();
   void migrate_7_8();
-  void migrate_8_9();
 
   void cleanup_batch();
 

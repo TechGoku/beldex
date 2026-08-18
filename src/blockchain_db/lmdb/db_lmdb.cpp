@@ -65,8 +65,12 @@ enum struct lmdb_version
     v5,     // alt_block_data_1_t => alt_block_data_t: Alt block data has boolean for if the block was checkpointed
     v6,     // remigrate quorum_signature struct due to alignment change
     v7,     // rebuild the checkpoint table because v6 update in-place made MDB_LAST not give us the newest checkpoint
-    v8,     // add token history table for custom token registry state
-    v9,     // add blinded_token_id to output metadata for private token ring filtering
+    // Private tokens: adds the token history table AND widens output metadata
+    // with blinded_token_id for ring filtering. These were developed as two
+    // steps (v8, v9) but ship together, and no release ever exposed the
+    // intermediate state, so they are a single version bump here -- one pass
+    // over m_output_amounts instead of two, and one thing for operators to run.
+    v8,     // add token history table + blinded_token_id in output metadata
     _count
 };
 
@@ -6106,37 +6110,30 @@ void BlockchainLMDB::migrate_6_7()
 void BlockchainLMDB::migrate_7_8()
 {
   LOG_PRINT_L3("BlockchainLMDB::" << __func__);
-  MGINFO_YELLOW("Migrating blockchain from DB version 7 to 8 - adding token history table");
-
-  mdb_txn_safe txn(false);
-  if (auto result = mdb_txn_begin(m_env, NULL, 0, txn))
-    throw0(DB_ERROR(lmdb_error("Failed to create a transaction for the db: ", result).c_str()));
-
-  lmdb_db_open(txn, LMDB_TOKEN_HISTORIES, MDB_CREATE, m_token_histories, "Failed to open db handle for m_token_histories");
-  txn.commit();
-
-  if (int result = write_db_version(m_env, m_properties, (uint32_t)lmdb_version::v8))
-    throw0(DB_ERROR(lmdb_error("Failed to update version for the db: ", result).c_str()));
-}
-
-void BlockchainLMDB::migrate_8_9()
-{
-  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
   const auto migration_started = std::chrono::steady_clock::now();
-  MGINFO_YELLOW("Migrating blockchain from DB version 8 to 9 - adding blinded_token_id to output records; this may take a while:");
+  MGINFO_YELLOW("Migrating blockchain from DB version 7 to 8 - adding token history table and blinded_token_id to output records; this may take a while:");
 
-  // v9 appends a 32-byte crypto::token_id (blinded_token_id) to output_data_t,
+  // ── Part 1: the token history table ──
+  // Creating an empty table, so this is effectively free; it is folded in here
+  // rather than kept as its own version because the two ship together.
+  {
+    mdb_txn_safe txn(false);
+    if (auto result = mdb_txn_begin(m_env, NULL, 0, txn))
+      throw0(DB_ERROR(lmdb_error("Failed to create a transaction for the db: ", result).c_str()));
+
+    lmdb_db_open(txn, LMDB_TOKEN_HISTORIES, MDB_CREATE, m_token_histories, "Failed to open db handle for m_token_histories");
+    txn.commit();
+  }
+
+  // ── Part 2: widen the output metadata ──
+  // Appends a 32-byte crypto::token_id (blinded_token_id) to output_data_t,
   // which lives in the rct (amount==0) records of m_output_amounts. That table
   // is MDB_DUPFIXED, so all dups under a key must share one size; we therefore
-  // rebuild the rct dup-list at the new record size via a temp table. Native /
-  // legacy outputs get null_tid; private-token (zarcanum) outputs get their
-  // real blinded id, recovered by a forward scan that reproduces the exact
-  // output_id assignment order (per block: miner_tx, then txs in tx_hashes
-  // order, each vout ascending — see BlockchainDB::add_block).
-  // ── v8 on-disk record layout (BEFORE the new field) ──
+  // rebuild the rct dup-list at the new record size via a temp table.
+  // ── v7 on-disk record layout (BEFORE the new field) ──
 
 #pragma pack(push, 1)
-  struct v8_output_data_t
+  struct v7_output_data_t
   {
     crypto::public_key pubkey;
     uint64_t unlock_time;
@@ -6144,11 +6141,11 @@ void BlockchainLMDB::migrate_8_9()
     rct::key commitment;
   };
 
-  struct v8_outkey
+  struct v7_outkey
   {
     uint64_t amount_index;
     uint64_t output_id;
-    v8_output_data_t data;
+    v7_output_data_t data;
   };
 #pragma pack(pop)
 
@@ -6174,10 +6171,10 @@ void BlockchainLMDB::migrate_8_9()
     MDB_cursor *c_old = nullptr, *c_tmp = nullptr;
 
     if (mdb_cursor_open(txn, m_output_amounts, &c_old))
-      throw0(DB_ERROR("migrate_8_9: failed to open old cursor"));
+      throw0(DB_ERROR("migrate_7_8: failed to open old cursor"));
 
     if (mdb_cursor_open(txn, tmp, &c_tmp))
-      throw0(DB_ERROR("migrate_8_9: failed to open tmp cursor"));
+      throw0(DB_ERROR("migrate_7_8: failed to open tmp cursor"));
 
     MDB_val k, v;
 
@@ -6189,11 +6186,11 @@ void BlockchainLMDB::migrate_8_9()
         break;
 
       if (ret)
-        throw0(DB_ERROR(lmdb_error("migrate_8_9: enumerate old outputs: ", ret).c_str()));
+        throw0(DB_ERROR(lmdb_error("migrate_7_8: enumerate old outputs: ", ret).c_str()));
 
-      if (v.mv_size == sizeof(v8_outkey))
+      if (v.mv_size == sizeof(v7_outkey))
       {
-        const v8_outkey *old = static_cast<const v8_outkey *>(v.mv_data);
+        const v7_outkey *old = static_cast<const v7_outkey *>(v.mv_data);
 
         outkey nk{};
         nk.amount_index = old->amount_index;
@@ -6208,16 +6205,16 @@ void BlockchainLMDB::migrate_8_9()
         MDB_val nv{sizeof(outkey), &nk};
 
         if (mdb_cursor_put(c_tmp, &k, &nv, MDB_APPENDDUP))
-          throw0(DB_ERROR("migrate_8_9: failed to write converted rct output"));
+          throw0(DB_ERROR("migrate_7_8: failed to write converted rct output"));
 
-        // MGINFO_MAGENTA("migrate_8_9: converted rct output " << old->output_id << " at amount index " << old->amount_index);
+        // MGINFO_MAGENTA("migrate_7_8: converted rct output " << old->output_id << " at amount index " << old->amount_index);
       }
 
       else
       {
         // pre-rct record (or anything else): copy verbatim
         if (mdb_cursor_put(c_tmp, &k, &v, MDB_APPENDDUP))
-          throw0(DB_ERROR("migrate_8_9: failed to copy pre-rct output"));
+          throw0(DB_ERROR("migrate_7_8: failed to copy pre-rct output"));
       }
     }
 
@@ -6227,16 +6224,16 @@ void BlockchainLMDB::migrate_8_9()
 
   // 2b. empty the real table, then copy tmp back into it
   if (mdb_drop(txn, m_output_amounts, 0))
-    throw0(DB_ERROR("migrate_8_9: failed to empty m_output_amounts"));
+    throw0(DB_ERROR("migrate_7_8: failed to empty m_output_amounts"));
 
   {
     MDB_cursor *c_tmp = nullptr, *c_new = nullptr;
 
     if (mdb_cursor_open(txn, tmp, &c_tmp))
-      throw0(DB_ERROR("migrate_8_9: failed to reopen tmp cursor"));
+      throw0(DB_ERROR("migrate_7_8: failed to reopen tmp cursor"));
 
     if (mdb_cursor_open(txn, m_output_amounts, &c_new))
-      throw0(DB_ERROR("migrate_8_9: failed to reopen new cursor"));
+      throw0(DB_ERROR("migrate_7_8: failed to reopen new cursor"));
 
     MDB_val k, v;
 
@@ -6247,27 +6244,27 @@ void BlockchainLMDB::migrate_8_9()
         break;
 
       if (ret)
-        throw0(DB_ERROR(lmdb_error("migrate_8_9: enumerate tmp outputs: ", ret).c_str()));
+        throw0(DB_ERROR(lmdb_error("migrate_7_8: enumerate tmp outputs: ", ret).c_str()));
 
       if (mdb_cursor_put(c_new, &k, &v, MDB_APPENDDUP))
-        throw0(DB_ERROR("migrate_8_9: failed to copy output back"));
+        throw0(DB_ERROR("migrate_7_8: failed to copy output back"));
     }
 
-    MGINFO_YELLOW("migrate_8_9: copied outputs back into m_output_amounts");
+    MGINFO_YELLOW("migrate_7_8: copied outputs back into m_output_amounts");
     mdb_cursor_close(c_new);
     mdb_cursor_close(c_tmp);
   }
 
   // 2c. drop the temp table entirely
   if (mdb_drop(txn, tmp, 1))
-    throw0(DB_ERROR("migrate_8_9: failed to drop temp output table"));
+    throw0(DB_ERROR("migrate_7_8: failed to drop temp output table"));
 
   txn.commit();
 
-  if (int result = write_db_version(m_env, m_properties, (uint32_t)lmdb_version::v9))
+  if (int result = write_db_version(m_env, m_properties, (uint32_t)lmdb_version::v8))
     throw0(DB_ERROR(lmdb_error("Failed to update version for the db: ", result).c_str()));
 
-  MGINFO("migrate_8_9: completed in " << tools::friendly_duration(std::chrono::steady_clock::now() - migration_started));
+  MGINFO("migrate_7_8: completed in " << tools::friendly_duration(std::chrono::steady_clock::now() - migration_started));
 }
 
 void BlockchainLMDB::migrate(const uint32_t oldversion, cryptonote::network_type nettype)
@@ -6289,8 +6286,6 @@ void BlockchainLMDB::migrate(const uint32_t oldversion, cryptonote::network_type
     migrate_6_7(); /* FALLTHRU */
   case 7:
     migrate_7_8(); /* FALLTHRU */
-  case 8:
-    migrate_8_9(); /* FALLTHRU */
   default:
     break;
   }
