@@ -123,10 +123,16 @@ namespace lws
   static void write_bytes(wire::json_writer& dest, random_output const& self)
   {
     const rct_bytes rct{self.keys.mask, rct::zero(), rct::zero()};
+    // HF22: only present when this decoy is a private-token output. Absent
+    // means native, which is what beldex-core-cpp already assumes when the
+    // field is missing, so an ordinary BDX ring is unchanged.
+    const auto blinded_token_id = self.keys.blinded_token_id != crypto::null_tid ?
+      std::addressof(self.keys.blinded_token_id) : nullptr;
     wire::object(dest,
       wire::field("global_index", rpc::safe_uint64(self.index)),
       wire::field("public_key", std::cref(self.keys.key)),
-      wire::field("rct", std::cref(rct))
+      wire::field("rct", std::cref(rct)),
+      wire::optional_field("blinded_token_id", blinded_token_id)
     );
   }
   static void write_bytes(wire::json_writer& dest, random_ring const& self)

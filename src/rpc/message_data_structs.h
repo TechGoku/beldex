@@ -125,6 +125,10 @@ namespace rpc
     crypto::public_key key;
     rct::key mask;
     bool unlocked;
+    // HF22: null for a native output; the blinded token id T for a private
+    // token output. Carried so a light wallet can fill the X layer of a
+    // CLSAG-GGX ring for decoys it did not scan itself.
+    crypto::token_id blinded_token_id;
   };
 
   struct hard_fork_info

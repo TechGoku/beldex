@@ -252,12 +252,21 @@ namespace lws
 
           cryptonote::txout_to_key const* const out_data =
               std::get_if<cryptonote::txout_to_key>(std::addressof(out.target));
-          if (!out_data)
+          // HF22: a private-token output is a tx_out_zarcanum, which carries its
+          // one-time key as `stealth_address` rather than `key`. Ownership is
+          // decided identically from there. Before this, the get_if above
+          // returned null for these and every token output was silently skipped.
+          cryptonote::tx_out_zarcanum const* const zout_data =
+              std::get_if<cryptonote::tx_out_zarcanum>(std::addressof(out.target));
+          if (!out_data && !zout_data)
             continue; // to next output
+
+          const crypto::public_key& out_pub =
+              out_data ? out_data->key : zout_data->stealth_address;
 
           crypto::public_key derived_pub;
           const bool received =
-              crypto::wallet::derive_subaddress_public_key(out_data->key, derived, index, derived_pub) &&
+              crypto::wallet::derive_subaddress_public_key(out_pub, derived, index, derived_pub) &&
               derived_pub == user.spend_public();
 
           if (!received)
@@ -270,9 +279,32 @@ namespace lws
           }
 
           std::uint64_t amount = out.amount;
-          
+
           rct::key mask = rct::identity();
-          if (!amount && !(ext & db::coinbase_output) && cryptonote::txversion::v1 < tx.version)
+          crypto::token_id token_id = crypto::null_tid;
+          if (zout_data)
+          {
+            // HF22: recover the plaintext token id and amount. `acc` is unused
+            // by decode_zarcanum_output -- everything it needs comes from the
+            // derivation and the output itself -- which is what lets a
+            // view-only server decode these at all. It re-derives the amount
+            // commitment and returns false on mismatch, so a corrupt or
+            // misattributed output is rejected rather than stored wrong.
+            const cryptonote::account_keys view_only{};
+            rct::key amount_mask{};
+            rct::key token_blinding_mask{};
+            if (!cryptonote::decode_zarcanum_output(
+                  view_only, *zout_data, derived, index,
+                  amount, token_id, amount_mask, token_blinding_mask))
+            {
+              MWARNING(user.address() << " failed to decode private-token output for tx "
+                       << tx_hash << ", skipping output");
+              continue; // to next output
+            }
+            mask = amount_mask;
+            ext = db::extra(ext | db::ringct_output);
+          }
+          else if (!amount && !(ext & db::coinbase_output) && cryptonote::txversion::v1 < tx.version)
           {
             
             const bool bulletproof2 = true;
@@ -313,11 +345,20 @@ namespace lws
                   tx.unlock_time,
                   *prefix_hash,
                   locked_key_image ? *locked_key_image : crypto::key_image{},
-                  out_data->key,
+                  out_pub,
                   mask,
                   {0, 0, 0, 0, 0, 0, 0}, // reserved bytes
                   db::pack(ext, payment_id.first),
-                  payment_id.second
+                  payment_id.second,
+                  // HF22 private tokens. All zero for an ordinary BDX output.
+                  // The blinded id, commitment and encrypted amount are stored
+                  // verbatim because the wallet re-derives its own blinding
+                  // scalar from them when spending; that scalar has no other
+                  // source and the server cannot supply it.
+                  zout_data ? reinterpret_cast<const crypto::public_key&>(token_id) : crypto::public_key{},
+                  zout_data ? reinterpret_cast<const crypto::public_key&>(zout_data->blinded_token_id) : crypto::public_key{},
+                  zout_data ? zout_data->amount_commitment : crypto::public_key{},
+                  zout_data ? zout_data->encrypted_amount : std::uint64_t(0)
             }
           );
 

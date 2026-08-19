@@ -659,12 +659,97 @@ namespace db
     // remain valid across this migration.
   }
 
+  // Migrate the `outputs` table from the pre-private-token layout (v2) to the
+  // current one (v3), which appends the four private-token fields. Same
+  // guarantees as migrate_1_2 above: fresh DB is a no-op, already-v3 rows are
+  // left alone, an unrecognised record size aborts the txn rather than
+  // guessing, and no spend rows are touched.
+  //
+  // Every existing row predates HF22 and so cannot be a token output; they all
+  // get zeroed token fields, which is exactly what "ordinary BDX output" means
+  // to the reader.
+  void migrate_2_3(MDB_txn& txn, tables_ const& tables)
+  {
+    MINFO("Checking outputs for private-token field migration (v2 -> v3)");
+
+    cursor::outputs cur;
+    const expect<void> opened = check_cursor(txn, tables.outputs, cur);
+    if (!opened)
+      MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
+
+    struct owned_key { std::vector<unsigned char> data; };
+    std::vector<owned_key> keys;
+    std::vector<output> values;
+
+    MDB_val key{}, value{};
+    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+
+    while (err == 0)
+    {
+      if (value.mv_size == sizeof(output))
+      {
+        err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
+        continue;
+      }
+      if (value.mv_size != sizeof(output_v2))
+      {
+        MONERO_THROW(lws::error::bad_blockchain,
+          "Unexpected output record size during migration; refusing to modify the database");
+      }
+
+      const auto& old = *reinterpret_cast<const output_v2*>(value.mv_data);
+      output v3{};
+      v3.link = old.link;
+      v3.spend_meta.id = old.spend_meta.id;
+      v3.spend_meta.amount = old.spend_meta.amount;
+      v3.spend_meta.mixin_count = old.spend_meta.mixin_count;
+      v3.spend_meta.index = old.spend_meta.index;
+      v3.spend_meta.tx_public = old.spend_meta.tx_public;
+      v3.timestamp = old.timestamp;
+      v3.unlock_time = old.unlock_time;
+      v3.tx_prefix_hash = old.tx_prefix_hash;
+      v3.locked_key_image = old.locked_key_image;
+      v3.pub = old.pub;
+      v3.ringct_mask = old.ringct_mask;
+      std::memcpy(v3.reserved, old.reserved, sizeof(v3.reserved));
+      v3.extra = old.extra;
+      std::memcpy(&v3.payment_id, &old.payment_id, sizeof(v3.payment_id));
+      // Token fields stay zeroed: no output predating HF22 is a token output.
+
+      owned_key k;
+      k.data.assign(static_cast<unsigned char*>(key.mv_data), static_cast<unsigned char*>(key.mv_data) + key.mv_size);
+      keys.push_back(std::move(k));
+      values.push_back(v3);
+
+      err = mdb_cursor_del(cur.get(), 0);
+      if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
+      err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
+    }
+
+    if (err != MDB_NOTFOUND) MONERO_THROW(lmdb::error(err), "cursor iteration failed");
+
+    for (std::size_t i = 0; i < values.size(); ++i)
+    {
+      MDB_val k{ keys[i].data.size(), keys[i].data.data() };
+      MDB_val v = lmdb::to_val(values[i]);
+      err = mdb_put(&txn, tables.outputs, &k, &v, 0);
+      if (err) MONERO_THROW(lmdb::error(err), "mdb_put failed");
+    }
+
+    MINFO("Private-token field migration complete: converted " << values.size() << " row(s)");
+  }
+
   expect<void> migrate(MDB_txn& txn, tables_ const& tables, unsigned oldversion)
   {
     if (oldversion < 2)
     {
       migrate_1_2(txn, tables);
       MONERO_CHECK(complete_migration(txn, tables, 2));
+    }
+    if (oldversion < 3)
+    {
+      migrate_2_3(txn, tables);
+      MONERO_CHECK(complete_migration(txn, tables, 3));
     }
     return success();
   }
@@ -704,7 +789,9 @@ namespace db
         }
     }
 
-    if (current_version < 2) {
+    // Keep this in step with the highest version migrate() knows about, or a
+    // DB one version behind is silently left unmigrated.
+    if (current_version < 3) {
         expect<void> result = this->migrate(*txn, tables, current_version);
         if (!result) {
             MONERO_THROW(result.error(), "Migration failed");

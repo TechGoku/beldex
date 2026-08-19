@@ -168,8 +168,23 @@ namespace db
       crypto::hash8 short_;  //!< Decrypted short payment id
       crypto::hash long_;    //!< Long version of payment id (always decrypted)
     } payment_id;
+
+    // ── HF22 private tokens ─────────────────────────────────────────────
+    // All zero for an ordinary BDX output; `token_id != null` is what marks
+    // this as a tx_out_zarcanum. Appended at the end so the LMDB DUPSORT
+    // comparator, which orders on the leading `link` and `id`, is unaffected.
+    //
+    // `token_id` is the plaintext id recovered by decode_zarcanum_output. The
+    // other three are copied verbatim off the chain because the wallet needs
+    // them to rebuild the output and recover its own blinding scalar when
+    // spending -- that scalar has no other source, and the server cannot
+    // derive it on the wallet's behalf.
+    crypto::public_key token_id;
+    crypto::public_key blinded_token_id;
+    crypto::public_key amount_commitment;
+    std::uint64_t encrypted_amount;
   };
-  static_assert(sizeof(output) == 8 + 32 + (8 * 3) + (4 * 2) + 32 + (8 * 2) + (32 * 4) + 7 + 1 + 32, "padding in output");
+  static_assert(sizeof(output) == 8 + 32 + (8 * 3) + (4 * 2) + 32 + (8 * 2) + (32 * 4) + 7 + 1 + 32 + (32 * 3) + 8, "padding in output");
   void write_bytes(wire::writer&, const output&);
 
   //! Information about a possible spend of a received `output`.

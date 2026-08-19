@@ -1424,6 +1424,12 @@ namespace lws
                 tools::hex_to_type(key_p, key.key);
                 tools::hex_to_type(it.at("mask").get<std::string>(), key.mask);
                 key.unlocked = it.at("unlocked");
+                // HF22: optional so an older daemon that does not send it still
+                // works -- the decoy is then simply treated as native, which is
+                // what a null blinded token id means.
+                key.blinded_token_id = crypto::null_tid;
+                if (const auto btid = it.find("blinded_token_id"); btid != it.end() && btid->is_string())
+                  tools::hex_to_type(btid->get<std::string>(), key.blinded_token_id);
                 keys.push_back(key);
               }
             }

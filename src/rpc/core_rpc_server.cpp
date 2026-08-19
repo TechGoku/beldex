@@ -813,6 +813,11 @@ namespace cryptonote::rpc {
         b["mask"] = std::move(outkey.mask);
         o["unlocked"] = outkey.unlocked;
         o["height"] = outkey.height;
+        // HF22: a decoy chosen for a private-token ring needs its blinded token
+        // id, which is the third (X) layer of the CLSAG-GGX ring and has no
+        // other source for a light wallet. Emitted only in the dict form --
+        // the tuple form's element order is part of its contract.
+        b["blinded_token_id"] = outkey.blinded_token_id;
         if (get_outputs.request.get_txid)
           b["txid"] = std::move(outkey.txid);
         outs.push_back(std::move(o));

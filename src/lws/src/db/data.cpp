@@ -97,6 +97,15 @@ namespace db
     const auto payment_id = payment_bytes.empty() ?
       nullptr : std::addressof(payment_bytes);
 
+    // HF22: emitted only for a private-token output, so an ordinary BDX output
+    // serializes byte-for-byte as it always has and existing clients are
+    // unaffected. A zero token_id is what "not a token output" means.
+    const bool is_token = (self.token_id != crypto::public_key{});
+    const auto token_id = is_token ? std::addressof(self.token_id) : nullptr;
+    const auto blinded_token_id = is_token ? std::addressof(self.blinded_token_id) : nullptr;
+    const auto amount_commitment = is_token ? std::addressof(self.amount_commitment) : nullptr;
+    const auto encrypted_amount = is_token ? std::addressof(self.encrypted_amount) : nullptr;
+
     wire::object(dest,
       wire::field("id", std::cref(self.spend_meta.id)),
       wire::field("block", self.link.height),
@@ -111,7 +120,11 @@ namespace db
       wire::optional_field("payment_id", payment_id),
       wire::field("unlock_time", self.unlock_time),
       wire::field("mixin_count", self.spend_meta.mixin_count),
-      wire::field("coinbase", coinbase)
+      wire::field("coinbase", coinbase),
+      wire::optional_field("token_id", token_id),
+      wire::optional_field("blinded_token_id", blinded_token_id),
+      wire::optional_field("amount_commitment", amount_commitment),
+      wire::optional_field("encrypted_amount", encrypted_amount)
     );
   }
 

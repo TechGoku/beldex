@@ -19,6 +19,7 @@ namespace tools {
   template <> inline constexpr bool json_is_binary<crypto::ed25519_public_key> = true;
   template <> inline constexpr bool json_is_binary<crypto::x25519_public_key> = true;
   template <> inline constexpr bool json_is_binary<crypto::key_image> = true;
+  template <> inline constexpr bool json_is_binary<crypto::token_id> = true;
   template <> inline constexpr bool json_is_binary<rct::key> = true;
 
   template <typename T>
