@@ -1023,7 +1023,26 @@ namespace lws
           return {lws::error::bad_daemon_response};
         }
 
-        return response{fee_per_byte, fee_per_output,flash_fee_per_byte,flash_fee_per_output,flash_fee_fixed,quantization_mask,17,rpc::safe_uint64(received), std::move(unspent), std::move(req.creds.key), next_min_height};
+        // The chain tip. HF22 token registration locks its collateral output to
+        // an absolute height, so the client needs to know where the chain is.
+        std::uint64_t blockchain_height = 0;
+        if (const expect<db::block_info> last = user->second.get_last_block())
+          blockchain_height = std::uint64_t(last->id);
+
+        // TODO: report the daemon's real fork version here. This was pinned at
+        // 17, which silently disabled every client-side gate above it --
+        // including the whole HF22 private-token path, since the client tests
+        // fork_version >= HF_VERSION_PRIVATE_TOKENS before it will build a
+        // token transaction at all. Pinned to 22 so the feature is reachable;
+        // it must become dynamic before this serves a real network, or the
+        // client will try to build token transactions on a chain that has not
+        // forked yet.
+        constexpr std::uint64_t PINNED_FORK_VERSION = 22;
+
+        return response{fee_per_byte, fee_per_output, flash_fee_per_byte, flash_fee_per_output,
+                        flash_fee_fixed, quantization_mask, PINNED_FORK_VERSION,
+                        rpc::safe_uint64(received), std::move(unspent),
+                        std::move(req.creds.key), next_min_height, blockchain_height};
       }
     };//get_unspent_outs
 

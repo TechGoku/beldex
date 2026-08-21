@@ -362,6 +362,7 @@ namespace lws
       // WIRE_FIELD_COPY(fee_mask),
       WIRE_FIELD_COPY(amount),
       WIRE_FIELD_COPY(next_min_height),
+      WIRE_FIELD_COPY(blockchain_height),
       wire::field("outputs", wire::as_array(std::cref(self.outputs), expand))
     );
   }

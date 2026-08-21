@@ -210,6 +210,10 @@ namespace rpc
       std::vector<std::pair<db::output, std::vector<crypto::key_image>>> outputs;
       crypto::secret_key user_key;
       std::uint64_t next_min_height; //!< 0 = last page; else min_height for the next page
+      //! Current chain tip. HF22 token registration must lock its collateral
+      //! output to an absolute height, so the client has to know where the
+      //! chain is; nothing else in this response conveys that.
+      std::uint64_t blockchain_height;
     };
     void write_bytes(wire::json_writer&, const get_unspent_outs_response&);
 
