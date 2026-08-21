@@ -152,14 +152,17 @@ namespace cryptonote { enum class token_descriptor_operation_type : uint8_t; }
 
 namespace tokens
 {
+inline constexpr uint64_t REGISTRATION_COLLATERAL_AMOUNT = 10'000 * beldex::COIN;
+inline constexpr uint64_t REGISTRATION_COLLATERAL_LOCK_BLOCKS = 2880 * 30 * 6;
+
 constexpr uint64_t burn_needed(cryptonote::hf hf_version, cryptonote::token_descriptor_operation_type op_type)
 {
   uint64_t basic_fee = 100 * beldex::COIN; 
 
   switch (static_cast<uint8_t>(op_type))
   {
-    case 1: // register_token (deploy_new_token)
-      return basic_fee * 2; // Higher fee (e.g. 200 BDX)
+    case 1: // register_token (register_private_token)
+      return 0; // Registration uses locked collateral instead of burning BDX.
     case 2: // mint_token
       return basic_fee / 2;  // Slightly low (e.g. 50 BDX)
     case 3: // update_token

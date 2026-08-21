@@ -50,6 +50,7 @@
 #include "common/i18n.h"
 #include "common/signal_handler.h"
 #include "cryptonote_config.h"
+#include "cryptonote_basic/token_descriptor.h"
 #include "cryptonote_basic/token_descriptor_operation_utils.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "common/file.h"
@@ -83,173 +84,6 @@ namespace
   const command_line::arg_descriptor<bool> arg_prompt_for_password = {"prompt-for-password", "Prompts for password when not provided", false};
 
   constexpr const char default_rpc_username[] = "beldex";
-
-  bool validate_token_descriptor_for_deploy(const cryptonote::token_descriptor_base& descriptor, std::string& error)
-  {
-    auto ticker_ok = [](std::string_view ticker) {
-      return !ticker.empty() && ticker.size() <= 14 &&
-             std::all_of(ticker.begin(), ticker.end(), [](unsigned char c) { return std::isalnum(c); });
-    };
-    auto full_name_ok = [](std::string_view name) {
-      return !name.empty() &&
-             std::all_of(name.begin(), name.end(), [](unsigned char c) {
-               return std::isalnum(c) || c == ' ' || c == '_' || c == '-' || c == '.';
-             });
-    };
-
-    if (!ticker_ok(descriptor.ticker))
-    {
-      error = "ticker is invalid; expected 1-14 alphanumeric characters";
-      return false;
-    }
-    if (!full_name_ok(descriptor.full_name))
-    {
-      error = "full_name contains unsupported characters";
-      return false;
-    }
-    if (descriptor.decimal_point > 18)
-    {
-      error = "decimal_point must be <= 18";
-      return false;
-    }
-    if (descriptor.total_max_supply == 0)
-    {
-      error = "total_max_supply must be greater than 0";
-      return false;
-    }
-    if (descriptor.current_supply > descriptor.total_max_supply)
-    {
-      error = "current_supply cannot exceed total_max_supply";
-      return false;
-    }
-    if (descriptor.meta_info.length() > 4096)
-    {
-      error = "meta_info cannot exceed 4096 characters";
-      return false;
-    }
-    return true;
-  }
-
-  bool load_token_descriptor_from_json(
-      std::string_view data,
-      cryptonote::token_descriptor_base& descriptor,
-      std::string& error)
-  {
-    rapidjson::Document json;
-    if (json.Parse(data.data(), data.size()).HasParseError())
-    {
-      error = "Token specification is not valid JSON";
-      return false;
-    }
-    if (!json.IsObject())
-    {
-      error = "Token specification root must be a JSON object";
-      return false;
-    }
-
-    auto assign_string = [&](const char* field, std::string& target) -> bool {
-      if (!json.HasMember(field))
-        return true;
-      if (!json[field].IsString())
-      {
-        error = std::string{field} + " must be a string";
-        return false;
-      }
-      target = json[field].GetString();
-      return true;
-    };
-    auto assign_uint64 = [&](const char* field, uint64_t& target) -> bool {
-      if (!json.HasMember(field))
-        return true;
-      if (!json[field].IsUint64())
-      {
-        error = std::string{field} + " must be an unsigned integer";
-        return false;
-      }
-      target = json[field].GetUint64();
-      return true;
-    };
-    auto assign_uint8 = [&](const char* field, uint8_t& target) -> bool {
-      if (!json.HasMember(field))
-        return true;
-      if (!json[field].IsUint())
-      {
-        error = std::string{field} + " must be an unsigned integer";
-        return false;
-      }
-      unsigned value = json[field].GetUint();
-      if (value > std::numeric_limits<uint8_t>::max())
-      {
-        error = std::string{field} + " is out of range";
-        return false;
-      }
-      target = static_cast<uint8_t>(value);
-      return true;
-    };
-    auto assign_bool = [&](const char* field, bool& target) -> bool {
-      if (!json.HasMember(field))
-        return true;
-      if (!json[field].IsBool())
-      {
-        error = std::string{field} + " must be a boolean";
-        return false;
-      }
-      target = json[field].GetBool();
-      return true;
-    };
-
-    if (!assign_uint8("version", descriptor.version) ||
-        !assign_uint64("total_max_supply", descriptor.total_max_supply) ||
-        !assign_uint64("current_supply", descriptor.current_supply) ||
-        !assign_uint8("decimal_point", descriptor.decimal_point) ||
-        !assign_string("ticker", descriptor.ticker) ||
-        !assign_string("full_name", descriptor.full_name) ||
-        !assign_string("meta_info", descriptor.meta_info))
-      return false;
-
-    if (json.HasMember("owner"))
-    {
-      const auto& owner = json["owner"];
-      if (!owner.IsString())
-      {
-        error = "owner must be a hex-encoded public key or address";
-        return false;
-      }
-      std::string owner_str = owner.GetString();
-
-      cryptonote::address_parse_info owner_info;
-      if (cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::MAINNET, owner_str) ||
-          cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::TESTNET, owner_str))
-      {
-        if (owner_info.is_subaddress)
-        {
-          error = "owner cannot be a subaddress";
-          return false;
-        }
-        descriptor.owner = owner_info.address.m_spend_public_key;
-      } else if (!tools::hex_to_type(owner_str, descriptor.owner)) {
-        error = "owner must be a hex-encoded public key or valid address";
-        return false;
-      }
-    }
-
-    return validate_token_descriptor_for_deploy(descriptor, error);
-  }
-
-  bool load_token_descriptor_from_json_file(
-      const fs::path& filename,
-      cryptonote::token_descriptor_base& descriptor,
-      std::string& error)
-  {
-    std::string data;
-    if (!tools::slurp_file(filename, data))
-    {
-      error = "Failed to read token specification file";
-      return false;
-    }
-
-    return load_token_descriptor_from_json(data, descriptor, error);
-  }
 
   std::optional<tools::password_container> password_prompter(const char *prompt, bool verify)
   {
@@ -821,17 +655,12 @@ namespace tools
       // HF21: aggregate per-token balances from ZC transfer details
       {
         std::map<crypto::token_id, uint64_t> token_total, token_unlocked;
-        const uint64_t blockchain_height = m_wallet->get_blockchain_current_height();
         for (const auto& td : transfers)
         {
           if (!td.is_zarcanum() || td.m_spent) continue;
           if (!req.all_accounts && td.m_subaddr_index.major != req.account_index) continue;
           if (!req.address_indices.empty() && req.address_indices.count(td.m_subaddr_index.minor) == 0) continue;
-          const uint64_t unlock_time = td.m_tx.unlock_time;
-          const bool unlocked = (unlock_time == 0) ||
-              (unlock_time < cryptonote::MAX_BLOCK_NUMBER
-                  ? blockchain_height >= unlock_time
-                  : (uint64_t)std::time(nullptr) >= unlock_time);
+          const bool unlocked = m_wallet->is_transfer_unlocked(td);
           token_total[td.m_token_id] += td.m_amount;
           if (unlocked) token_unlocked[td.m_token_id] += td.m_amount;
         }
@@ -905,11 +734,7 @@ namespace tools
           {
             if (!td.is_zarcanum() || td.m_spent) continue;
             if (td.m_subaddr_index != index) continue;
-            const uint64_t unlock_time = td.m_tx.unlock_time;
-            const bool unlocked = (unlock_time == 0) ||
-                (unlock_time < cryptonote::MAX_BLOCK_NUMBER
-                    ? blockchain_height >= unlock_time
-                    : (uint64_t)std::time(nullptr) >= unlock_time);
+            const bool unlocked = m_wallet->is_transfer_unlocked(td);
             subaddr_token_total[td.m_token_id] += td.m_amount;
             if (unlocked) subaddr_token_unlocked[td.m_token_id] += td.m_amount;
           }
@@ -2102,6 +1927,7 @@ namespace tools
         rpc_transfers.block_height = td.m_block_height;
         rpc_transfers.frozen       = td.m_frozen;
         rpc_transfers.unlocked     = m_wallet->is_transfer_unlocked(td);
+        rpc_transfers.unlock_time  = td.m_tx.get_unlock_time(td.m_internal_output_index);
       }
     }
 
@@ -4003,11 +3829,11 @@ namespace {
     m_stop = true;
   }
 
-  // HF21: deploy a new private token
-  DEPLOY_NEW_TOKEN::response wallet_rpc_server::invoke(DEPLOY_NEW_TOKEN::request&& req)
+  // HF21: register a new private token
+  REGISTER_PRIVATE_TOKEN::response wallet_rpc_server::invoke(REGISTER_PRIVATE_TOKEN::request&& req)
   {
     require_open();
-    DEPLOY_NEW_TOKEN::response res{};
+    REGISTER_PRIVATE_TOKEN::response res{};
 
     // 1. Validate request
     if (req.json_string.empty())
@@ -4016,25 +3842,21 @@ namespace {
     // 2. Load descriptor from inline JSON
     cryptonote::token_descriptor_base descriptor{};
     std::string error;
-    if (!load_token_descriptor_from_json(req.json_string, descriptor, error))
+    if (!cryptonote::load_token_descriptor_from_json(req.json_string, descriptor, error))
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error};
 
-    // 3. Validate descriptor
-    if (!validate_token_descriptor_for_deploy(descriptor, error))
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Invalid descriptor: " + error};
-
-    // 4. Set owner to wallet's spend key if not provided
+    // 3. Set owner to wallet's spend key if not provided
     const auto owner = m_wallet->get_account().get_keys().m_account_address.m_spend_public_key;
     if (descriptor.owner == crypto::null_pkey)
       descriptor.owner = owner;
     else if (descriptor.owner != owner)
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Token owner must be this wallet's spend key"};
 
-    // 5. Verify hard fork version
+    // 4. Verify hard fork version
     if (!m_wallet->get_hard_fork_version())
       throw wallet_rpc_error{error_code::HF_QUERY_FAILED, tools::ERR_MSG_NETWORK_VERSION_QUERY_FAILED};
 
-    // 6. Create TDO (Token Descriptor Operation)
+    // 5. Create TDO (Token Descriptor Operation)
     cryptonote::tx_extra_token_descriptor_operation tdo{};
     tdo.operation_type = cryptonote::token_descriptor_operation_type::register_token;
     tdo.fields         = static_cast<uint8_t>(cryptonote::token_field_descriptor |
@@ -4042,15 +3864,15 @@ namespace {
     tdo.descriptor     = descriptor;
     tdo.token_id_salt  = crypto::rand<uint32_t>();
 
-    // 7. Encode TDO into tx extra
+    // 6. Encode TDO into tx extra
     std::vector<uint8_t> extra;
     if (!cryptonote::add_token_descriptor_operation_to_tx_extra(extra, tdo))
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to encode token descriptor into tx extra"};
 
-    // 8. Calculate token ID
+    // 7. Calculate token ID
     const crypto::token_id token_id = cryptonote::get_or_calculate_token_id(tdo);
 
-    // 9. Create destination with initial supply
+    // 8. Create destination with initial supply
     std::vector<cryptonote::tx_destination_entry> dsts;
     if (descriptor.current_supply > 0)
     {
@@ -4062,22 +3884,22 @@ namespace {
       dsts.push_back(dest);
     }
 
-    // 10. Create transaction
+    // 9. Create transaction
     std::set<uint32_t> subaddr_indices = req.subaddr_indices;
-    auto ptx_vector = m_wallet->create_token_deploy_tx(
+    auto ptx_vector = m_wallet->create_private_token_registration_tx(
         dsts, token_id, cryptonote::TX_OUTPUT_DECOYS, req.priority, extra,
         req.account_index, subaddr_indices);
 
     if (ptx_vector.empty())
       throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "No outputs found or daemon not ready"};
     if (ptx_vector.size() != 1)
-      throw wallet_rpc_error{error_code::TX_TOO_LARGE, "Transaction would be too large. Try a simpler token deployment."};
+      throw wallet_rpc_error{error_code::TX_TOO_LARGE, "Transaction would be too large. Try a simpler token registration."};
 
-    // 11. Relay or mark as pending
+    // 10. Relay or mark as pending
     if (!req.do_not_relay)
       m_wallet->commit_tx(ptx_vector.front());
 
-    // 12. Build response
+    // 11. Build response
     res.token_id = tools::type_to_hex(token_id);
     res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(ptx_vector.front().tx));
     res.ticker = descriptor.ticker;
@@ -4316,9 +4138,9 @@ namespace {
     std::string error;
     bool loaded = false;
     if (!req.json_string.empty())
-      loaded = load_token_descriptor_from_json(req.json_string, file_adb, error);
+      loaded = cryptonote::load_token_descriptor_from_json(req.json_string, file_adb, error, cryptonote::token_descriptor_json_mode::update);
     else
-      loaded = load_token_descriptor_from_json_file(fs::u8path(req.json_filename), file_adb, error);
+      loaded = cryptonote::load_token_descriptor_from_json_file(fs::u8path(req.json_filename), file_adb, error, cryptonote::token_descriptor_json_mode::update);
 
     if (!loaded)
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error + (req.json_string.empty() ? (": " + req.json_filename) : "")};

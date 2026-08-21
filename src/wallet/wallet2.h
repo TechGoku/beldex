@@ -773,10 +773,10 @@ private:
     bool parse_tx_from_str(std::string_view signed_tx_st, std::vector<pending_tx> &ptx, std::function<bool(const signed_tx_set &)> accept_func);
     std::vector<pending_tx> create_transactions_2(std::vector<cryptonote::tx_destination_entry> dsts, const size_t fake_outs_count, const uint64_t unlock_time, uint32_t priority, const std::vector<uint8_t>& extra_base, uint32_t subaddr_account, std::set<uint32_t> subaddr_indices, cryptonote::beldex_construct_tx_params &tx_params, const unique_index_container& subtract_fee_from_outputs = {});     // pass subaddr_indices by value on purpose
 
-    // HF21: build a deploy_new_token or mint_token transaction.
+    // HF21: build a register_private_token or mint_token transaction.
     // Automatically pads ZC destinations with self-sends to reach
     // MIN_TOKEN_MINT_OUTPUTS so the blockchain fan-out rule passes.
-    std::vector<pending_tx> create_token_deploy_tx(
+    std::vector<pending_tx> create_private_token_registration_tx(
         std::vector<cryptonote::tx_destination_entry> dsts,
         const crypto::token_id& token_id,
         const size_t fake_outs_count,

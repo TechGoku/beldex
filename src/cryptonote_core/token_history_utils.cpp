@@ -425,10 +425,10 @@ bool validate_tx_token_operations_against_db(
   {
     saw_token_op = true;
 
-    if (tx.type != txtype::deploy_new_token && tx.type != txtype::mint_token &&
+    if (tx.type != txtype::register_private_token && tx.type != txtype::mint_token &&
         tx.type != txtype::update_token && tx.type != txtype::burn_token)
     {
-      reason = "token descriptor operation is only allowed in deploy_new_token, mint_token, update_token or burn_token transactions";
+      reason = "token descriptor operation is only allowed in register_private_token, mint_token, update_token or burn_token transactions";
       return false;
     }
 
@@ -530,7 +530,7 @@ bool validate_tx_token_operations_against_db(
     }
   }
 
-  if ((tx.type == txtype::deploy_new_token || tx.type == txtype::mint_token || tx.type == txtype::update_token) && !saw_token_op)
+  if ((tx.type == txtype::register_private_token || tx.type == txtype::mint_token || tx.type == txtype::update_token) && !saw_token_op)
   {
     reason = "deploy/mint/update transaction must include at least one token descriptor operation";
     return false;

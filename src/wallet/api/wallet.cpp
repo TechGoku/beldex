@@ -45,13 +45,12 @@
 #include "common_defines.h"
 #include "common/util.h"
 #include "common/fs.h"
+#include "cryptonote_basic/token_descriptor.h"
 #include "cryptonote_basic/token_descriptor_operation_utils.h"
 
 #include "mnemonics/electrum-words.h"
 #include "mnemonics/english.h"
 #include <boost/format.hpp>
-#include <cctype>
-#include <rapidjson/document.h>
 #include <sstream>
 #include <unordered_map>
 #include <thread>
@@ -89,147 +88,6 @@ namespace {
         if (!token_id) return false;
         return token_id->empty() || *token_id == "BDX" || *token_id == "bdx" ||
                *token_id == "native" || *token_id == "NATIVE";
-    }
-
-    bool validate_token_descriptor_for_deploy(const cryptonote::token_descriptor_base& descriptor, std::string& error)
-    {
-        auto ticker_ok = [](std::string_view ticker) {
-            return !ticker.empty() && ticker.size() <= 14 &&
-                   std::all_of(ticker.begin(), ticker.end(), [](unsigned char c) { return std::isalnum(c); });
-        };
-        auto full_name_ok = [](std::string_view name) {
-            return !name.empty() &&
-                   std::all_of(name.begin(), name.end(), [](unsigned char c) {
-                       return std::isalnum(c) || c == ' ' || c == '_' || c == '-' || c == '.';
-                   });
-        };
-
-        if (!ticker_ok(descriptor.ticker))
-        {
-            error = "ticker is invalid; expected 1-14 alphanumeric characters";
-            return false;
-        }
-        if (!full_name_ok(descriptor.full_name))
-        {
-            error = "full_name contains unsupported characters";
-            return false;
-        }
-        if (descriptor.decimal_point > 18)
-        {
-            error = "decimal_point must be <= 18";
-            return false;
-        }
-        if (descriptor.total_max_supply == 0)
-        {
-            error = "total_max_supply must be greater than 0";
-            return false;
-        }
-        if (descriptor.current_supply > descriptor.total_max_supply)
-        {
-            error = "current_supply cannot exceed total_max_supply";
-            return false;
-        }
-        if (descriptor.meta_info.length() > 4096)
-        {
-            error = "meta_info cannot exceed 4096 characters";
-            return false;
-        }
-        return true;
-    }
-
-    bool load_token_descriptor_from_json(
-            std::string_view data,
-            cryptonote::token_descriptor_base& descriptor,
-            std::string& error)
-    {
-        rapidjson::Document json;
-        if (json.Parse(data.data(), data.size()).HasParseError())
-        {
-            error = "invalid JSON";
-            return false;
-        }
-
-        if (!json.IsObject())
-        {
-            error = "top-level JSON must be an object";
-            return false;
-        }
-
-        auto get_string = [&](const char* key, std::string& out, bool required) -> bool {
-            auto it = json.FindMember(key);
-            if (it == json.MemberEnd())
-            {
-                if (required)
-                {
-                    error = std::string{"missing required field: "} + key;
-                    return false;
-                }
-                return true;
-            }
-            if (!it->value.IsString())
-            {
-                error = std::string{"field '"} + key + "' must be a string";
-                return false;
-            }
-            out = {it->value.GetString(), it->value.GetStringLength()};
-            return true;
-        };
-
-        auto get_uint = [&](const char* key, uint64_t& out, bool required) -> bool {
-            auto it = json.FindMember(key);
-            if (it == json.MemberEnd())
-            {
-                if (required)
-                {
-                    error = std::string{"missing required field: "} + key;
-                    return false;
-                }
-                return true;
-            }
-            if (!it->value.IsUint64())
-            {
-                error = std::string{"field '"} + key + "' must be an unsigned integer";
-                return false;
-            }
-            out = it->value.GetUint64();
-            return true;
-        };
-
-        uint64_t decimal_point = 0;
-        std::string owner_str;
-
-        if (!get_string("ticker", descriptor.ticker, true) ||
-            !get_string("full_name", descriptor.full_name, true) ||
-            !get_string("meta_info", descriptor.meta_info, false) ||
-            !get_uint("total_max_supply", descriptor.total_max_supply, true) ||
-            !get_uint("current_supply", descriptor.current_supply, false) ||
-            !get_uint("decimal_point", decimal_point, false) ||
-            !get_string("owner", owner_str, false))
-            return false;
-
-        descriptor.decimal_point = decimal_point;
-        descriptor.owner = crypto::null_pkey;
-        if (!owner_str.empty())
-        {
-            cryptonote::address_parse_info owner_info{};
-            if (cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::MAINNET, owner_str) ||
-                cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::TESTNET, owner_str))
-            {
-                if (owner_info.is_subaddress)
-                {
-                    error = "field 'owner' cannot be a subaddress";
-                    return false;
-                }
-                descriptor.owner = owner_info.address.m_spend_public_key;
-            }
-            else if (!tools::hex_to_type(owner_str, descriptor.owner))
-            {
-                error = "field 'owner' must be a valid public key hex string or address";
-                return false;
-            }
-        }
-
-        return true;
     }
 
     void checkMultisigWalletReady(LockedWallet& wallet) {
@@ -2176,7 +2034,7 @@ PendingTransaction *WalletImpl::createSweepAllTransaction(std::optional<std::str
 }
 
 EXPORT
-PendingTransaction *WalletImpl::deployNewTokenTransaction(const std::string& descriptor_json, std::string& token_id, uint32_t priority, uint32_t subaddr_account, std::set<uint32_t> subaddr_indices)
+PendingTransaction *WalletImpl::registerPrivateTokenTransaction(const std::string& descriptor_json, std::string& token_id, uint32_t priority, uint32_t subaddr_account, std::set<uint32_t> subaddr_indices)
 {
     clearStatus();
     pauseRefresh();
@@ -2192,13 +2050,8 @@ PendingTransaction *WalletImpl::deployNewTokenTransaction(const std::string& des
 
         cryptonote::token_descriptor_base descriptor{};
         std::string error;
-        if (!load_token_descriptor_from_json(descriptor_json, descriptor, error)) {
+        if (!cryptonote::load_token_descriptor_from_json(descriptor_json, descriptor, error)) {
             setStatusError(tr("Invalid token descriptor JSON: ") + error);
-            break;
-        }
-
-        if (!validate_token_descriptor_for_deploy(descriptor, error)) {
-            setStatusError(tr("Invalid token descriptor: ") + error);
             break;
         }
 
@@ -2243,7 +2096,7 @@ PendingTransaction *WalletImpl::deployNewTokenTransaction(const std::string& des
         }
 
         try {
-            transaction->m_pending_tx = w->create_token_deploy_tx(
+            transaction->m_pending_tx = w->create_private_token_registration_tx(
                     dsts,
                     computed_token_id,
                     cryptonote::TX_OUTPUT_DECOYS,
@@ -2613,7 +2466,7 @@ PendingTransaction *WalletImpl::updateTokenTransaction(const std::string& token_
 
         cryptonote::token_descriptor_base json_adb = adb;
         std::string error;
-        if (!load_token_descriptor_from_json(descriptor_json, json_adb, error)) {
+        if (!cryptonote::load_token_descriptor_from_json(descriptor_json, json_adb, error, cryptonote::token_descriptor_json_mode::update)) {
             setStatusError(tr("Invalid token descriptor JSON: ") + error);
             break;
         }

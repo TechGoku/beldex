@@ -189,7 +189,7 @@ public:
                                         uint32_t priority = 0,
                                         uint32_t subaddr_account = 0,
                                         std::set<uint32_t> subaddr_indices = {}) override;
-    PendingTransaction* deployNewTokenTransaction(const std::string& descriptor_json,
+    PendingTransaction* registerPrivateTokenTransaction(const std::string& descriptor_json,
                                         std::string& token_id,
                                         uint32_t priority = 0,
                                         uint32_t subaddr_account = 0,

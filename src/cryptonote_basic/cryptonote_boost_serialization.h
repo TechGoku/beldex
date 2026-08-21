@@ -226,7 +226,7 @@ namespace boost
       if (x.rct_signatures.type != rct::RCTType::Null)
         a & x.rct_signatures.p;
 
-      if (ver >= 1)
+      if (ver >= boost::serialization::version_type{1})
         a & x.token_proofs;
     }
   }

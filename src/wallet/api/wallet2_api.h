@@ -926,16 +926,16 @@ struct Wallet
                                                     uint32_t subaddr_account = 0,
                                                     std::set<uint32_t> subaddr_indices = {}) = 0;
     /*!
-     * \brief deployNewTokenTransaction creates a deploy_new_token transaction from a descriptor json string
+     * \brief registerPrivateTokenTransaction creates a register_private_token transaction from a descriptor json string
      * \param descriptor_json   serialized token descriptor json
-     * \param token_id          computed token id for the deployment request
+     * \param token_id          computed token id for the registration request
      * \param subaddr_account   subaddress account from which native fee inputs are taken
      * \param subaddr_indices   set of subaddress indices to use
      * \param priority          set a priority for the transaction. Accepted Values are: default (0), or 0-5 for: default, unimportant, normal, elevated, priority, flash.
      * \return                  PendingTransaction object. caller is responsible to check PendingTransaction::status()
      *                          after object returned
      */
-    virtual PendingTransaction* deployNewTokenTransaction(const std::string& descriptor_json,
+    virtual PendingTransaction* registerPrivateTokenTransaction(const std::string& descriptor_json,
                                                     std::string& token_id,
                                                     uint32_t priority = 0,
                                                     uint32_t subaddr_account = 0,

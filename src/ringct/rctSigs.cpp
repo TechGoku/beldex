@@ -1932,13 +1932,13 @@ namespace rct {
             }
 
             // Token-operation proofs only belong to their originating tx kinds:
-            //   token_operation_proof          -> deploy_new_token / mint_token / burn_token
+            //   token_operation_proof          -> register_private_token / mint_token / burn_token
             //   token_operation_ownership_proof -> mint_token / update_token
             // (see construct_tx_with_tx_key.) burn_token also carries an
             // amount-commitment composition_proof: it binds the publicly-declared
             // burned amount to the TDO commitment that the zc_balance_proof then
             // subtracts from the spend equation.
-            const bool aop_allowed       = tx.type == cryptonote::txtype::deploy_new_token
+            const bool aop_allowed       = tx.type == cryptonote::txtype::register_private_token
                                         || tx.type == cryptonote::txtype::mint_token
                                         || tx.type == cryptonote::txtype::burn_token;
             const bool ownership_allowed = tx.type == cryptonote::txtype::mint_token
@@ -2058,7 +2058,7 @@ namespace rct {
         // revealing which one. Ring members (must match construct_tx_with_tx_key's
         // surjection block bit-for-bit, in the same order):
         //   - every spent zc input's pseudo-blinded token id (zc_sigs, step 1), and
-        //   - for deploy_new_token/mint_token, the token-descriptor-operation's
+        //   - for register_private_token/mint_token, the token-descriptor-operation's
         //     own token id H_tdo, appended LAST (mirrors Zano's "token emission"
         //     ring member, generate_token_surjection_proof_hf6). This is what
         //     binds EACH mint output to the declared token: the TDO
@@ -2080,7 +2080,7 @@ namespace rct {
         for (const auto* zs : zc_sigs)
             surjection_ring.push_back(zs->pseudo_out_blinded_token_id);
 
-        if (tx.type == cryptonote::txtype::deploy_new_token || tx.type == cryptonote::txtype::mint_token)
+        if (tx.type == cryptonote::txtype::register_private_token || tx.type == cryptonote::txtype::mint_token)
         {
             cryptonote::tx_extra_token_descriptor_operation tdo{};
             if (!cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo))
@@ -2088,7 +2088,7 @@ namespace rct {
                 reason = "mint tx is missing its token_descriptor_operation in tx.extra";
                 return false;
             }
-            const crypto::token_id token_id = (tx.type == cryptonote::txtype::deploy_new_token)
+            const crypto::token_id token_id = (tx.type == cryptonote::txtype::register_private_token)
                 ? cryptonote::get_or_calculate_token_id(tdo)
                 : tdo.token_id;
             if (token_id == crypto::null_tid)
@@ -2269,7 +2269,7 @@ namespace rct {
                 // exist at all: either spent zc inputs (whose hidden token ids
                 // need not agree -- multiple distinct private tokens are
                 // allowed in one tx, see construct_tx_with_tx_key) or, for mints
-                // with no zc input (deploy_new_token/mint_token), the token
+                // with no zc input (register_private_token/mint_token), the token
                 // descriptor operation's own (plaintext, public) token_id.
                 //
                 // Note: zc inputs no longer declare any plaintext token id (it
@@ -2282,7 +2282,7 @@ namespace rct {
                 // log relation between two independently hash-derived token
                 // points, which is assumed infeasible.
                 bool tag_set = zc_input_count > 0;
-                if (!tag_set && (tx.type == cryptonote::txtype::deploy_new_token || tx.type == cryptonote::txtype::mint_token))
+                if (!tag_set && (tx.type == cryptonote::txtype::register_private_token || tx.type == cryptonote::txtype::mint_token))
                 {
                     cryptonote::tx_extra_token_descriptor_operation tdo{};
                     if (!cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo))
@@ -2290,7 +2290,7 @@ namespace rct {
                         reason = "mint tx is missing its token_descriptor_operation in tx.extra";
                         return false;
                     }
-                    const crypto::token_id token_id = (tx.type == cryptonote::txtype::deploy_new_token)
+                    const crypto::token_id token_id = (tx.type == cryptonote::txtype::register_private_token)
                         ? cryptonote::get_or_calculate_token_id(tdo)
                         : tdo.token_id;
                     if (token_id == crypto::null_tid)

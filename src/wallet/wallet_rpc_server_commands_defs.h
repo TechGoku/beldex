@@ -843,6 +843,7 @@ namespace tools::wallet_rpc {
     uint64_t block_height;                      // Block height the transfer occurred on
     bool frozen;                                // If the output has been intentionally frozen by the user, i.e. unspendable.
     bool unlocked;                              // If the TX is spendable yet
+    uint64_t unlock_time;                       // Per-output unlock height/timestamp for this transfer.
 
     KV_MAP_SERIALIZABLE
   };
@@ -2611,12 +2612,12 @@ This command is only required if the open wallet is one of the owners of a BNS r
     };
   };
 
-  // HF21: Deploy a new private token on-chain.
-  struct DEPLOY_NEW_TOKEN : RESTRICTED
+  // HF21: Register a new private token on-chain.
+  struct REGISTER_PRIVATE_TOKEN : RESTRICTED
   {
-    static constexpr auto names() { return NAMES("deploy_new_token"); }
+    static constexpr auto names() { return NAMES("register_private_token"); }
     static constexpr const char* description =
-        "Deploy a new private token. Pass the path to a JSON descriptor file containing: "
+        "Register a new private token. Pass a JSON descriptor containing: "
         "ticker, full_name, total_max_supply, current_supply, decimal_point, meta_info.";
 
     struct request
@@ -2635,7 +2636,7 @@ This command is only required if the open wallet is one of the owners of a BNS r
     struct response
     {
       std::string token_id;       // Hex-encoded calculated token ID
-      std::string tx_hash;        // Transaction hash of the deploy tx
+      std::string tx_hash;        // Transaction hash of the registration tx
       std::string tx_key;         // Transaction key (if requested)
       std::string tx_hex;         // Transaction hex blob (if requested)
       std::string ticker;         // Confirmed ticker from descriptor
@@ -2874,7 +2875,7 @@ This command is only required if the open wallet is one of the owners of a BNS r
     BNS_DECRYPT_VALUE,
     BNS_ENCRYPT_VALUE,
     COIN_BURN,
-    DEPLOY_NEW_TOKEN,
+    REGISTER_PRIVATE_TOKEN,
     GET_OWNED_TOKENS,
     MINT_TOKEN,
     BURN_TOKEN,

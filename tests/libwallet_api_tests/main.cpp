@@ -846,7 +846,7 @@ TEST_F(WalletTest1, WalletRefresh)
 //     ASSERT_TRUE(Utils::close_wallet_quietly(wmgr, wallet1));
 // }
 
-// TEST_F(WalletTest1, WalletDeployNewTokenTransaction)
+// TEST_F(WalletTest1, WalletRegisterPrivateTokenTransaction)
 // {
 //     Wallet::Wallet * wallet1 = wmgr->openWallet(CURRENT_SRC_WALLET, TESTNET_WALLET_PASS, Wallet::NetworkType::TESTNET);
 //     ASSERT_TRUE(wallet1->init(TESTNET_DAEMON_ADDRESS, 0));
@@ -856,7 +856,7 @@ TEST_F(WalletTest1, WalletRefresh)
 //         GTEST_SKIP() << readiness_error;
 //     }
 //     if (wallet1->unlockedBalance(0) == 0) {
-//         GTEST_SKIP() << "Need unlocked native BDX to pay deploy_new_token fee.";
+//         GTEST_SKIP() << "Need unlocked native BDX to pay register_private_token fee.";
 //     }
 
 //     const auto unique_suffix = std::to_string(
@@ -884,7 +884,7 @@ TEST_F(WalletTest1, WalletRefresh)
 
 //     std::string token_id;
 //     Wallet::PendingTransaction * transaction =
-//             wallet1->deployNewTokenTransaction(descriptor_json.str(), token_id);
+//             wallet1->registerPrivateTokenTransaction(descriptor_json.str(), token_id);
 
 //     ASSERT_TRUE(transaction->good()) << transaction->status().second;
 //     ASSERT_FALSE(token_id.empty());

@@ -6435,7 +6435,7 @@ wallet::transfer_view wallet2::wallet2::make_transfer_view(const crypto::hash &t
   result.note = get_tx_note(txid);
 
   crypto::token_id deduced_token_id = crypto::null_tid;
-  if (pd.m_pay_type == wallet::pay_type::deploy_token || pd.m_pay_type == wallet::pay_type::mint_token || pd.m_pay_type == wallet::pay_type::update_token || pd.m_pay_type == wallet::pay_type::burn_token)
+  if (pd.m_pay_type == wallet::pay_type::register_token || pd.m_pay_type == wallet::pay_type::mint_token || pd.m_pay_type == wallet::pay_type::update_token || pd.m_pay_type == wallet::pay_type::burn_token)
   {
     for (auto it = m_transfers.rbegin(); it != m_transfers.rend(); ++it)
     {
@@ -6500,7 +6500,7 @@ wallet::transfer_view wallet2::wallet2::make_transfer_view(const crypto::hash &t
     }
     result.amount = spent_token > received_token ? spent_token - received_token : 0;
   }
-  else if ((pd.m_pay_type == wallet::pay_type::deploy_token || pd.m_pay_type == wallet::pay_type::mint_token) && deduced_token_id != crypto::null_tid)
+  else if ((pd.m_pay_type == wallet::pay_type::register_token || pd.m_pay_type == wallet::pay_type::mint_token) && deduced_token_id != crypto::null_tid)
   {
     result.token_id = tools::type_to_hex(deduced_token_id);
     uint64_t received_token = 0;
@@ -6524,7 +6524,7 @@ wallet::transfer_view wallet2::wallet2::make_transfer_view(const crypto::hash &t
     }
     if (first_actual_token_id != crypto::null_tid)
     {
-      if (pd.m_pay_type != wallet::pay_type::deploy_token && pd.m_pay_type != wallet::pay_type::mint_token)
+      if (pd.m_pay_type != wallet::pay_type::register_token && pd.m_pay_type != wallet::pay_type::mint_token)
       {
         result.token_id = tools::type_to_hex(first_actual_token_id);
         result.amount = 0;
@@ -6565,7 +6565,7 @@ wallet::transfer_view wallet2::make_transfer_view(const crypto::hash &txid, cons
   result.note = get_tx_note(txid);
 
   crypto::token_id deduced_token_id = crypto::null_tid;
-  if (pd.m_pay_type == wallet::pay_type::deploy_token || pd.m_pay_type == wallet::pay_type::mint_token || pd.m_pay_type == wallet::pay_type::update_token || pd.m_pay_type == wallet::pay_type::burn_token)
+  if (pd.m_pay_type == wallet::pay_type::register_token || pd.m_pay_type == wallet::pay_type::mint_token || pd.m_pay_type == wallet::pay_type::update_token || pd.m_pay_type == wallet::pay_type::burn_token)
   {
     for (auto it = m_transfers.rbegin(); it != m_transfers.rend(); ++it)
     {
@@ -6631,7 +6631,7 @@ wallet::transfer_view wallet2::make_transfer_view(const crypto::hash &txid, cons
     }
     result.amount = spent_token > received_token ? spent_token - received_token : 0;
   }
-  else if ((pd.m_pay_type == wallet::pay_type::deploy_token || pd.m_pay_type == wallet::pay_type::mint_token) && deduced_token_id != crypto::null_tid)
+  else if ((pd.m_pay_type == wallet::pay_type::register_token || pd.m_pay_type == wallet::pay_type::mint_token) && deduced_token_id != crypto::null_tid)
   {
     result.token_id = tools::type_to_hex(deduced_token_id);
     uint64_t received_token = 0;
@@ -6655,7 +6655,7 @@ wallet::transfer_view wallet2::make_transfer_view(const crypto::hash &txid, cons
     }
     if (first_actual_token_id != crypto::null_tid)
     {
-      if (pd.m_pay_type != wallet::pay_type::deploy_token && pd.m_pay_type != wallet::pay_type::mint_token)
+      if (pd.m_pay_type != wallet::pay_type::register_token && pd.m_pay_type != wallet::pay_type::mint_token)
       {
         result.token_id = tools::type_to_hex(first_actual_token_id);
         result.amount = 0;
@@ -6771,13 +6771,13 @@ void wallet2::get_transfers(get_transfers_args_t args, std::vector<wallet::trans
   {
     bool is_deploy_or_mint = false;
     for (const auto& o : out) {
-      if (o.first == i.second.m_tx_hash && (o.second.m_pay_type == wallet::pay_type::deploy_token || o.second.m_pay_type == wallet::pay_type::mint_token)) {
+      if (o.first == i.second.m_tx_hash && (o.second.m_pay_type == wallet::pay_type::register_token || o.second.m_pay_type == wallet::pay_type::mint_token)) {
         is_deploy_or_mint = true; break;
       }
     }
     if (!is_deploy_or_mint) {
       for (const auto& pof : pending_or_failed) {
-        if (pof.first == i.second.m_tx_hash && (pof.second.m_pay_type == wallet::pay_type::deploy_token || pof.second.m_pay_type == wallet::pay_type::mint_token)) {
+        if (pof.first == i.second.m_tx_hash && (pof.second.m_pay_type == wallet::pay_type::register_token || pof.second.m_pay_type == wallet::pay_type::mint_token)) {
           is_deploy_or_mint = true; break;
         }
       }
@@ -10570,7 +10570,27 @@ void wallet2::transfer_selected_rct(std::vector<cryptonote::tx_destination_entry
 
   // calculate total amount being sent to all destinations
   // throw if total amount overflows uint64_t
-  if(!(tx_params.tx_type == txtype::deploy_new_token || tx_params.tx_type == txtype::mint_token))
+  if(tx_params.tx_type == txtype::register_private_token)
+  {
+    for(auto& dt: dsts)
+    {
+      THROW_WALLET_EXCEPTION_IF(0 == dt.amount && !dt.is_zarcanum(), error::zero_destination);
+      if(!dt.is_zarcanum())
+      {
+        needed_money += dt.amount;
+        LOG_PRINT_L2("transfer: adding native " << print_money(dt.amount) << ", for a total of " << print_money(needed_money));
+        THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, fee, m_nettype);
+      }
+    }
+  }
+  else if (tx_params.tx_type == txtype::mint_token)
+  {
+    for (auto& dt : dsts)
+    {
+      THROW_WALLET_EXCEPTION_IF(!dt.is_zarcanum(), error::wallet_internal_error, "mint_token transactions must only contain token destinations");
+    }
+  }
+  else
   {
     for(auto& dt: dsts)
     {
@@ -11695,12 +11715,12 @@ bool wallet2::light_wallet_key_image_is_ours(const crypto::key_image& key_image,
 // This system allows for sending (almost) the entire balance, since it does
 // not generate spurious change in all txes, thus decreasing the instantaneous
 // usable balance.
-// ── HF21: create_token_deploy_tx ─────────────────────────────────────────────
-// Build a deploy_new_token or mint_token transaction.
+// ── HF21: create_private_token_registration_tx ─────────────────────────────────────────────
+// Build a register_private_token or mint_token transaction.
 // Pads ZC destinations with self-sends to own subaddress[0] to reach
 // MIN_TOKEN_MINT_OUTPUTS, satisfying the blockchain fan-out rule and
 // immediately creating ring members for future spends of the new token.
-std::vector<wallet2::pending_tx> wallet2::create_token_deploy_tx(
+std::vector<wallet2::pending_tx> wallet2::create_private_token_registration_tx(
     std::vector<cryptonote::tx_destination_entry> dsts,
     const crypto::token_id& token_id,
     const size_t fake_outs_count,
@@ -11733,21 +11753,42 @@ std::vector<wallet2::pending_tx> wallet2::create_token_deploy_tx(
       dsts.push_back(dummy);
     }
 
-    MINFO("create_token_deploy_tx: added " << needed
+    MINFO("create_private_token_registration_tx: added " << needed
           << " self-send outputs to reach MIN_TOKEN_MINT_OUTPUTS ("
           << cryptonote::MIN_TOKEN_MINT_OUTPUTS << ")");
   }
 
   for(auto dest: dsts)
   {
-    MINFO("create_token_deploy_tx: amount " << dest.amount << ", is_subaddress " << dest.is_subaddress << ", token_id " << dest.token_id);
+    MINFO("create_private_token_registration_tx: amount " << dest.amount << ", is_subaddress " << dest.is_subaddress << ", token_id " << dest.token_id);
   }
+
+  std::string err, err2;
+  const uint64_t blockchain_height = std::max(get_daemon_blockchain_height(err),
+                                             get_daemon_blockchain_target_height(err2));
+  THROW_WALLET_EXCEPTION_IF(!err.empty() || !err2.empty(), error::wallet_internal_error,
+      std::string(ERR_MSG_NETWORK_HEIGHT_QUERY_FAILED) + (err.empty() ? err2 : err));
+
+  cryptonote::tx_destination_entry collateral_dest;
+  collateral_dest.addr = get_subaddress({subaddr_account, 0});
+  collateral_dest.amount = tokens::REGISTRATION_COLLATERAL_AMOUNT;
+  collateral_dest.is_subaddress = subaddr_account != 0;
+  collateral_dest.token_id = crypto::null_tid;
+
+  const uint64_t collateral_unlock_height = blockchain_height + tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS;
+  collateral_dest.unlock_time = collateral_unlock_height;
+  dsts.push_back(collateral_dest);
+
+  MINFO("create_private_token_registration_tx: locking "
+        << print_money(tokens::REGISTRATION_COLLATERAL_AMOUNT)
+        << " collateral until block " << collateral_unlock_height
+        << " (" << tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS << " blocks)");
 
   auto hf_ver = get_hard_fork_version();
   THROW_WALLET_EXCEPTION_IF(!hf_ver, error::wallet_internal_error,
       "Failed to get hard fork version from daemon");
   beldex_construct_tx_params tx_params = wallet2::construct_params(
-      *hf_ver, txtype::deploy_new_token, priority, tokens::burn_needed(*hf_ver, cryptonote::token_descriptor_operation_type::register_token));
+      *hf_ver, txtype::register_private_token, priority);
 
   return create_transactions_2(dsts, fake_outs_count, 0 /*unlock_time*/,
                                priority, extra, subaddr_account,
@@ -11846,10 +11887,14 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   }
 
   // check the type is token register or not
-  bool const is_token_register_tx = (tx_params.tx_type == txtype::deploy_new_token);
+  bool const is_token_register_tx = (tx_params.tx_type == txtype::register_private_token);
     LOG_PRINT_L0("is_token_register_tx:" << is_token_register_tx);
-  if (is_token_register_tx)  {
-    THROW_WALLET_EXCEPTION_IF(dsts.size() != cryptonote::MIN_TOKEN_MINT_OUTPUTS, error::wallet_internal_error, "Token register txs must have exactly " + std::to_string(cryptonote::MIN_TOKEN_MINT_OUTPUTS) + " destinations set, has: " + std::to_string(dsts.size()));
+  if (is_token_register_tx)
+  {
+    const size_t zc_outputs = std::count_if(dsts.begin(), dsts.end(), [](const auto& d) { return d.is_zarcanum(); });
+    THROW_WALLET_EXCEPTION_IF(zc_outputs != cryptonote::MIN_TOKEN_MINT_OUTPUTS, error::wallet_internal_error,
+        "Token register txs must have exactly " + std::to_string(cryptonote::MIN_TOKEN_MINT_OUTPUTS) +
+        " zarcanum destinations set, has: " + std::to_string(zc_outputs));
   }
 
   bool const is_token_mint_tx = (tx_params.tx_type == txtype::mint_token);
@@ -12020,15 +12065,23 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   // throw if total amount overflows uint64_t
   needed_money = 0;
 
-  if(is_token_register_tx || is_token_mint_tx)
+  if(is_token_register_tx)
   {
     for(auto& dt: dsts)
     {
-      token_needed_money[dt.token_id] += dt.amount;
-      LOG_PRINT_L2("transfer: adding " << print_money(dt.amount) << ", for a total of " << print_money (token_needed_money[dt.token_id]));
-      THROW_WALLET_EXCEPTION_IF(token_needed_money[dt.token_id] < dt.amount, error::tx_sum_overflow, dsts, 0, m_nettype);
+      if (dt.token_id == crypto::null_tid)
+      {
+        needed_money += dt.amount;
+        LOG_PRINT_L2("transfer: adding native " << print_money(dt.amount) << ", for a total of " << print_money(needed_money));
+        THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, 0, m_nettype);
+      }
     }
-  } else {
+  }
+  else if(is_token_mint_tx)
+  {
+    LOG_PRINT_L2("mint_token tx: minted token outputs do not require wallet token inputs");
+  }
+  else {
     for(auto& dt: dsts)
     {
       THROW_WALLET_EXCEPTION_IF(0 == dt.amount && !(is_bns_tx || is_burn_tx || is_token_update_tx), error::zero_destination);
@@ -12116,7 +12169,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
     THROW_WALLET_EXCEPTION_IF(total_needed_money > unlocked_balance_subtotal || min_fee + fixed_fee > unlocked_balance_subtotal, error::not_enough_unlocked_money,
         unlocked_balance_subtotal, needed_money, 0);
     
-    // For deploy_new_token we mint the token in this transaction, so only the native
+    // For register_private_token we mint the token in this transaction, so only the native
     // balance used to pay fees needs to exist in the wallet.
     if (!is_token_register_tx && !is_token_mint_tx)
     {

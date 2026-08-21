@@ -191,7 +191,7 @@ namespace cryptonote
     bool bns_lookup(std::vector<std::string> args);
 
     bool coin_burn(std::vector<std::string> args);
-    bool deploy_new_token(const std::vector<std::string>& args);  // HF21
+    bool register_private_token(const std::vector<std::string>& args);  // HF21
     bool get_token_info(const std::string& token_id_hex, nlohmann::json& info_res);
     bool tokens_by_owner(const std::vector<std::string>& args);
     bool mint_token(const std::vector<std::string>& args);        // HF21

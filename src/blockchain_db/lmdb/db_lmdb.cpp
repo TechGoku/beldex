@@ -65,12 +65,7 @@ enum struct lmdb_version
     v5,     // alt_block_data_1_t => alt_block_data_t: Alt block data has boolean for if the block was checkpointed
     v6,     // remigrate quorum_signature struct due to alignment change
     v7,     // rebuild the checkpoint table because v6 update in-place made MDB_LAST not give us the newest checkpoint
-    // Private tokens: adds the token history table AND widens output metadata
-    // with blinded_token_id for ring filtering. These were developed as two
-    // steps (v8, v9) but ship together, and no release ever exposed the
-    // intermediate state, so they are a single version bump here -- one pass
-    // over m_output_amounts instead of two, and one thing for operators to run.
-    v8,     // add token history table + blinded_token_id in output metadata
+    v8,     // add token history table and blinded_token_id output metadata for private token ring filtering
     _count
 };
 
@@ -6111,11 +6106,8 @@ void BlockchainLMDB::migrate_7_8()
 {
   LOG_PRINT_L3("BlockchainLMDB::" << __func__);
   const auto migration_started = std::chrono::steady_clock::now();
-  MGINFO_YELLOW("Migrating blockchain from DB version 7 to 8 - adding token history table and blinded_token_id to output records; this may take a while:");
+  MGINFO_YELLOW("Migrating blockchain from DB version 7 to 8 - adding token history table and blinded_token_id output records; this may take a while:");
 
-  // ── Part 1: the token history table ──
-  // Creating an empty table, so this is effectively free; it is folded in here
-  // rather than kept as its own version because the two ship together.
   {
     mdb_txn_safe txn(false);
     if (auto result = mdb_txn_begin(m_env, NULL, 0, txn))
@@ -6125,15 +6117,18 @@ void BlockchainLMDB::migrate_7_8()
     txn.commit();
   }
 
-  // ── Part 2: widen the output metadata ──
-  // Appends a 32-byte crypto::token_id (blinded_token_id) to output_data_t,
+  // v8 appends a 32-byte crypto::token_id (blinded_token_id) to output_data_t,
   // which lives in the rct (amount==0) records of m_output_amounts. That table
   // is MDB_DUPFIXED, so all dups under a key must share one size; we therefore
-  // rebuild the rct dup-list at the new record size via a temp table.
-  // ── v7 on-disk record layout (BEFORE the new field) ──
+  // rebuild the rct dup-list at the new record size via a temp table. Native /
+  // legacy outputs get null_tid; private-token (zarcanum) outputs get their
+  // real blinded id, recovered by a forward scan that reproduces the exact
+  // output_id assignment order (per block: miner_tx, then txs in tx_hashes
+  // order, each vout ascending — see BlockchainDB::add_block).
+  // ── v8 on-disk record layout (BEFORE the new field) ──
 
 #pragma pack(push, 1)
-  struct v7_output_data_t
+  struct v8_output_data_t
   {
     crypto::public_key pubkey;
     uint64_t unlock_time;
@@ -6141,11 +6136,11 @@ void BlockchainLMDB::migrate_7_8()
     rct::key commitment;
   };
 
-  struct v7_outkey
+  struct v8_outkey
   {
     uint64_t amount_index;
     uint64_t output_id;
-    v7_output_data_t data;
+    v8_output_data_t data;
   };
 #pragma pack(pop)
 
@@ -6161,7 +6156,7 @@ void BlockchainLMDB::migrate_7_8()
 
   MDB_dbi tmp;
 
-  if (auto result = mdb_dbi_open(txn, "output_amounts_tmp_v9", MDB_INTEGERKEY | MDB_DUPSORT | MDB_DUPFIXED | MDB_CREATE, &tmp))
+  if (auto result = mdb_dbi_open(txn, "output_amounts_tmp_v8", MDB_INTEGERKEY | MDB_DUPSORT | MDB_DUPFIXED | MDB_CREATE, &tmp))
     throw0(DB_ERROR(lmdb_error("Failed to open temp output table: ", result).c_str()));
 
   mdb_set_dupsort(txn, tmp, compare_uint64);
@@ -6188,9 +6183,9 @@ void BlockchainLMDB::migrate_7_8()
       if (ret)
         throw0(DB_ERROR(lmdb_error("migrate_7_8: enumerate old outputs: ", ret).c_str()));
 
-      if (v.mv_size == sizeof(v7_outkey))
+      if (v.mv_size == sizeof(v8_outkey))
       {
-        const v7_outkey *old = static_cast<const v7_outkey *>(v.mv_data);
+        const v8_outkey *old = static_cast<const v8_outkey *>(v.mv_data);
 
         outkey nk{};
         nk.amount_index = old->amount_index;

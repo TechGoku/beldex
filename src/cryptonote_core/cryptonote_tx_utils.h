@@ -184,6 +184,7 @@ namespace cryptonote
     bool is_integrated;
     // Private token (HF21+). null_pkey = native BDX output (txout_to_key).
     crypto::token_id token_id = crypto::null_tid;
+    uint64_t unlock_time = 0;
 
     tx_destination_entry() : amount(0), addr{}, is_subaddress(false), is_integrated(false) { }
     tx_destination_entry(uint64_t a, const account_public_address &ad, bool is_subaddress) : amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false) { }

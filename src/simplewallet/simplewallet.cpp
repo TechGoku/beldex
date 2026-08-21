@@ -52,7 +52,6 @@
 #include <unordered_map>
 #include <ctype.h>
 #include <string_view>
-#include <regex>
 #include <boost/lexical_cast.hpp>
 #include <boost/program_options.hpp>
 #include <boost/format.hpp>
@@ -71,14 +70,12 @@
 #include "cryptonote_core/master_node_list.h"
 #include "cryptonote_core/beldex_name_system.h"
 #include "simplewallet.h"
+#include "cryptonote_basic/token_descriptor.h"
 #include "cryptonote_basic/token_descriptor_operation_utils.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "rpc/core_rpc_server_commands_defs.h"
 #include "crypto/crypto.h"  // for crypto::secret_key definition
 #include "mnemonics/electrum-words.h"
-#include "rapidjson/document.h"
-#include "rapidjson/stringbuffer.h"
-#include "rapidjson/writer.h"
 #include "common/json_util.h"
 #include "ringct/rctSigs.h"
 #include "multisig/multisig.h"
@@ -133,100 +130,6 @@ using sw = cryptonote::simple_wallet;
 
 namespace
 {
-  // ── Token deployment helpers ──────────────────────────────────────────────
-
-  bool validate_token_ticker(const std::string& ticker)
-  {
-    static const std::regex token_ticker_regexp{R"([A-Za-z0-9]{1,14})"};
-    return std::regex_match(ticker, token_ticker_regexp);
-  }
-
-  bool validate_token_full_name(const std::string& full_name)
-  {
-    static const std::regex token_full_name_regexp{R"([A-Za-z0-9.,:!?\-() ]{0,400})"};
-    return std::regex_match(full_name, token_full_name_regexp);
-  }
-
-  bool validate_token_descriptor_for_deploy(const cryptonote::token_descriptor_base& descriptor, std::string& error)
-  {
-    if (!validate_token_ticker(descriptor.ticker))
-    { error = sw::tr("ticker is invalid; expected 1-14 alphanumeric characters"); return false; }
-    if (!validate_token_full_name(descriptor.full_name))
-    { error = sw::tr("full_name contains unsupported characters"); return false; }
-    if (descriptor.decimal_point > 18)
-    { error = sw::tr("decimal_point must be <= 18"); return false; }
-    if (descriptor.current_supply > descriptor.total_max_supply)
-    { error = sw::tr("current_supply cannot exceed total_max_supply"); return false; }
-    return true;
-  }
-
-  bool load_token_descriptor_from_json_file(const fs::path& filename,
-                                             cryptonote::token_descriptor_base& descriptor,
-                                             std::string& error)
-  {
-    std::string data;
-    if (!tools::slurp_file(filename, data))
-    { error = sw::tr("Failed to read token specification file"); return false; }
-
-    rapidjson::Document json;
-    if (json.Parse(data.c_str()).HasParseError())
-    { error = sw::tr("Token specification is not valid JSON"); return false; }
-    if (!json.IsObject())
-    { error = sw::tr("Token specification root must be a JSON object"); return false; }
-
-    auto assign_string = [&](const char* f, std::string& t) -> bool {
-      if (!json.HasMember(f)) return true;
-      if (!json[f].IsString()) { error = std::string{f} + " must be a string"; return false; }
-      t = json[f].GetString(); return true;
-    };
-    auto assign_uint64 = [&](const char* f, uint64_t& t) -> bool {
-      if (!json.HasMember(f)) return true;
-      if (!json[f].IsUint64()) { error = std::string{f} + " must be an unsigned integer"; return false; }
-      t = json[f].GetUint64(); return true;
-    };
-    auto assign_uint8 = [&](const char* f, uint8_t& t) -> bool {
-      if (!json.HasMember(f)) return true;
-      if (!json[f].IsUint()) { error = std::string{f} + " must be an unsigned integer"; return false; }
-      unsigned p = json[f].GetUint();
-      if (p > std::numeric_limits<uint8_t>::max()) { error = std::string{f} + " is out of range"; return false; }
-      t = static_cast<uint8_t>(p); return true;
-    };
-    auto assign_bool = [&](const char* f, bool& t) -> bool {
-      if (!json.HasMember(f)) return true;
-      if (!json[f].IsBool()) { error = std::string{f} + " must be a boolean"; return false; }
-      t = json[f].GetBool(); return true;
-    };
-
-    if (!assign_uint8("version",          descriptor.version)         ||
-        !assign_uint64("total_max_supply", descriptor.total_max_supply)||
-        !assign_uint64("current_supply",   descriptor.current_supply)  ||
-        !assign_uint8("decimal_point",     descriptor.decimal_point)   ||
-        !assign_string("ticker",           descriptor.ticker)          ||
-        !assign_string("full_name",        descriptor.full_name)       ||
-        !assign_string("meta_info",        descriptor.meta_info))
-      return false;
-
-    if (json.HasMember("owner"))
-    {
-      const auto& owner = json["owner"];
-      if (!owner.IsString())
-      { error = sw::tr("owner must be a hex-encoded public key or address"); return false; }
-      std::string owner_str = owner.GetString();
-
-      cryptonote::address_parse_info owner_info;
-      if (cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::MAINNET, owner_str) ||
-          cryptonote::get_account_address_from_str(owner_info, cryptonote::network_type::TESTNET, owner_str))
-      {
-        if (owner_info.is_subaddress)
-        { error = sw::tr("owner cannot be a subaddress"); return false; }
-        descriptor.owner = owner_info.address.m_spend_public_key;
-      } else if (!tools::hex_to_type(owner_str, descriptor.owner)) {
-        error = sw::tr("owner must be a hex-encoded public key or valid address"); return false;
-      }
-    }
-    return validate_token_descriptor_for_deploy(descriptor, error);
-  }
-
   enum class token_prefixed_address_mode
   {
     plain_address,
@@ -336,7 +239,7 @@ namespace
       if (td.m_txid != txid) continue;
       if (subaddr_index && td.m_subaddr_index != *subaddr_index) continue;
       if (td.m_amount != amount) continue;
-      if (unlock_time && td.m_tx.unlock_time != *unlock_time) continue;
+      if (unlock_time && td.m_tx.get_unlock_time(td.m_internal_output_index) != *unlock_time) continue;
       if (td.m_token_id == crypto::null_tid) continue;
 
       received_token_info result{};
@@ -542,7 +445,7 @@ namespace
     
   const char* USAGE_COIN_BURN("coin_burn [index=<N1>[,<N2>,...]] [<priority>] <burn=amount | txid>");
 
-  const char* USAGE_DEPLOY_NEW_TOKEN("deploy_new_token [index=<N1>[,<N2>,...]] [<priority>] <json_filename>");
+  const char* USAGE_REGISTER_PRIVATE_TOKEN("register_private_token [index=<N1>[,<N2>,...]] [<priority>] <json_filename>");
   const char* USAGE_TOKENS_BY_OWNER("tokens_by_owner [<owner_address_or_spend_public_key>]");
   const char* USAGE_MINT_TOKEN("mint_token [index=<N1>[,<N2>,...]] [<priority>] <token_id> <amount>");
   const char* USAGE_BURN_TOKEN("burn_token [index=<N1>[,<N2>,...]] [<priority>] <token_id> <amount>");
@@ -3456,20 +3359,20 @@ Pending or Failed: "failed"|"pending",  "out", Lock, Checkpointed, Time, Amount*
                            tr(tools::wallet_rpc::COIN_BURN::description));
 
   // HF21: private token commands
-  m_cmd_binder.set_handler("deploy_new_token",
-                           [this](const auto& x) { return deploy_new_token(x); },
-                           tr(USAGE_DEPLOY_NEW_TOKEN),
-                           tr("Deploy a new private token. Provide a JSON file with: ticker, full_name, total_max_supply, current_supply, decimal_point, meta_info."));
+  m_cmd_binder.set_handler("register_private_token",
+                           [this](const auto& x) { return register_private_token(x); },
+                           tr(USAGE_REGISTER_PRIVATE_TOKEN),
+                           tr("Register a new private token. Provide a JSON file with: ticker, full_name, total_max_supply, current_supply, decimal_point, meta_info."));
 
   m_cmd_binder.set_handler("tokens_by_owner",
                            [this](const auto& x) { return tokens_by_owner(x); },
                            tr(USAGE_TOKENS_BY_OWNER),
-                           tr("List all deployed tokens belonging to this wallet or the specified owner."));
+                           tr("List all registered tokens belonging to this wallet or the specified owner."));
 
   m_cmd_binder.set_handler("mint_token",
                            [this](const auto& x) { return mint_token(x); },
                            tr(USAGE_MINT_TOKEN),
-                           tr("Mint an deployed token by sending a transfer with the token's ID and the amount to mint encoded in the transaction extra. The optional index= and <priority> parameters work as in the `transfer' command."));
+                           tr("Mint a registered token by sending a transfer with the token's ID and the amount to mint encoded in the transaction extra. The optional index= and <priority> parameters work as in the `transfer' command."));
 
   m_cmd_binder.set_handler("burn_token",
                            [this](const auto& x) { return burn_token(x); },
@@ -3479,7 +3382,7 @@ Pending or Failed: "failed"|"pending",  "out", Lock, Checkpointed, Time, Amount*
   m_cmd_binder.set_handler("update_token",
                            [this](const auto& x) { return update_token(x); },
                            tr(USAGE_UPDATE_TOKEN),
-                           tr("Update an deployed token's meta info. Provide the token ID and a file containing the new meta info. The optional index= and <priority> parameters work as in the `transfer' command."));
+                           tr("Update a registered token's meta info. Provide the token ID and a file containing the new meta info. The optional index= and <priority> parameters work as in the `transfer' command."));
 }
 
 simple_wallet::~simple_wallet()
@@ -5644,7 +5547,7 @@ bool simple_wallet::show_incoming_transfers(const std::vector<std::string>& args
         std::string verbose_string;
         if (verbose)
           verbose_string = fmt::format("{:16s}{:22s}", tr("pubkey"), tr("key image"));
-        message_writer() << fmt::format("{:>21s}{:>8s}{:>12s}{:>8s}{:>16s}{:>34s}{:>46s}    {}", tr("amount"), tr("spent"), tr("unlocked"), tr("ringct"), tr("global_index"), tr("tx_id"), tr("addr_index"), verbose_string);
+        message_writer() << fmt::format("{:>21s}{:>8s}{:>12s}{:>16s}{:>8s}{:>16s}{:>34s}{:>46s}    {}", tr("amount"), tr("spent"), tr("unlocked"), tr("unlock_time"), tr("ringct"), tr("global_index"), tr("tx_id"), tr("addr_index"), verbose_string);
       }
       std::string extra_string;
       if (verbose)
@@ -5662,11 +5565,13 @@ bool simple_wallet::show_incoming_transfers(const std::vector<std::string>& args
         const std::pair<std::string, std::string> line = show_outputs_line(heights, blockchain_height, idx);
         extra_string += std::string("\n    ") + tr("Used at heights: ") + line.first + "\n    " + line.second;
       }
-      message_writer(td.m_spent ? epee::console_color_magenta : epee::console_color_green, false) << boost::format("%21s%8s%12s%8s%16u%68s%8u%s") %
-                                                                                                         format_received_amount(*m_wallet, td.m_txid, td.m_subaddr_index, td.amount(), td.m_tx.unlock_time) %
+      const uint64_t output_unlock_time = td.m_tx.get_unlock_time(td.m_internal_output_index);
+      message_writer(td.m_spent ? epee::console_color_magenta : epee::console_color_green, false) << boost::format("%21s%8s%12s%16u%8s%16u%68s%8u%s") %
+                                                                                                         format_received_amount(*m_wallet, td.m_txid, td.m_subaddr_index, td.amount(), output_unlock_time) %
                                                                                                          (td.m_spent ? tr("T") : tr("F")) %
                                                                                                          (m_wallet->frozen(td) ? tr("[frozen]") : m_wallet->is_transfer_unlocked(td) ? tr("unlocked")
                                                                                                                                                                                      : tr("locked")) %
+                                                                                                         output_unlock_time %
                                                                                                          (td.is_rct() ? tr("RingCT") : tr("-")) %
                                                                                                          td.m_global_output_index %
                                                                                                          td.m_txid %
@@ -8042,7 +7947,7 @@ bool simple_wallet::tokens_by_owner(const std::vector<std::string>& args_)
   return true;
 }
 //----------------------------------------------------------------------------------------------------
-bool simple_wallet::deploy_new_token(const std::vector<std::string>& args_)
+bool simple_wallet::register_private_token(const std::vector<std::string>& args_)
 {
   if (!try_connect_to_daemon())
     return false;
@@ -8055,7 +7960,7 @@ bool simple_wallet::deploy_new_token(const std::vector<std::string>& args_)
 
   if (args.size() != 1)
   {
-    PRINT_USAGE(USAGE_DEPLOY_NEW_TOKEN);
+    PRINT_USAGE(USAGE_REGISTER_PRIVATE_TOKEN);
     return false;
   }
 
@@ -8065,7 +7970,7 @@ bool simple_wallet::deploy_new_token(const std::vector<std::string>& args_)
   {
     cryptonote::token_descriptor_base descriptor{};
     std::string error;
-    if (!load_token_descriptor_from_json_file(fs::u8path(args[0]), descriptor, error))
+    if (!cryptonote::load_token_descriptor_from_json_file(fs::u8path(args[0]), descriptor, error))
     {
       fail_msg_writer() << error << ": " << args[0];
       return false;
@@ -8097,7 +8002,7 @@ bool simple_wallet::deploy_new_token(const std::vector<std::string>& args_)
 
     const crypto::token_id token_id = cryptonote::get_or_calculate_token_id(tdo);
 
-    success_msg_writer(true) << tr("New token deployment details:\n")
+    success_msg_writer(true) << tr("New token registration details:\n")
                               << tr("  Token ID: ") << tools::type_to_hex(token_id) << "\n"
                               << tr("  Ticker:   ") << descriptor.ticker << "\n"
                               << tr("  Full name: ") << descriptor.full_name << "\n"
@@ -8117,8 +8022,8 @@ bool simple_wallet::deploy_new_token(const std::vector<std::string>& args_)
       dsts.push_back(dest);
     }
 
-    // Use create_token_deploy_tx which auto-pads to MIN_TOKEN_MINT_OUTPUTS
-    auto ptx_vector = m_wallet->create_token_deploy_tx(
+    // Use create_private_token_registration_tx which auto-pads to MIN_TOKEN_MINT_OUTPUTS
+    auto ptx_vector = m_wallet->create_private_token_registration_tx(
         dsts, token_id, cryptonote::TX_OUTPUT_DECOYS, priority, extra,
         m_current_subaddress_account, subaddr_indices);
 
@@ -8462,7 +8367,7 @@ bool simple_wallet::update_token(const std::vector<std::string>& args_)
   // tx is rejected.
   cryptonote::token_descriptor_base file_adb = adb;
   std::string error;
-  if (!load_token_descriptor_from_json_file(fs::u8path(args[1]), file_adb, error))
+  if (!cryptonote::load_token_descriptor_from_json_file(fs::u8path(args[1]), file_adb, error, cryptonote::token_descriptor_json_mode::update))
   {
     fail_msg_writer() << error << ": " << args[1];
     return false;

@@ -622,7 +622,7 @@ namespace cryptonote
     // which take a different path and carry no zc sources here). Without a
     // matching source the per-output surjection would fail downstream anyway;
     // catching it here gives a clearer error.
-    if (tx_params.tx_type != txtype::deploy_new_token && tx_params.tx_type != txtype::mint_token)
+    if (tx_params.tx_type != txtype::register_private_token && tx_params.tx_type != txtype::mint_token)
     {
       std::set<crypto::token_id> source_token_ids;
       for (const auto& s : sources)
@@ -934,7 +934,7 @@ namespace cryptonote
     // carrying private-token content must keep the plain R=tx_key*G
     // form.
     bool tx_has_zarcanum_content =
-        tx_params.tx_type == txtype::deploy_new_token ||
+        tx_params.tx_type == txtype::register_private_token ||
         tx_params.tx_type == txtype::mint_token ||
         std::any_of(sources.begin(), sources.end(), [](const tx_source_entry& s) { return s.is_zarcanum(); }) ||
         std::any_of(destinations.begin(), destinations.end(), [](const tx_destination_entry& d) { return d.is_zarcanum(); });
@@ -999,7 +999,7 @@ namespace cryptonote
         }
         else
         {
-          tx.output_unlock_times.push_back(unlock_time); // for now, all non-change have same unlock time
+          tx.output_unlock_times.push_back(dst_entr.unlock_time ? dst_entr.unlock_time : unlock_time);
         }
       }
 
@@ -1098,7 +1098,7 @@ namespace cryptonote
       // In mint transaction, we are creating new coins, so we don't need to add the amount to the summary_outs_money
       // In deploy transaction, we are creating a new token, so we don't need to add the amount to the summary_outs_money
       // Zarcanum destination amounts are token-denominated, not BDX, and must not be mixed into the native money balance check.
-      if(tx.type != txtype::deploy_new_token && tx.type != txtype::mint_token && !dst_entr.is_zarcanum())
+      if(tx.type != txtype::register_private_token && tx.type != txtype::mint_token && !dst_entr.is_zarcanum())
         summary_outs_money += dst_entr.amount;
     }
     CHECK_AND_ASSERT_MES(additional_tx_public_keys.size() == additional_tx_keys.size(), false, "Internal error creating additional public keys");
@@ -1134,7 +1134,7 @@ namespace cryptonote
     rct::key aop_secret_x   = rct::zero();
     rct::key aop_commitment = rct::zero(); // full TDO amount commitment C (used by the burn balance proof)
     crypto::token_id aop_token_id = crypto::null_tid; // mint token id, used as the surjection ring member
-    if (tx.type == txtype::deploy_new_token || tx.type == txtype::mint_token || tx.type == txtype::burn_token)
+    if (tx.type == txtype::register_private_token || tx.type == txtype::mint_token || tx.type == txtype::burn_token)
     {
       tx_extra_token_descriptor_operation tdo{};
       if (!get_token_descriptor_operation_from_tx_extra(tx.extra, tdo))
@@ -1145,7 +1145,7 @@ namespace cryptonote
 
       uint64_t declared_amount = 0;
       crypto::token_id token_id = crypto::null_tid;
-      if (tx.type == txtype::deploy_new_token)
+      if (tx.type == txtype::register_private_token)
       {
         declared_amount = tdo.descriptor.current_supply;
         token_id        = get_or_calculate_token_id(tdo);
@@ -1555,7 +1555,7 @@ namespace cryptonote
           //
           // Ring members (one BGE proof per zc output, hidden real index):
           //   - every spent zc input's pseudo-blinded token id (T^p_i), and
-          //   - for deploy_new_token/mint_token, the token-descriptor-operation's
+          //   - for register_private_token/mint_token, the token-descriptor-operation's
           //     own token id H_tdo as a single extra ring member (mirrors Zano's
           //     generate_token_surjection_proof_hf6 "token emission" ring member,
           //     ogc.ao_token_id_pt). Without this, a multi-output mint could bind
@@ -1799,7 +1799,7 @@ namespace cryptonote
             aop.flags = 1; // composition_proof present
             tx.token_proofs.push_back(std::move(aop));
             MINFO("Attached token amount-commitment proof for "
-                  << (tx.type == txtype::deploy_new_token ? "deploy"
+                  << (tx.type == txtype::register_private_token ? "deploy"
                       : tx.type == txtype::mint_token ? "mint" : "burn")
                   << " tx");
           }

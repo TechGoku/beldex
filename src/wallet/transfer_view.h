@@ -49,7 +49,7 @@ enum struct pay_type
   governance,
   bns,
   coin_burn,
-  deploy_token,
+  register_token,
   mint_token,
   update_token,
   burn_token
@@ -68,7 +68,7 @@ inline const char *pay_type_string(pay_type type)
     case pay_type::master_node: return "mnode";
     case pay_type::governance:   return "gov";
     case pay_type::coin_burn:   return "burn";
-    case pay_type::deploy_token: return "deploy";
+    case pay_type::register_token: return "register";
     case pay_type::mint_token:   return "mint";
     case pay_type::update_token: return "update";
     case pay_type::burn_token:   return "burn_token";
@@ -83,7 +83,7 @@ inline pay_type pay_type_from_tx(const cryptonote::transaction tx)
     case cryptonote::txtype::stake: return wallet::pay_type::stake;
     case cryptonote::txtype::beldex_name_system: return wallet::pay_type::bns;
     case cryptonote::txtype::coin_burn: return wallet::pay_type::coin_burn;
-    case cryptonote::txtype::deploy_new_token: return wallet::pay_type::deploy_token;
+    case cryptonote::txtype::register_private_token: return wallet::pay_type::register_token;
     case cryptonote::txtype::mint_token: return wallet::pay_type::mint_token;
     case cryptonote::txtype::update_token: return wallet::pay_type::update_token;
     case cryptonote::txtype::burn_token: return wallet::pay_type::burn_token;

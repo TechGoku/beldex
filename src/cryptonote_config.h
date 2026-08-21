@@ -80,7 +80,7 @@ inline constexpr size_t TOKEN_RING_SIZE = TX_OUTPUT_DECOYS; // same as BDX
 
 // ── Mandatory fan-out for deploy / mint transactions (HF21+) ───────────────
 //
-// Every deploy_new_token or mint_token transaction MUST produce at least
+// Every register_private_token or mint_token transaction MUST produce at least
 // MIN_TOKEN_MINT_OUTPUTS tx_out_zarcanum outputs.
 //
 // Why: even though the ring draws from the shared BDX pool, we want
