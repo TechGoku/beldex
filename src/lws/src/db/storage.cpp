@@ -596,9 +596,13 @@ namespace db
 
     while (err == 0)
     {
-      if (value.mv_size == sizeof(output_v2))
+      if (value.mv_size == sizeof(output_v2) || value.mv_size == sizeof(output))
       {
-        // Already in the current layout - leave untouched, advance.
+        // Already at v2 or beyond - leave untouched, advance. Accepting the
+        // current `output` size matters because a DB that has already reached
+        // v3 can still be re-entered here from version 0, and v1/v2/v3 are
+        // three distinct compile-time sizes, so this cannot mask a real
+        // corrupt-row case.
         err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
         continue;
       }

@@ -1025,9 +1025,23 @@ namespace lws
 
         // The chain tip. HF22 token registration locks its collateral output to
         // an absolute height, so the client needs to know where the chain is.
+        //
+        // This is the scanner's tip, which trails the daemon's -- and consensus
+        // compares the collateral's unlock height against the daemon's height at
+        // validation time, so reporting a stale value here makes the client
+        // build registrations the network rejects. The client adds its own
+        // margin on top, but do not narrow this further: whatever is reported
+        // here is already in the past by the time the transaction is validated.
         std::uint64_t blockchain_height = 0;
         if (const expect<db::block_info> last = user->second.get_last_block())
           blockchain_height = std::uint64_t(last->id);
+        // get_last_block() has been observed lagging the scanner by well over a
+        // thousand blocks, which is fatal here: a registration's collateral is
+        // locked relative to this number, and consensus compares it against the
+        // daemon's real height, so an understated tip produces a transaction the
+        // network relays and then never mines. The account's own scan height is
+        // the fresher of the two, so report whichever is further along.
+        blockchain_height = std::max(blockchain_height, std::uint64_t(user->first.scan_height));
 
         // TODO: report the daemon's real fork version here. This was pinned at
         // 17, which silently disabled every client-side gate above it --
@@ -1590,10 +1604,28 @@ namespace lws
         try
         {
           const json& result = deep_unwrap(deep_unwrap(daemon_resp).at("result"));
+          // A rejected transaction reaches the client as a bare 500 with no
+          // body, so the daemon's reason is the only explanation that exists
+          // anywhere. Log it before discarding it -- without this a rejection
+          // is indistinguishable from a success that never confirms, which is
+          // exactly how a failed token registration presents: the wallet shows
+          // the transaction optimistically, then it vanishes on refresh.
+          const auto log_rejection = [&result, &daemon_resp](const char* what) {
+            MERROR("submit_raw_tx " << what
+                   << " -- reason: " << result.value("reason", std::string{"(none given)"})
+                   << " -- reason_codes: " << result.value("reason_codes", json::array()).dump()
+                   << " -- full result: " << result.dump().substr(0, 600));
+          };
           if (result.value("not_relayed", false))
+          {
+            log_rejection("not relayed");
             return {lws::error::tx_relay_failed};
+          }
           if (result.value("status", std::string{"OK"}) == "Failed")
+          {
+            log_rejection("rejected by daemon");
             return {lws::error::status_failed};
+          }
         }
         catch (const std::exception& e)
         {

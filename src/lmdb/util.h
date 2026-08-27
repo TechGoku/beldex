@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstring>
 #include <lmdb.h>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -84,13 +85,38 @@ namespace lmdb
     }
 
     //! \return `value` bytes in a LMDB `MDB_val` object.
-    template<typename T>
+    //
+    // `std::string` is excluded here and handled by the overload below. Left to
+    // this template it would hand LMDB `sizeof(std::string)` bytes of the string
+    // *object* -- which, for a short string, begins with a pointer into the
+    // object's own buffer. That address changes every run, so a key written by
+    // one process could never be found by the next.
+    template<typename T,
+             typename = typename std::enable_if<
+                 !std::is_same<
+                     typename std::decay<T>::type, std::string
+                 >::value
+             >::type>
     inline MDB_val to_val(T&& value) noexcept
     {
         // lmdb does not touch user data, so const_cast is acceptable
         static_assert(!std::is_rvalue_reference<T&&>(), "cannot use temporary value");
         void const* const temp = reinterpret_cast<void const*>(std::addressof(value));
         return MDB_val{sizeof(value), const_cast<void*>(temp)};
+    }
+
+    //! \return The characters of `value` in a LMDB `MDB_val` object.
+    //
+    // The SFINAE guard above routes every `std::string` argument here -- const,
+    // non-const, and temporary alike. Selecting on constness alone is not
+    // enough: for a non-const lvalue the template deduces a parameter type with
+    // fewer cv-qualifiers and wins overload resolution, silently restoring the
+    // bug described above.
+    inline MDB_val to_val(const std::string& value) noexcept
+    {
+        // lmdb does not touch user data, so const_cast is acceptable
+        void const* const temp = reinterpret_cast<void const*>(value.data());
+        return MDB_val{value.size(), const_cast<void*>(temp)};
     }
 
     //! \return A span over the same chunk of memory as `value`.

@@ -11775,7 +11775,9 @@ std::vector<wallet2::pending_tx> wallet2::create_private_token_registration_tx(
   collateral_dest.is_subaddress = subaddr_account != 0;
   collateral_dest.token_id = crypto::null_tid;
 
-  const uint64_t collateral_unlock_height = blockchain_height + tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS;
+  const uint64_t collateral_unlock_height = blockchain_height
+      + tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS
+      + tokens::REGISTRATION_COLLATERAL_UNLOCK_BUFFER_BLOCKS;
   collateral_dest.unlock_time = collateral_unlock_height;
   dsts.push_back(collateral_dest);
 

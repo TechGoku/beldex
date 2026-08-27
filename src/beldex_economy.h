@@ -155,6 +155,19 @@ namespace tokens
 inline constexpr uint64_t REGISTRATION_COLLATERAL_AMOUNT = 10'000 * beldex::COIN;
 inline constexpr uint64_t REGISTRATION_COLLATERAL_LOCK_BLOCKS = 2880 * 30 * 6;
 
+// Headroom added to a registration's collateral unlock height by the wallet.
+//
+// Consensus requires unlock_time >= <daemon height> + REGISTRATION_COLLATERAL_LOCK_BLOCKS,
+// and re-checks it in Blockchain::check_tx_inputs on every mempool admission and
+// every block-template attempt -- so the bar rises with each new block while the
+// transaction waits. A transaction built against the exact minimum is already
+// invalid one block later and can never be mined, yet it relays cleanly, so the
+// failure is invisible from the wallet.
+//
+// 2880 blocks is about a day at the 30-second target: far more than any
+// plausible relay-and-inclusion delay, and under 0.6% of the 518,400-block lock.
+inline constexpr uint64_t REGISTRATION_COLLATERAL_UNLOCK_BUFFER_BLOCKS = 2880;
+
 constexpr uint64_t burn_needed(cryptonote::hf hf_version, cryptonote::token_descriptor_operation_type op_type)
 {
   uint64_t basic_fee = 100 * beldex::COIN; 
