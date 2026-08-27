@@ -146,9 +146,19 @@ static void init_bge_generators()
         // Build hash input: domain || uint64_le(i)
         uint8_t buf[32] = {};
         keccak(reinterpret_cast<const uint8_t*>(domain_prefix), (int)prefix_len, buf, 32);
-        // XOR index into last 8 bytes for uniqueness
+        // XOR index into last 8 bytes for uniqueness.
+        //
+        // The index MUST be widened to a fixed 64-bit type first. `i` is a
+        // size_t, which is 32 bits on wasm32: shifting it by 32..56 is
+        // undefined behaviour, and in practice the shift wraps modulo 32, so
+        // `i >> 32` yields `i` rather than 0 and bytes 28..31 pick up the index
+        // as well. That derives a DIFFERENT generator set on a 32-bit build
+        // than on a 64-bit one -- each self-consistent, so proofs verify
+        // locally and are rejected by the network. Consensus follows the
+        // 64-bit result, which uint64_t reproduces on every target.
+        const uint64_t idx = static_cast<uint64_t>(i);
         for (size_t b = 0; b < 8; ++b)
-            buf[24 + b] ^= static_cast<uint8_t>((i >> (b * 8)) & 0xFF);
+            buf[24 + b] ^= static_cast<uint8_t>((idx >> (b * 8)) & 0xFF);
 
         // Map to a curve point (Elligator), then multiply by the cofactor
         // (8 = THREE doublings) to land in the prime-order subgroup. This MUST
