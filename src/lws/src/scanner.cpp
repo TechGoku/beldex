@@ -245,10 +245,23 @@ namespace lws
         }
 
         std::size_t index = -1;
+        // HF22: rct_signatures.outPk / ecdhInfo cover only the NATIVE outputs,
+        // while `index` walks every vout. A token tx interleaves zarcanum
+        // outputs with native ones (fee change, registration collateral), so
+        // indexing those vectors by vout position runs off the end -- a 12
+        // output registration has just 2 entries. Track the native ordinal
+        // separately. output_indices is unaffected: the daemon emits one entry
+        // per vout, so out_ids stays indexed by `index`.
+        std::size_t native_index = 0;
         for (auto const& out : tx.vout)
         {
           // std::cout << "entered in vout " << std::endl;
           ++index;
+          const bool is_native_out =
+              std::get_if<cryptonote::tx_out_zarcanum>(std::addressof(out.target)) == nullptr;
+          const std::size_t this_native_index = native_index;
+          if (is_native_out)
+            ++native_index;
 
           cryptonote::txout_to_key const* const out_data =
               std::get_if<cryptonote::txout_to_key>(std::addressof(out.target));
@@ -309,7 +322,8 @@ namespace lws
             
             const bool bulletproof2 = true;
             const auto decrypted = lws::decode_amount(
-              tx.rct_signatures.outPk.at(index).mask, tx.rct_signatures.ecdhInfo.at(index), derived, index, bulletproof2
+              tx.rct_signatures.outPk.at(this_native_index).mask,
+              tx.rct_signatures.ecdhInfo.at(this_native_index), derived, index, bulletproof2
             );
             if (!decrypted)
             {
@@ -342,7 +356,13 @@ namespace lws
                 key.pub_key
               },
                   timestamp,
-                  tx.unlock_time,
+                  // Since txversion v3 the per-output unlock times are the
+                  // authoritative ones; tx.unlock_time is a legacy tx-wide
+                  // value and is 0 on any modern transaction. HF22 relies on
+                  // this: a registration locks ONLY its collateral output, so
+                  // reading the tx-level field reports a wallet's locked
+                  // collateral as immediately spendable.
+                  tx.get_unlock_time(index),
                   *prefix_hash,
                   locked_key_image ? *locked_key_image : crypto::key_image{},
                   out_pub,

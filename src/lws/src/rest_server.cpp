@@ -571,6 +571,14 @@ namespace lws
 
       for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
       {
+        // HF22: a privacy-token output's amount is denominated in that token,
+        // not BDX. Letting one through here reports a wallet holding 1000 DEMO
+        // as if it held an extra 1,000,000 BDX, and offers the output up as
+        // spendable coin for a native send. Native outputs carry a null
+        // token_id; token balances are accounted per-token, not here.
+        if (output.get_value<MONERO_FIELD(db::output, token_id)>() != crypto::public_key{})
+          continue;
+
         const db::output::spend_meta_ meta =
           output.get_value<MONERO_FIELD(db::output, spend_meta)>();
 
@@ -939,6 +947,14 @@ namespace lws
             next_min_height = out_height; // resume here next page (inclusive seek)
             break;
           }
+
+          // HF22: never offer a privacy-token output as spendable coin. Its
+          // amount is denominated in that token, and a wallet that picks one up
+          // for a native send builds a transaction the daemon rejects outright
+          // ("ringct non-semantics verification failed"). Token spending needs
+          // its own selection path; this endpoint is native-only.
+          if (out.token_id != crypto::public_key{})
+            continue;
 
           const std::pair<db::extra, std::uint8_t> unpacked = db::unpack(out.extra);
           const bool coinbase = (unpacked.first & lws::db::coinbase_output);
