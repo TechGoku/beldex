@@ -956,6 +956,14 @@ namespace lws
           if (out.token_id != crypto::public_key{})
             continue;
 
+          // Nor a still-locked output. An HF22 registration locks its 10,000 BDX
+          // collateral for months; offering it as spendable lets a wallet build
+          // a transaction the network refuses. The client sees only an amount
+          // and a height, not the unlock rule, so the server must not put a
+          // locked output on the table in the first place.
+          if (is_locked(out.unlock_time, user->first.scan_height))
+            continue;
+
           const std::pair<db::extra, std::uint8_t> unpacked = db::unpack(out.extra);
           const bool coinbase = (unpacked.first & lws::db::coinbase_output);
           if (out.spend_meta.amount < std::uint64_t(*req.dust_threshold) ||  (out.spend_meta.mixin_count < *req.mixin && !(coinbase == 1)))
@@ -1162,6 +1170,19 @@ namespace lws
 
           if (spend.is_end() || (!output.is_end() && next_output <= next_spend))
           {
+            // HF22: a privacy-token output's amount is denominated in that
+            // token, not BDX. Folding it into the transaction's BDX amount
+            // shows a registration of 1000 DEMO (1e15 atomic at 12 decimals)
+            // as "+999999.69 BDX" received in the history. Advance past it so
+            // the entry reflects only the native value moved.
+            if (output.get_value<MONERO_FIELD(db::output, token_id)>() != crypto::public_key{})
+            {
+              ++output;
+              if (!output.is_end())
+                next_output = output.get_value<MONERO_FIELD(db::output, link)>();
+              continue;
+            }
+
             std::uint64_t amount = 0;
             if (resp.transactions.empty() || resp.transactions.back().info.link.tx_hash != next_output.tx_hash)
             {
