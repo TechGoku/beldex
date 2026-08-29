@@ -74,6 +74,24 @@ namespace rpc
     };
     void read_bytes(wire::json_reader&, get_address_info_request&);
 
+    /*! One HF22 privacy token held by the account.
+
+        Amounts are in that token's own atomic units - the scale is set by the
+        descriptor's decimal_point, which lives on the daemon and not here, so a
+        client that wants to display these must resolve it via get_token_info.
+        Reported as three numbers rather than one balance for the same reason the
+        native side is: the client decides whether it wants the spendable figure
+        or the total. */
+    struct token_balance
+    {
+      token_balance() = delete;
+      crypto::public_key token_id;
+      safe_uint64 total_received;
+      safe_uint64 total_sent;
+      safe_uint64 locked_funds;
+    };
+    void write_bytes(wire::json_writer&, const token_balance&);
+
     struct get_address_info_response
     {
       get_address_info_response() noexcept
@@ -86,7 +104,8 @@ namespace rpc
           transaction_height(0),
           blockchain_height(0),
           next_min_height(0),
-          spent_outputs()
+          spent_outputs(),
+          tokens()
           // rates(common_error::kInvalidArgument)
       {}
 
@@ -100,6 +119,8 @@ namespace rpc
       std::uint64_t blockchain_height;
       std::uint64_t next_min_height; //!< 0 = last page; else min_height for the next page
       std::vector<transaction_spend> spent_outputs;
+      //! Empty for an account holding no tokens, which is every pre-HF22 wallet.
+      std::vector<token_balance> tokens;
       // expect<lws::rates> rates;
     };
     void write_bytes(wire::json_writer&, const get_address_info_response&);
@@ -165,6 +186,106 @@ namespace rpc
   };
   void write_bytes(wire::json_writer&, const daemon_status_response&);
 
+
+    /*! One token in a get_token_balances reply: what the account holds, and
+        what the token is.
+
+        The two halves come from different places - holdings from the outputs
+        this server scanned, identity from the daemon's blockchain database - and
+        a wallet needs both to render a single row. Fetching them separately cost
+        one request per token on top of the balance call; this carries them
+        together. */
+    struct token_balance_entry
+    {
+      token_balance_entry() = default;
+
+      std::string token_id;
+
+      //! "confirmed" when the chain describes this token, "not_found" when it
+      //! does not, "unknown" when the daemon could not be asked.
+      std::string status;
+
+      //! Atomic units in this token's own scale. unlocked = received - sent - locked.
+      safe_uint64 total_received{safe_uint64(0)};
+      safe_uint64 total_sent{safe_uint64(0)};
+      safe_uint64 locked_funds{safe_uint64(0)};
+      safe_uint64 unlocked_balance{safe_uint64(0)};
+
+      //! Descriptor, present only when status is "confirmed".
+      std::string ticker;
+      std::string full_name;
+      std::string owner;
+      std::string meta_info;
+      safe_uint64 current_supply{safe_uint64(0)};
+      safe_uint64 total_max_supply{safe_uint64(0)};
+      std::uint32_t decimal_point = 0;
+    };
+    void write_bytes(wire::json_writer&, const token_balance_entry&);
+
+    struct get_token_balances_request
+    {
+      get_token_balances_request() = default;
+      account_credentials creds;
+      /*! Extra ids to report on beyond what the account holds.
+
+          A registration that has been broadcast but not yet mined leaves the
+          wallet holding nothing, so it would otherwise be invisible here -
+          which is the moment its owner most wants to know where it stands. */
+      std::vector<std::string> token_ids;
+    };
+    void read_bytes(wire::json_reader&, get_token_balances_request&);
+
+    struct get_token_balances_response
+    {
+      get_token_balances_response() = default;
+      std::vector<token_balance_entry> tokens;
+      std::uint64_t scanned_height = 0;
+      std::uint64_t blockchain_height = 0;
+    };
+    void write_bytes(wire::json_writer&, const get_token_balances_response&);
+
+    /* ── HF22 privacy tokens: descriptor lookups ────────────────────────
+       Forwarded to the daemon, which is the only holder of token state. They
+       carry no credentials because they read nothing account-specific: a token
+       descriptor is public chain data, exactly like a block header. */
+
+    struct get_token_info_request
+    {
+      get_token_info_request() = delete;
+      std::string token_id;   //!< 64 hex characters
+    };
+    void read_bytes(wire::json_reader&, get_token_info_request&);
+
+    struct get_token_info_response
+    {
+      get_token_info_response() = default;
+      std::string token_id;
+      std::string ticker;
+      std::string full_name;
+      std::string owner;
+      std::string meta_info;
+      //! Atomic units, scaled by decimal_point.
+      safe_uint64 current_supply{safe_uint64(0)};
+      safe_uint64 total_max_supply{safe_uint64(0)};
+      std::uint32_t decimal_point = 0;
+    };
+    void write_bytes(wire::json_writer&, const get_token_info_response&);
+
+    struct get_token_list_request
+    {
+      get_token_list_request() = default;
+      std::uint64_t offset = 0;
+      std::uint64_t count = 100;
+    };
+    void read_bytes(wire::json_reader&, get_token_list_request&);
+
+    struct get_token_list_response
+    {
+      get_token_list_response() = default;
+      std::vector<std::string> token_ids;
+      std::uint64_t total_count = 0;
+    };
+    void write_bytes(wire::json_writer&, const get_token_list_response&);
 
     struct get_random_outs_request
     {

@@ -455,6 +455,29 @@ namespace lws
         state (10s TTL) and, for timestamp-based unlock times, on wall-clock time.
         It is recomputed per request from `locked`, which is a RAM scan with no LMDB
         I/O. */
+    /*! One HF22 privacy-token output, kept out of the native projection.
+
+        Token amounts are denominated in their own token, so they cannot be summed
+        with BDX. But a spend still has to be resolvable: `get_address_info` looks
+        every spend up by output id and throws "no receive for spend" when it finds
+        none, so simply dropping token outputs from the projection would turn the
+        first spend of a token output into a 500 on the balance endpoint. They are
+        held here instead - resolvable, and attributable to the right token. */
+    struct token_meta
+    {
+      db::output::spend_meta_ meta;   //!< the same shape native outputs use
+      crypto::public_key token_id;    //!< plaintext id, recovered by the scanner
+      std::uint64_t unlock_time;      //!< mirrors the chain value
+    };
+
+    //! Running totals for one token held by an account.
+    struct token_totals
+    {
+      std::uint64_t received = 0;
+      std::uint64_t sent = 0;
+      std::uint64_t locked = 0;
+    };
+
     struct account_index
     {
       db::block_id scan_height;                    //!< every output in a block <= this is present
@@ -462,13 +485,49 @@ namespace lws
       std::uint64_t total_received;
       std::vector<db::output::spend_meta_> metas;  //!< sorted by id, for find_metadata
       std::vector<locked_entry> locked;            //!< output-walk order
+      std::vector<token_meta> token_metas;         //!< sorted by meta.id, for find_token_metadata
+      /*! Received-per-token, accumulated over the same walk that builds `metas`.
+
+          A flat vector rather than a map: crypto::public_key has neither an
+          ordering nor a std::hash, and an account holds a handful of tokens at
+          most, so a linear probe is cheaper than the machinery to avoid it. */
+      std::vector<std::pair<crypto::public_key, std::uint64_t>> token_received;
     };
 
     std::size_t index_bytes(const account_index& self) noexcept
     {
       return sizeof(account_index)
         + self.metas.capacity() * sizeof(db::output::spend_meta_)
-        + self.locked.capacity() * sizeof(locked_entry);
+        + self.locked.capacity() * sizeof(locked_entry)
+        + self.token_metas.capacity() * sizeof(token_meta)
+        + self.token_received.capacity() * sizeof(std::pair<crypto::public_key, std::uint64_t>);
+    }
+
+    //! \return Running total for `id` in `totals`, inserting a zero entry if new.
+    template<typename Assoc>
+    typename Assoc::value_type::second_type& token_slot(Assoc& totals, const crypto::public_key& id)
+    {
+      for (auto& entry : totals)
+      {
+        if (entry.first == id)
+          return entry.second;
+      }
+      totals.emplace_back(id, typename Assoc::value_type::second_type{});
+      return totals.back().second;
+    }
+
+    //! Same binary search as `find_metadata`, over the token projection.
+    std::vector<token_meta>::const_iterator
+    find_token_metadata(std::vector<token_meta> const& metas, db::output_id id)
+    {
+      struct by_id
+      {
+        bool operator()(token_meta const& left, db::output_id const& right) const noexcept
+        { return left.meta.id < right; }
+        bool operator()(db::output_id const& left, token_meta const& right) const noexcept
+        { return left < right.meta.id; }
+      };
+      return std::lower_bound(metas.begin(), metas.end(), id, by_id{});
     }
 
     /*! \return Cached output projection for `user`, extended or rebuilt as needed.
@@ -552,6 +611,8 @@ namespace lws
         fresh->metas = base->metas;
         fresh->locked = base->locked;
         fresh->total_received = base->total_received;
+        fresh->token_metas = base->token_metas;
+        fresh->token_received = base->token_received;
       }
 
       /* Seek past what is already held. `base->scan_height` is the last block whose
@@ -571,16 +632,33 @@ namespace lws
 
       for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
       {
-        // HF22: a privacy-token output's amount is denominated in that token,
-        // not BDX. Letting one through here reports a wallet holding 1000 DEMO
-        // as if it held an extra 1,000,000 BDX, and offers the output up as
-        // spendable coin for a native send. Native outputs carry a null
-        // token_id; token balances are accounted per-token, not here.
-        if (output.get_value<MONERO_FIELD(db::output, token_id)>() != crypto::public_key{})
-          continue;
-
         const db::output::spend_meta_ meta =
           output.get_value<MONERO_FIELD(db::output, spend_meta)>();
+
+        /* HF22: a privacy-token output's amount is denominated in that token, not
+           BDX. Summing one into total_received would report a wallet holding 1000
+           DEMO as if it held an extra 1,000,000 BDX, and offer the output up as
+           spendable coin for a native send. Native outputs carry a null token_id;
+           token amounts are accumulated per token instead.
+
+           They are kept, not discarded: a spend is resolved by output id, and an
+           unresolvable one is a hard error, so dropping these would make the first
+           spend of a token output fail the whole balance request. */
+        const crypto::public_key tid =
+          output.get_value<MONERO_FIELD(db::output, token_id)>();
+        if (tid != crypto::public_key{})
+        {
+          const token_meta entry{
+            meta, tid, output.get_value<MONERO_FIELD(db::output, unlock_time)>()
+          };
+          if (fresh->token_metas.empty() || fresh->token_metas.back().meta.id < meta.id)
+            fresh->token_metas.push_back(entry);
+          else
+            fresh->token_metas.insert(find_token_metadata(fresh->token_metas, meta.id), entry);
+
+          token_slot(fresh->token_received, tid) += meta.amount;
+          continue;
+        }
 
         // these outputs will usually be in correct order post ringct
         if (fresh->metas.empty() || fresh->metas.back().id < meta.id)
@@ -852,6 +930,10 @@ namespace lws
         std::uint64_t returned = 0;
         std::uint64_t last_returned_height = 0;
 
+        /* Per-request, not cached with the projection: an incremental caller seeks
+           the spends cursor, so this is delta-scoped exactly like total_sent. */
+        std::vector<std::pair<crypto::public_key, std::uint64_t>> token_sent;
+
         resp.spent_outputs.reserve(reserve_for(*spends, req.min_height, req.max_count));
         for (auto const &spend : spends->make_range())
         {
@@ -865,6 +947,20 @@ namespace lws
           const auto meta = find_metadata(metas, spend.source);
           if (meta == metas.end() || meta->id != spend.source)
           {
+            /* Not a native output. Before treating this as corruption, check the
+               token projection: a spent privacy-token output is a legitimate
+               receive that simply is not denominated in BDX. Its amount must not
+               reach total_sent, or spending 1000 DEMO would read as 1000 BDX
+               leaving the wallet. */
+            const auto token = find_token_metadata(outputs.token_metas, spend.source);
+            if (token != outputs.token_metas.end() && token->meta.id == spend.source)
+            {
+              token_slot(token_sent, token->token_id) += token->meta.amount;
+              ++returned;
+              last_returned_height = spend_height;
+              continue;
+            }
+
             throw std::logic_error{
               "Serious database error, no receive for spend"
             };
@@ -874,6 +970,44 @@ namespace lws
           resp.total_sent = rpc::safe_uint64(std::uint64_t(resp.total_sent) + meta->amount);
           ++returned;
           last_returned_height = spend_height;
+        }
+
+        /* One entry per token the account has ever received, even where the whole
+           balance has since been spent - a zero row is information (the wallet
+           held this token) and dropping it would make a fully-spent token vanish
+           from the client's history without explanation.
+
+           `locked` is summed here rather than cached for the same reason
+           locked_funds is: a timestamp-based unlock_time is measured against the
+           wall clock, so it is not a pure function of scanned state. The
+           master-node blacklist is deliberately not consulted - it stakes BDX,
+           never tokens. */
+        resp.tokens.reserve(outputs.token_received.size());
+        for (const auto& received : outputs.token_received)
+        {
+          std::uint64_t locked = 0;
+          for (const token_meta& out : outputs.token_metas)
+          {
+            if (out.token_id == received.first &&
+                is_locked(out.unlock_time, user->first.scan_height))
+              locked += out.meta.amount;
+          }
+
+          std::uint64_t sent = 0;
+          for (const auto& entry : token_sent)
+          {
+            if (entry.first == received.first)
+              sent = entry.second;
+          }
+
+          resp.tokens.push_back(
+            rpc::token_balance{
+              received.first,
+              rpc::safe_uint64(received.second),
+              rpc::safe_uint64(sent),
+              rpc::safe_uint64(locked)
+            }
+          );
         }
 
         return resp;
@@ -1311,6 +1445,348 @@ namespace lws
           }
         }
 
+        return resp;
+      }
+    };
+
+    /*! \return The daemon's `result` object for `method`, or an error.
+
+        Token state lives in the daemon's blockchain database and nowhere else -
+        the LWS scans outputs, not descriptors - so these two endpoints exist only
+        to spare the wallet a second connection to a host it is not allowed to
+        reach. Written against the same JSON-RPC transport daemon_status uses. */
+    std::error_code daemon_token_call(const char* method, nlohmann::json params, nlohmann::json& out)
+    {
+      const nlohmann::json body = {
+        {"jsonrpc", "2.0"}, {"id", "0"}, {"method", method}, {"params", std::move(params)}
+      };
+
+      const auto reply = cpr::Post(
+        cpr::Url{lws::daemon_add},
+        cpr::Body{body.dump()},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Timeout{std::chrono::milliseconds{30000}}
+      );
+
+      if (reply.status_code != 200)
+      {
+        MERROR(method << " call failed with HTTP code: " << reply.status_code);
+        return make_error_code(std::errc::io_error);
+      }
+
+      nlohmann::json parsed;
+      try
+      {
+        parsed = nlohmann::json::parse(reply.text);
+      }
+      catch (const std::exception& e)
+      {
+        MERROR(method << " JSON parse failed: " << e.what());
+        return make_error_code(std::errc::invalid_argument);
+      }
+
+      const nlohmann::json& env = deep_unwrap(parsed);
+      // A daemon "error" here is usually the caller's fault - an unknown token id
+      // - so it is reported as a bad request rather than a server failure.
+      if (env.is_object() && env.contains("error"))
+      {
+        /* Almost always an unknown token id, which is the caller's business and
+           not a fault here. It has to stay distinguishable from "this server
+           cannot answer at all": a wallet that cannot tell them apart either
+           accuses the chain of losing a registration, or hides one that really
+           did fail. This path answers 400 with a message; a server without these
+           routes answers a bare 404. */
+        MINFO(method << " rejected by daemon: " << env.at("error").dump());
+        return lws::error::token_not_found;
+      }
+      if (!env.is_object() || !env.contains("result"))
+      {
+        MERROR("Missing 'result' in " << method << " response");
+        return make_error_code(std::errc::protocol_error);
+      }
+      /* Assigned, not returned through expect<nlohmann::json>. expect constructs
+         its value with T{...}, and for nlohmann::json brace-init selects the
+         initializer-list constructor: `json{obj}` is the ARRAY [obj], not a copy
+         of obj. The daemon's object arrived intact and came back out wrapped,
+         and every field read then failed with "cannot use value() with array".
+         An out-parameter uses plain assignment and has no such ambiguity. */
+      out = deep_unwrap(env.at("result"));
+      return {};
+    }
+
+    /*! Short-lived cache of token descriptors.
+
+        The balance endpoint is polled on a timer, and an account holding ten
+        tokens would otherwise put ten daemon round-trips behind every poll of
+        every wallet. A descriptor only moves when someone mints, updates or
+        burns, so serving a few seconds stale costs nothing and the supply figure
+        catches up on the next tick. Same reasoning as the master-node cache. */
+    constexpr const std::chrono::seconds token_descriptor_ttl{15};
+
+    struct cached_descriptor
+    {
+      rpc::get_token_info_response value;
+      bool found = false;    //!< false = the chain has no such token
+      std::chrono::steady_clock::time_point fetched;
+    };
+
+    std::mutex token_cache_mutex;
+    std::unordered_map<std::string, cached_descriptor> token_cache;
+
+    std::error_code daemon_token_call(const char* method, nlohmann::json params, nlohmann::json& out);
+
+    /*! \return Descriptor for `id`, from cache when fresh.
+        \param found set false when the chain has no such token - which is a real
+          answer, cached like any other, so a wallet asking about an unmined
+          registration on a timer does not re-ask the daemon every few seconds. */
+    expect<rpc::get_token_info_response> token_descriptor(const std::string& id, bool& found)
+    {
+      const auto now = std::chrono::steady_clock::now();
+      {
+        const std::lock_guard<std::mutex> lock{token_cache_mutex};
+        const auto it = token_cache.find(id);
+        if (it != token_cache.end() && now - it->second.fetched < token_descriptor_ttl)
+        {
+          found = it->second.found;
+          return it->second.value;
+        }
+      }
+
+      nlohmann::json r;
+      const std::error_code err = daemon_token_call("get_token_info", {{"token_id", id}}, r);
+      cached_descriptor entry{};
+      entry.fetched = now;
+
+      if (err == lws::error::token_not_found)
+        entry.found = false;               // a definite "no", worth caching
+      else if (err)
+        return err;                        // daemon unreachable: do not cache
+      else
+      {
+        entry.found = true;
+        try
+        {
+          entry.value.token_id         = r.value("token_id", id);
+          entry.value.ticker           = r.value("ticker", std::string{});
+          entry.value.full_name        = r.value("full_name", std::string{});
+          entry.value.owner            = r.value("owner", std::string{});
+          entry.value.meta_info        = r.value("meta_info", std::string{});
+          entry.value.current_supply   = rpc::safe_uint64(r.value("current_supply", std::uint64_t{0}));
+          entry.value.total_max_supply = rpc::safe_uint64(r.value("total_max_supply", std::uint64_t{0}));
+          entry.value.decimal_point    = r.value("decimal_point", std::uint32_t{0});
+        }
+        catch (const std::exception& e)
+        {
+          MERROR("Unexpected get_token_info payload: " << e.what());
+          return make_error_code(std::errc::protocol_error);
+        }
+      }
+
+      {
+        const std::lock_guard<std::mutex> lock{token_cache_mutex};
+        token_cache[id] = entry;
+      }
+      found = entry.found;
+      return entry.value;
+    }
+
+    /*! Per-token holdings and identity for one account, in a single request.
+
+        get_address_info already carries the balances, but a wallet cannot render
+        them from that alone: an amount in a token's own atomic units is
+        meaningless without the ticker and decimal scale, and those live on the
+        daemon. Resolving them client-side meant a request per token on every
+        refresh. This answers the whole screen at once. */
+    struct get_token_balances
+    {
+      using request = rpc::get_token_balances_request;
+      using response = rpc::get_token_balances_response;
+
+      static expect<response> handle(const request& req, db::storage disk)
+      {
+        auto user = open_account(req.creds, std::move(disk));
+        if (!user)
+          return user.error();
+
+        auto index = get_account_index(user->second, user->first);
+        if (!index)
+          return index.error();
+        const account_index& outputs = **index;
+
+        /* Spends are walked in full rather than paginated: this endpoint reports
+           a balance, and a partial walk would report a balance that is too high
+           by whatever it skipped. */
+        auto spends = user->second.get_spends(user->first.id);
+        if (!spends)
+          return spends.error();
+
+        std::vector<std::pair<crypto::public_key, std::uint64_t>> token_sent;
+        for (const auto& spend : spends->make_range())
+        {
+          const auto token = find_token_metadata(outputs.token_metas, spend.source);
+          if (token != outputs.token_metas.end() && token->meta.id == spend.source)
+            token_slot(token_sent, token->token_id) += token->meta.amount;
+        }
+
+        const expect<db::block_info> last = user->second.get_last_block();
+        if (!last)
+          return last.error();
+
+        response resp{};
+        resp.blockchain_height = std::uint64_t(last->id);
+        resp.scanned_height = std::uint64_t(user->first.scan_height);
+
+        // Held first, then anything extra the caller asked about that is not
+        // already covered.
+        std::vector<std::string> ids;
+        ids.reserve(outputs.token_received.size() + req.token_ids.size());
+        for (const auto& held : outputs.token_received)
+          ids.push_back(epee::string_tools::pod_to_hex(held.first));
+        for (const std::string& asked : req.token_ids)
+        {
+          if (asked.size() == 64 && oxenc::is_hex(asked) &&
+              std::find(ids.begin(), ids.end(), asked) == ids.end())
+            ids.push_back(asked);
+        }
+
+        resp.tokens.reserve(ids.size());
+        for (const std::string& id : ids)
+        {
+          crypto::public_key raw{};
+          if (!epee::string_tools::hex_to_pod(id, raw))
+            continue;
+
+          rpc::token_balance_entry entry{};
+          entry.token_id = id;
+
+          std::uint64_t received = 0;
+          for (const auto& held : outputs.token_received)
+          {
+            if (held.first == raw)
+              received = held.second;
+          }
+          std::uint64_t sent = 0;
+          for (const auto& gone : token_sent)
+          {
+            if (gone.first == raw)
+              sent = gone.second;
+          }
+          std::uint64_t locked = 0;
+          for (const token_meta& out : outputs.token_metas)
+          {
+            if (out.token_id == raw && is_locked(out.unlock_time, user->first.scan_height))
+              locked += out.meta.amount;
+          }
+
+          entry.total_received = rpc::safe_uint64(received);
+          entry.total_sent = rpc::safe_uint64(sent);
+          entry.locked_funds = rpc::safe_uint64(locked);
+          // Saturated rather than wrapped: a spend can only consume an output
+          // this account received, so an underflow would be a bug elsewhere -
+          // and reporting a spendable balance near 2^64 would be far worse than
+          // reporting zero.
+          const std::uint64_t spent_and_locked = sent + locked;
+          entry.unlocked_balance =
+            rpc::safe_uint64(received > spent_and_locked ? received - spent_and_locked : 0);
+
+          bool found = false;
+          const auto descriptor = token_descriptor(id, found);
+          if (!descriptor)
+          {
+            // The daemon could not be reached. Say so rather than implying the
+            // token does not exist - the balance above is still good.
+            entry.status = "unknown";
+          }
+          else if (!found)
+            entry.status = "not_found";
+          else
+          {
+            entry.status = "confirmed";
+            entry.ticker = descriptor->ticker;
+            entry.full_name = descriptor->full_name;
+            entry.owner = descriptor->owner;
+            entry.meta_info = descriptor->meta_info;
+            entry.current_supply = descriptor->current_supply;
+            entry.total_max_supply = descriptor->total_max_supply;
+            entry.decimal_point = descriptor->decimal_point;
+          }
+
+          resp.tokens.push_back(std::move(entry));
+        }
+
+        return resp;
+      }
+    };
+
+    struct get_token_info
+    {
+      using request = rpc::get_token_info_request;
+      using response = rpc::get_token_info_response;
+
+      static expect<response> handle(const request& req, const db::storage&)
+      {
+        // Checked here as well as by the daemon so a malformed id costs a string
+        // comparison rather than a network round-trip.
+        if (req.token_id.size() != 64 || !oxenc::is_hex(req.token_id))
+          return {lws::error::token_not_found};
+
+        nlohmann::json r;
+        if (const std::error_code err = daemon_token_call("get_token_info", {{"token_id", req.token_id}}, r))
+          return err;
+
+        response resp{};
+        try
+        {
+          resp.token_id         = r.value("token_id", req.token_id);
+          resp.ticker           = r.value("ticker", std::string{});
+          resp.full_name        = r.value("full_name", std::string{});
+          resp.owner            = r.value("owner", std::string{});
+          resp.meta_info        = r.value("meta_info", std::string{});
+          resp.current_supply   = rpc::safe_uint64(r.value("current_supply", std::uint64_t{0}));
+          resp.total_max_supply = rpc::safe_uint64(r.value("total_max_supply", std::uint64_t{0}));
+          resp.decimal_point    = r.value("decimal_point", std::uint32_t{0});
+        }
+        catch (const std::exception& e)
+        {
+          MERROR("Unexpected get_token_info payload: " << e.what());
+          return make_error_code(std::errc::protocol_error);
+        }
+        return resp;
+      }
+    };
+
+    struct get_token_list
+    {
+      using request = rpc::get_token_list_request;
+      using response = rpc::get_token_list_response;
+
+      static expect<response> handle(const request& req, const db::storage&)
+      {
+        // Bounded like get_random_outs: this walks every token on the chain, and
+        // an unbounded count would let one request pull the whole table.
+        if (1000 < req.count)
+          return {lws::error::exceeded_rest_request_limit};
+
+        nlohmann::json r;
+        if (const std::error_code err = daemon_token_call(
+              "get_token_list", {{"offset", req.offset}, {"count", req.count}}, r))
+          return err;
+
+        response resp{};
+        try
+        {
+          if (r.contains("token_ids") && r.at("token_ids").is_array())
+          {
+            for (const auto& id : r.at("token_ids"))
+              resp.token_ids.push_back(id.get<std::string>());
+          }
+          resp.total_count = r.value("total_count", std::uint64_t{resp.token_ids.size()});
+        }
+        catch (const std::exception& e)
+        {
+          MERROR("Unexpected get_token_list payload: " << e.what());
+          return make_error_code(std::errc::protocol_error);
+        }
         return resp;
       }
     };
@@ -1848,6 +2324,9 @@ namespace lws
       {"/get_address_info",      call<get_address_info>, 2 * 1024},
       {"/get_address_txs",       call_get_address_txs,   2 * 1024},
       {"/get_random_outs",       call<get_random_outs>,  2 * 1024},
+      {"/get_token_balances",    call<get_token_balances>, 8 * 1024},
+      {"/get_token_info",        call<get_token_info>,   2 * 1024},
+      {"/get_token_list",        call<get_token_list>,   2 * 1024},
             // {"/get_txt_records",       nullptr,                0       },
       {"/get_unspent_outs",      call<get_unspent_outs>, 2 * 1024},
       {"/import_request",        call<import_request>,   2 * 1024},
@@ -1981,6 +2460,14 @@ namespace lws
         {
           response.m_response_code = 403;
           response.m_response_comment = "Forbidden";
+        }
+        else if (body == lws::error::token_not_found)
+        {
+          // Deliberately not 404: a bare 404 is what a server that has never
+          // heard of these routes returns, and the client has to tell "no such
+          // token" from "no such endpoint".
+          response.m_response_code = 400;
+          response.m_response_comment = "Bad Request";
         }
         else if (body.matches(std::errc::timed_out) || body.matches(std::errc::no_lock_available))
         {

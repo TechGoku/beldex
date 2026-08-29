@@ -248,6 +248,16 @@ namespace lws
     );
   }
 
+  void rpc::write_bytes(wire::json_writer& dest, const token_balance& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD_COPY(token_id),
+      WIRE_FIELD_COPY(total_received),
+      WIRE_FIELD_COPY(total_sent),
+      WIRE_FIELD_COPY(locked_funds)
+    );
+  }
+
   void rpc::write_bytes(wire::json_writer& dest, const get_address_info_response& self)
   {
     wire::object(dest,
@@ -260,7 +270,8 @@ namespace lws
       WIRE_FIELD_COPY(transaction_height),
       WIRE_FIELD_COPY(blockchain_height),
       WIRE_FIELD_COPY(next_min_height),
-      WIRE_FIELD(spent_outputs)
+      WIRE_FIELD(spent_outputs),
+      WIRE_FIELD(tokens)
       // WIRE_OPTIONAL_FIELD(rates)
     );
   }
@@ -314,6 +325,81 @@ namespace lws
       WIRE_FIELD_COPY(next_min_height),
       wire::field("transactions", wire::as_array(boost::adaptors::index(self.transactions)))
     );
+  }
+
+  void rpc::write_bytes(wire::json_writer& dest, const token_balance_entry& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(token_id),
+      WIRE_FIELD(status),
+      WIRE_FIELD_COPY(total_received),
+      WIRE_FIELD_COPY(total_sent),
+      WIRE_FIELD_COPY(locked_funds),
+      WIRE_FIELD_COPY(unlocked_balance),
+      WIRE_FIELD(ticker),
+      WIRE_FIELD(full_name),
+      WIRE_FIELD(owner),
+      WIRE_FIELD(meta_info),
+      WIRE_FIELD_COPY(current_supply),
+      WIRE_FIELD_COPY(total_max_supply),
+      WIRE_FIELD_COPY(decimal_point)
+    );
+  }
+  void rpc::read_bytes(wire::json_reader& source, get_token_balances_request& self)
+  {
+    std::string address;
+    boost::optional<std::vector<std::string>> token_ids;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      wire::optional_field("token_ids", std::ref(token_ids))
+    );
+    if (token_ids)
+      self.token_ids = std::move(*token_ids);
+    convert_address(address, self.creds.address);
+  }
+  void rpc::write_bytes(wire::json_writer& dest, const get_token_balances_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(tokens),
+      WIRE_FIELD_COPY(scanned_height),
+      WIRE_FIELD_COPY(blockchain_height)
+    );
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, get_token_info_request& self)
+  {
+    wire::object(source, WIRE_FIELD(token_id));
+  }
+  void rpc::write_bytes(wire::json_writer& dest, const get_token_info_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(token_id),
+      WIRE_FIELD(ticker),
+      WIRE_FIELD(full_name),
+      WIRE_FIELD(owner),
+      WIRE_FIELD(meta_info),
+      WIRE_FIELD_COPY(current_supply),
+      WIRE_FIELD_COPY(total_max_supply),
+      WIRE_FIELD_COPY(decimal_point)
+    );
+  }
+  void rpc::read_bytes(wire::json_reader& source, get_token_list_request& self)
+  {
+    // Both fields are optional; the struct's defaults (offset 0, count 100)
+    // stand when the caller omits them.
+    boost::optional<std::uint64_t> offset;
+    boost::optional<std::uint64_t> count;
+    wire::object(source,
+      wire::optional_field("offset", std::ref(offset)),
+      wire::optional_field("count", std::ref(count))
+    );
+    if (offset) self.offset = *offset;
+    if (count)  self.count  = *count;
+  }
+  void rpc::write_bytes(wire::json_writer& dest, const get_token_list_response& self)
+  {
+    wire::object(dest, WIRE_FIELD(token_ids), WIRE_FIELD_COPY(total_count));
   }
 
   void rpc::read_bytes(wire::json_reader& source, get_random_outs_request& self)

@@ -240,6 +240,46 @@ namespace lws
               }
             }
           }
+          else if (cryptonote::txin_zc_input const* const zc_data =
+                     std::get_if<cryptonote::txin_zc_input>(std::addressof(in)))
+          {
+            /* HF22: the input side of a privacy-token spend - a burn, a mint, or
+               a token transfer. Without this branch the spend is silently not
+               recorded, and the account keeps counting an output it no longer
+               owns: a burn that consumed 1,000,000 and returned 750,000 in
+               change reported 1,750,000, because the change was added and
+               nothing was ever taken away.
+
+               Token outputs are stored under amount 0 (see the storing side
+               below), so the lookup uses 0 rather than an input amount - which
+               txin_zc_input does not carry, the value being hidden in the
+               commitment. */
+            mixin = boost::numeric_cast<std::uint32_t>(
+              std::max(std::size_t(1), zc_data->key_offsets.size()) - 1
+            );
+
+            std::uint64_t goffset = 0;
+            for (std::uint64_t offset : zc_data->key_offsets)
+            {
+              goffset += offset;
+              if (user.has_spendable(db::output_id{0, goffset}))
+              {
+                user.add_spend(
+                    db::spend{
+                        db::transaction_link{height, tx_hash},
+                        zc_data->k_image,
+                        db::output_id{0, goffset},
+                        timestamp,
+                        tx.unlock_time,
+                        mixin,
+                        {0, 0, 0}, // reserved
+                        payment_id.first,
+                        payment_id.second.long_
+                    }
+                );
+              }
+            }
+          }
           else if (std::get_if<cryptonote::txin_gen>(std::addressof(in)))
             ext = db::extra(ext | db::coinbase_output);
         }

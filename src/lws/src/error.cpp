@@ -72,6 +72,8 @@ namespace lws
         return "The daemon failed to relay transaction from REST client";
       case error::status_failed:
         return "The daemon failed to accept transaction from REST client";
+      case error::token_not_found:
+        return "No such privacy token on the chain";
       default:
         break;
       }

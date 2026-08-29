@@ -307,12 +307,31 @@ namespace cryptonote
   {
     wire::object(source, WIRE_FIELD(amount), WIRE_FIELD(key_offsets), wire::field("k_image", std::ref(self.k_image)));
   }
+  /* HF22: the input side of a privacy-token spend.
+
+     Mirrors tx_out_zarcanum on the output side. A token output is consumed by
+     this variant rather than txin_to_key, so any transaction that SPENDS a
+     token - a burn, a mint, a transfer - carries one. Without it the reader
+     throws "Schema expected object" on the whole get_blocks_fast reply and the
+     scan threads die, which takes the light wallet server down with them: not
+     just the token accounts, every account, from the first such block onward.
+
+     The shape is txin_to_key's minus `amount` - a token amount is hidden in the
+     commitment and is not on the input. */
+  static void read_bytes(wire::json_reader& source, txin_zc_input& self)
+  {
+    wire::object(source,
+      WIRE_FIELD(key_offsets),
+      wire::field("k_image", std::ref(self.k_image))
+    );
+  }
   static void read_bytes(wire::json_reader& source, txin_v& self)
   {
     wire::object(source,
       wire::variant_field("transaction input variant", std::ref(self),
         wire::option<txin_to_key>{"key"},
         wire::option<txin_gen>{"gen"},
+        wire::option<txin_zc_input>{"zc_input"},
         wire::option<txin_to_script>{"to_script"},
         wire::option<txin_to_scripthash>{"to_scripthash"}
       )
