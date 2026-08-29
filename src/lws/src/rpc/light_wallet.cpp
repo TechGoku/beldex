@@ -299,6 +299,15 @@ namespace lws
 
   namespace rpc
   {
+    static void write_bytes(wire::json_writer& dest, const get_address_txs_response::transaction::token_leg& self)
+    {
+      wire::object(dest,
+        WIRE_FIELD_COPY(token_id),
+        wire::field("received", safe_uint64(self.received)),
+        wire::field("sent", safe_uint64(self.sent))
+      );
+    }
+
     static void write_bytes(wire::json_writer& dest, boost::range::index_value<const get_address_txs_response::transaction&> self)
     {
       epee::span<const std::uint8_t> const* payment_id = nullptr;
@@ -317,15 +326,10 @@ namespace lws
 
       const bool is_coinbase = (extra.first & db::coinbase_output);
 
-      crypto::public_key const* token_id = nullptr;
-      boost::optional<safe_uint64> token_received;
-      boost::optional<safe_uint64> token_sent;
-      if (self.value().token_id != crypto::public_key{})
-      {
-        token_id = std::addressof(self.value().token_id);
-        token_received = safe_uint64(self.value().token_received);
-        token_sent = safe_uint64(self.value().token_sent);
-      }
+
+      std::vector<get_address_txs_response::transaction::token_leg> const* token_legs = nullptr;
+      if (!self.value().token_legs.empty())
+        token_legs = std::addressof(self.value().token_legs);
 
       wire::object(dest,
         wire::field("id", std::uint64_t(self.index())),
@@ -340,11 +344,10 @@ namespace lws
         wire::field("mempool", false),
         wire::field("mixin", self.value().info.spend_meta.mixin_count),
         wire::field("spent_outputs", std::cref(self.value().spends)),
-        // HF22: present only when this entry moved a privacy token, so an
-        // ordinary BDX transaction is byte-for-byte what it always was.
-        wire::optional_field("token_id", token_id),
-        wire::optional_field("token_received", token_received),
-        wire::optional_field("token_sent", token_sent)
+        // HF22: one entry per token this transaction moved. Omitted entirely
+        // for an ordinary BDX transaction, so those are byte-for-byte what
+        // they always were.
+        wire::optional_field("token_legs", token_legs)
       );
     }
   } // rpc
@@ -460,6 +463,7 @@ namespace lws
     boost::optional<std::uint64_t> min_height;
     boost::optional<std::uint64_t> max_count;
     boost::optional<std::string> token_id;
+    boost::optional<bool> all_tokens;
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
@@ -469,10 +473,12 @@ namespace lws
       WIRE_OPTIONAL_FIELD(dust_threshold),
       wire::optional_field("min_height", std::ref(min_height)),
       wire::optional_field("max_count", std::ref(max_count)),
-      wire::optional_field("token_id", std::ref(token_id))
+      wire::optional_field("token_id", std::ref(token_id)),
+      wire::optional_field("all_tokens", std::ref(all_tokens))
     );
     if (token_id)
       self.token_id = std::move(*token_id);
+    self.all_tokens = all_tokens.value_or(false);
     convert_address(address, self.creds.address);
     self.min_height = min_height.value_or(0);
     self.max_count = max_count.value_or(0);

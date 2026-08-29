@@ -134,16 +134,37 @@ namespace rpc
         db::output info;
         std::vector<transaction_spend> spends;
         std::uint64_t spent;
-        /*! HF22: the privacy token this entry moved, if any.
+        /*! HF22: what this entry moved, per token.
 
             Kept beside the BDX figures rather than folded into them: a token
             amount is denominated in its own token, so adding it to `info`'s
-            amount would report a transfer of 1,200 POP as 1,200 BDX. Null
-            token_id means an ordinary BDX transaction, which is every entry a
-            pre-HF22 wallet will ever see. */
-        crypto::public_key token_id{};
-        std::uint64_t token_received = 0;
-        std::uint64_t token_sent = 0;
+            amount would report a transfer of 1,200 POP as 1,200 BDX.
+
+            A list rather than one id and one pair, because a single
+            transaction can touch more than one token - and does so routinely
+            even when the owner only moved one, since any of the account's
+            outputs may appear as a decoy in the rings. Collapsing them summed
+            unrelated tokens together and reported, for instance, 1,010 sent of
+            a token the account had only ever held 1,000 of. Empty for an
+            ordinary BDX transaction, which is every entry a pre-HF22 wallet
+            will ever see. */
+        struct token_leg
+        {
+          crypto::public_key token_id{};
+          std::uint64_t received = 0;
+          std::uint64_t sent = 0;
+        };
+        std::vector<token_leg> token_legs;
+
+        //! \return The leg for `id`, appending one if this is its first sight.
+        token_leg& leg(const crypto::public_key& id)
+        {
+          for (token_leg& l : token_legs)
+            if (l.token_id == id)
+              return l;
+          token_legs.push_back(token_leg{id, 0, 0});
+          return token_legs.back();
+        }
       };
 
       safe_uint64 total_received;
@@ -342,6 +363,17 @@ namespace rpc
           two pools at once: token outputs for the amount, native outputs for
           the fee, which is always paid in BDX. The client separates them. */
       std::string token_id;
+      /*! Return every token's outputs, not just one.
+
+          A wallet cannot trust the server's per-token `total_sent`: this server
+          is view-only, so it counts a spend for any ring member it owns and
+          cannot tell a decoy from a real spend. The wallet settles that itself
+          by computing each output's key image and checking it against
+          `spend_key_images` - the same test it already applies when choosing
+          inputs. Doing that for every token in one request is what this flag is
+          for; without it the wallet would need a call per token on every
+          balance refresh. */
+      bool all_tokens = false;
     };
     void read_bytes(wire::json_reader&, get_unspent_outs_request&);
 

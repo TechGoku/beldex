@@ -1099,7 +1099,8 @@ namespace lws
              a token transfer spends token outputs for the amount and native
              outputs for the fee, which is always BDX. The client partitions
              them by the token_id carried on each output. */
-          if (out.token_id != crypto::public_key{} && out.token_id != wanted_token)
+          if (out.token_id != crypto::public_key{} && !req.all_tokens &&
+              out.token_id != wanted_token)
             continue;
 
           // Nor a still-locked output. An HF22 registration locks its 10,000 BDX
@@ -1350,8 +1351,7 @@ namespace lws
                 resp.transactions.push_back({full_out});
                 resp.transactions.back().info.spend_meta.amount = 0; // no BDX moved
               }
-              resp.transactions.back().token_id = out_tid;
-              resp.transactions.back().token_received += full_out.spend_meta.amount;
+              resp.transactions.back().leg(out_tid).received += full_out.spend_meta.amount;
 
               ++output;
               if (!output.is_end())
@@ -1440,8 +1440,7 @@ namespace lws
                   resp.transactions.back().info.timestamp = full_spend.timestamp;
                   resp.transactions.back().info.unlock_time = full_spend.unlock_time;
                 }
-                resp.transactions.back().token_id = token->token_id;
-                resp.transactions.back().token_sent += token->meta.amount;
+                resp.transactions.back().leg(token->token_id).sent += token->meta.amount;
 
                 ++spend;
                 if (!spend.is_end())
