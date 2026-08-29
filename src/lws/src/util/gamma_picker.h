@@ -8,6 +8,13 @@ namespace lws
   class gamma_picker
   {
     std::vector<uint64_t> rct_offsets;
+    /*! Rank-to-global-index map, empty for the native bucket.
+
+        The distribution for privacy tokens counts ranks within the token
+        output set, not global output ids, so a rank picked from it has to be
+        translated before it means anything to the daemon. Doing it here keeps
+        every caller downstream working in one index space. */
+    std::vector<uint64_t> bucket_to_global;
     std::gamma_distribution<double> gamma;
     double outputs_per_second;
 
@@ -20,6 +27,8 @@ namespace lws
 
     //! Use default (recommended) gamma parameters with `rct_offsets`.
     explicit gamma_picker(std::vector<std::uint64_t> rct_offsets);
+    //! Token bucket: ranks from `rct_offsets` are mapped through `indices`.
+    gamma_picker(std::vector<std::uint64_t> rct_offsets, std::vector<std::uint64_t> indices);
     explicit gamma_picker(std::vector<std::uint64_t> rct_offsets, double shape, double scale);
 
     //! \post Source of move `!is_valid()`.

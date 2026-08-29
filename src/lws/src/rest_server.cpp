@@ -1025,6 +1025,14 @@ namespace lws
         if (!user)
           return user.error();
 
+        // Empty is the common case and means native only, which is what every
+        // pre-HF22 caller sends. A malformed id is treated as no id rather than
+        // an error: it can only ever widen what is offered, and refusing would
+        // break a caller that sent a stray empty string.
+        crypto::public_key wanted_token{};
+        if (req.token_id.size() == 64 && oxenc::is_hex(req.token_id))
+          (void)epee::string_tools::hex_to_pod(req.token_id, wanted_token);
+
         auto master_node_data = get_master_node_cache();
         if (!master_node_data)
           return master_node_data.error();
@@ -1082,12 +1090,16 @@ namespace lws
             break;
           }
 
-          // HF22: never offer a privacy-token output as spendable coin. Its
-          // amount is denominated in that token, and a wallet that picks one up
-          // for a native send builds a transaction the daemon rejects outright
-          // ("ringct non-semantics verification failed"). Token spending needs
-          // its own selection path; this endpoint is native-only.
-          if (out.token_id != crypto::public_key{})
+          /* HF22: a privacy-token output is only offered when the caller named
+             that token. Its amount is denominated in the token, so a wallet
+             that picks one up for a native send builds a transaction the daemon
+             rejects outright ("ringct non-semantics verification failed").
+
+             When the caller does name it, both pools come back in one reply:
+             a token transfer spends token outputs for the amount and native
+             outputs for the fee, which is always BDX. The client partitions
+             them by the token_id carried on each output. */
+          if (out.token_id != crypto::public_key{} && out.token_id != wanted_token)
             continue;
 
           // Nor a still-locked output. An HF22 registration locks its 10,000 BDX
@@ -1128,7 +1140,13 @@ namespace lws
 
           if (!should_skip_output)
           {
-            received += out.spend_meta.amount;
+            // `received` is the reply's native total. A token amount is
+            // denominated in its own token, so summing one here would inflate
+            // the BDX figure by whatever the token happens to be worth in its
+            // own units. The token outputs still travel in `unspent`; only this
+            // scalar stays native.
+            if (out.token_id == crypto::public_key{})
+              received += out.spend_meta.amount;
             unspent.push_back({out, {}});
 
             auto images = user->second.get_images(out.spend_meta.id);
@@ -1281,6 +1299,9 @@ namespace lws
 
         resp.transactions.reserve(outputs->count());
         metas.reserve(resp.transactions.capacity());
+        // Token outputs, kept out of `metas` so their amounts never reach a BDX
+        // total, but retained so their spends stay resolvable.
+        std::vector<token_meta> token_metas;
 
         db::transaction_link next_output{};
         db::transaction_link next_spend{};
@@ -1304,13 +1325,34 @@ namespace lws
 
           if (spend.is_end() || (!output.is_end() && next_output <= next_spend))
           {
-            // HF22: a privacy-token output's amount is denominated in that
-            // token, not BDX. Folding it into the transaction's BDX amount
-            // shows a registration of 1000 DEMO (1e15 atomic at 12 decimals)
-            // as "+999999.69 BDX" received in the history. Advance past it so
-            // the entry reflects only the native value moved.
-            if (output.get_value<MONERO_FIELD(db::output, token_id)>() != crypto::public_key{})
+            /* HF22: a privacy-token output's amount is denominated in that
+               token, not BDX. Folding it into the transaction's BDX amount
+               shows a registration of 1000 DEMO as "+999999.69 BDX" received.
+               It is recorded on the entry as a token amount instead, so the
+               history can say "+1,200 POP" rather than dropping the row.
+
+               It is also kept in `token_metas` so a later spend of it can be
+               resolved: an unresolvable spend throws, and that throw took the
+               whole endpoint down - which is why history appeared empty as
+               soon as any token had been spent. */
+            const crypto::public_key out_tid =
+              output.get_value<MONERO_FIELD(db::output, token_id)>();
+            if (out_tid != crypto::public_key{})
             {
+              const db::output full_out = *output;
+              token_metas.push_back(token_meta{
+                full_out.spend_meta, out_tid, full_out.unlock_time
+              });
+
+              if (resp.transactions.empty() ||
+                  resp.transactions.back().info.link.tx_hash != next_output.tx_hash)
+              {
+                resp.transactions.push_back({full_out});
+                resp.transactions.back().info.spend_meta.amount = 0; // no BDX moved
+              }
+              resp.transactions.back().token_id = out_tid;
+              resp.transactions.back().token_received += full_out.spend_meta.amount;
+
               ++output;
               if (!output.is_end())
                 next_output = output.get_value<MONERO_FIELD(db::output, link)>();
@@ -1376,6 +1418,37 @@ namespace lws
             const auto meta = find_metadata(metas, source_id);
             if (meta == metas.end() || meta->id != source_id)
             {
+              /* Not a native output. A spent privacy-token output is a
+                 legitimate receive that simply is not denominated in BDX, so
+                 it is attributed to its token rather than treated as
+                 corruption - the throw below would take the whole endpoint
+                 down and leave the wallet with no history at all. */
+              const auto token = find_token_metadata(token_metas, source_id);
+              if (token != token_metas.end() && token->meta.id == source_id)
+              {
+                if (resp.transactions.empty() ||
+                    resp.transactions.back().info.link.tx_hash != next_spend.tx_hash)
+                {
+                  // Same header fields the native spend path fills in, so a
+                  // token-only send is not rendered as a hashless entry at
+                  // height zero.
+                  const db::spend full_spend = *spend;
+                  resp.transactions.push_back({});
+                  resp.transactions.back().info.link.height = full_spend.link.height;
+                  resp.transactions.back().info.link.tx_hash = full_spend.link.tx_hash;
+                  resp.transactions.back().info.spend_meta.mixin_count = full_spend.mixin_count;
+                  resp.transactions.back().info.timestamp = full_spend.timestamp;
+                  resp.transactions.back().info.unlock_time = full_spend.unlock_time;
+                }
+                resp.transactions.back().token_id = token->token_id;
+                resp.transactions.back().token_sent += token->meta.amount;
+
+                ++spend;
+                if (!spend.is_end())
+                  next_spend = spend.get_value<MONERO_FIELD(db::spend, link)>();
+                continue;
+              }
+
               throw std::logic_error{
                 "Serious database error, no receive for spend"
               };
@@ -1806,6 +1879,18 @@ namespace lws
         if (50 < req.count || 20 < amounts.size())
           return {lws::error::exceeded_rest_request_limit};
 
+        /* Which bucket each ring is drawn from. A transaction can need both:
+           a token transfer spends token outputs for the amount and native
+           outputs for the BDX fee. Entries beyond what the caller supplied stay
+           native, so an older client behaves exactly as before. */
+        std::vector<bool> ring_is_token(amounts.size(), false);
+        for (std::size_t i = 0; i < ring_is_token.size() && i < req.token_ids.size(); ++i)
+          ring_is_token[i] = (req.token_ids[i].size() == 64 && oxenc::is_hex(req.token_ids[i]));
+        const bool any_token =
+          std::find(ring_is_token.begin(), ring_is_token.end(), true) != ring_is_token.end();
+        std::vector<std::uint64_t> token_distribution;
+        std::vector<std::uint64_t> token_indices;
+
         const std::greater<std::uint64_t> rsort{};
         std::sort(amounts.begin(), amounts.end(), rsort);
         const std::size_t ringct_count = amounts.end() - std::lower_bound(amounts.begin(), amounts.end(), 0, rsort);
@@ -1891,14 +1976,52 @@ namespace lws
           json resp = std::move(*distribution_data);
           try
           {
+            /* The daemon buckets the distribution: filter_type 1 is native,
+               2 is privacy tokens. Both are read here because one request can
+               need both, and the token bucket also carries output_indices,
+               which maps a rank within it back to a real global output id.
+
+               A single unbucketed entry is still accepted: that is what an
+               older daemon returns, and it is the native distribution. */
             const json& dists = deep_unwrap(deep_unwrap(resp).at("result")).at("distributions");
-            if (dists.size() != 1)
+            if (dists.empty())
               return {lws::error::bad_daemon_response};
-            const json& dist0 = deep_unwrap(dists.at(0));
-            if (dist0.at("amount") != 0)
+
+            const json* native = nullptr;
+            const json* token = nullptr;
+            for (const auto& entry : dists)
+            {
+              const json& d = deep_unwrap(entry);
+              if (d.at("amount") != 0)
+                continue;
+              const std::uint8_t ftype =
+                d.contains("filter_type") ? d.at("filter_type").get<std::uint8_t>() : std::uint8_t{1};
+              if (ftype == 1 && !native) native = std::addressof(d);
+              else if (ftype == 2 && !token) token = std::addressof(d);
+            }
+            if (!native && dists.size() == 1)
+              native = std::addressof(deep_unwrap(dists.at(0)));
+            if (!native)
               return {lws::error::bad_daemon_response};
-            for (const auto& it : dist0.at("distribution"))
+
+            for (const auto& it : native->at("distribution"))
               distributions.push_back(it.get<std::uint64_t>());
+
+            if (any_token)
+            {
+              // Asked for a token ring against a daemon that cannot bucket, or
+              // a chain with no token outputs yet: there is nothing to build a
+              // ring from, and saying so beats returning native decoys that
+              // would be rejected later.
+              if (!token || !token->contains("output_indices"))
+                return {lws::error::not_enough_mixin};
+              for (const auto& it : token->at("distribution"))
+                token_distribution.push_back(it.get<std::uint64_t>());
+              for (const auto& it : token->at("output_indices"))
+                token_indices.push_back(it.get<std::uint64_t>());
+              if (token_indices.empty())
+                return {lws::error::not_enough_mixin};
+            }
           }
           catch (const std::exception& e)
           {
@@ -1925,7 +2048,6 @@ namespace lws
           // rpc::client gclient;
         public:
           zmq_fetch_keys() noexcept
-          // : gclient(std::move(src))
           {}
 
           zmq_fetch_keys(zmq_fetch_keys&&) = default;
@@ -1943,12 +2065,8 @@ namespace lws
             // get_keys_rpc::request keys_req{};
             // keys_req.outputs = std::move(ids);
             json output_indices;
-            int i =0;
-            for(auto it :ids)
-            {
+            for (auto it : ids)
               output_indices.push_back(it.index);
-              i++;
-            }
             json out_params = {
               {"output_indices", std::move(output_indices)},
               {"get_txid", false}
@@ -1990,12 +2108,23 @@ namespace lws
         };
 
         lws::gamma_picker pick_rct{std::move(distributions)};
+        lws::gamma_picker pick_token{std::move(token_distribution), std::move(token_indices)};
+
+        // std::vector<bool> is a bitfield and has no contiguous storage to make
+        // a span over, so it is flattened first.
+        const std::vector<char> token_flags(ring_is_token.begin(), ring_is_token.end());
+        const epee::span<const bool> token_span{
+          reinterpret_cast<const bool*>(token_flags.data()), token_flags.size()
+        };
+
         auto rings = pick_random_outputs(
             req.count,
             epee::to_span(amounts),
             pick_rct,
             epee::to_mut_span(histograms),
-          zmq_fetch_keys{/*std::move(*client)*/}
+            zmq_fetch_keys{},
+            token_span,
+            any_token ? std::addressof(pick_token) : nullptr
         );
         if (!rings)
           return rings.error();

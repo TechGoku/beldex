@@ -25,6 +25,15 @@ namespace lws
     {
         std::vector<random_output> ring;
         std::uint64_t amount;
+        /*! Which distribution this ring is drawn from.
+
+            A transaction can spend both kinds at once - a privacy-token
+            transfer takes token outputs for the amount and native outputs for
+            the fee, which is always BDX - so the choice is per ring, not per
+            request. Carried on the ring itself because rings are erased from
+            the working list as they are satisfied, which would desynchronise
+            any parallel array. */
+        bool is_token = false;
     };
 
     using key_fetcher = expect<std::vector<output_keys>>(std::vector<output_ref>);
@@ -59,6 +68,10 @@ namespace lws
         epee::span<const std::uint64_t> amounts,
         gamma_picker& pick_rct,
         epee::span<histogram> histograms,
-        std::function<key_fetcher> fetch
+        std::function<key_fetcher> fetch,
+        //! Parallel to `amounts`; true draws that ring from `pick_token`.
+        epee::span<const bool> is_token = {},
+        //! Token-bucket picker. Required if any `is_token` entry is true.
+        gamma_picker* pick_token = nullptr
     );
 }

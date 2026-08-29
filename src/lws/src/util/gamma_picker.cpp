@@ -18,6 +18,12 @@ namespace lws
     constexpr const std::size_t recent_spend_window = 2 * tools::to_seconds(cryptonote::TARGET_BLOCK_TIME);  // need to change
   }
 
+  gamma_picker::gamma_picker(std::vector<uint64_t> rct_offsets, std::vector<uint64_t> indices)
+    : gamma_picker(std::move(rct_offsets), gamma_shape, gamma_scale)
+  {
+    bucket_to_global = std::move(indices);
+  }
+
   gamma_picker::gamma_picker(std::vector<uint64_t> rct_offsets)
     : gamma_picker(std::move(rct_offsets), gamma_shape, gamma_scale)
   {}
@@ -93,7 +99,16 @@ namespace lws
       const std::uint64_t first_rct = offsets().begin() == selection ? 0 : *(selection - 1);
       const std::uint64_t n_rct = *selection - first_rct;
       if (n_rct != 0)
-        return first_rct + crypto::rand_idx(n_rct);
+      {
+        const std::uint64_t rank = first_rct + crypto::rand_idx(n_rct);
+        if (bucket_to_global.empty())
+          return rank;
+        // A rank the daemon does not have cannot be asked for; try again
+        // rather than sending an index that resolves to nothing.
+        if (bucket_to_global.size() <= rank)
+          continue;
+        return bucket_to_global[rank];
+      }
       // block had zero outputs (miner didn't collect XMR?)
     }
     throw std::runtime_error{"Unable to select random output in spendable range using gamma distribution after 100 attempts"};

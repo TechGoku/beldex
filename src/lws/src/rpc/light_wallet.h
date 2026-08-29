@@ -134,6 +134,16 @@ namespace rpc
         db::output info;
         std::vector<transaction_spend> spends;
         std::uint64_t spent;
+        /*! HF22: the privacy token this entry moved, if any.
+
+            Kept beside the BDX figures rather than folded into them: a token
+            amount is denominated in its own token, so adding it to `info`'s
+            amount would report a transfer of 1,200 POP as 1,200 BDX. Null
+            token_id means an ordinary BDX transaction, which is every entry a
+            pre-HF22 wallet will ever see. */
+        crypto::public_key token_id{};
+        std::uint64_t token_received = 0;
+        std::uint64_t token_sent = 0;
       };
 
       safe_uint64 total_received;
@@ -292,6 +302,15 @@ namespace rpc
       get_random_outs_request() = delete;
       std::uint64_t count;
       safe_uint64_array amounts;
+      /*! Parallel to `amounts`: the token each ring is for, "" for native.
+
+          A ring must be drawn from outputs of the same kind - native decoys in
+          a token's ring produce a transaction the network rejects - and one
+          transaction can need both, because a token transfer spends token
+          outputs for the amount and native outputs for the BDX fee. So the
+          choice is per ring. Omitted, or shorter than `amounts`, leaves the
+          remaining rings native, which is what every existing caller expects. */
+      std::vector<std::string> token_ids;
     };
     void read_bytes(wire::json_reader&, get_random_outs_request&);
 
@@ -312,6 +331,17 @@ namespace rpc
       account_credentials creds;
       std::uint64_t min_height = 0; //!< return only outputs received at height >= min_height (incremental unspent pool)
       std::uint64_t max_count = 0;  //!< 0 = unbounded; else cap outputs per page (whole blocks)
+      /*! Hex id of a privacy token to include alongside the native outputs.
+
+          Empty means native only, which is what every pre-HF22 caller sends and
+          what a BDX send must keep receiving - a token output picked up for a
+          native send builds a transaction the daemon rejects outright.
+
+          Set, the reply carries native outputs AND that one token's outputs.
+          Both are needed in the same response because a token transfer spends
+          two pools at once: token outputs for the amount, native outputs for
+          the fee, which is always paid in BDX. The client separates them. */
+      std::string token_id;
     };
     void read_bytes(wire::json_reader&, get_unspent_outs_request&);
 

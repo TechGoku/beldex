@@ -93,6 +93,23 @@ namespace
       optional_rct = std::addressof(rct);
     }
 
+    /* HF22: a privacy-token output. The client rebuilds the output and recovers
+       its own blinding scalar from these when spending - that scalar has no
+       other source and the server cannot derive it on the wallet's behalf.
+       Omitted entirely for an ordinary BDX output, so a server that predates
+       tokens and a wallet that predates them both behave as before. */
+    crypto::public_key const* token_id = nullptr;
+    crypto::public_key const* blinded_token_id = nullptr;
+    crypto::public_key const* amount_commitment = nullptr;
+    boost::optional<lws::rpc::safe_uint64> encrypted_amount;
+    if (self.data.first.token_id != crypto::public_key{})
+    {
+      token_id = std::addressof(self.data.first.token_id);
+      blinded_token_id = std::addressof(self.data.first.blinded_token_id);
+      amount_commitment = std::addressof(self.data.first.amount_commitment);
+      encrypted_amount = lws::rpc::safe_uint64(self.data.first.encrypted_amount);
+    }
+
     wire::object(dest,
       wire::field("amount", lws::rpc::safe_uint64(self.data.first.spend_meta.amount)),
       wire::field("public_key", self.data.first.pub),
@@ -105,7 +122,11 @@ namespace
       wire::field("timestamp", iso_timestamp(self.data.first.timestamp)),
       wire::field("height", self.data.first.link.height),
       wire::field("spend_key_images", std::cref(self.data.second)),
-      wire::optional_field("rct", optional_rct)
+      wire::optional_field("rct", optional_rct),
+      wire::optional_field("token_id", token_id),
+      wire::optional_field("blinded_token_id", blinded_token_id),
+      wire::optional_field("amount_commitment", amount_commitment),
+      wire::optional_field("encrypted_amount", encrypted_amount)
     );
   }
 
@@ -296,6 +317,16 @@ namespace lws
 
       const bool is_coinbase = (extra.first & db::coinbase_output);
 
+      crypto::public_key const* token_id = nullptr;
+      boost::optional<safe_uint64> token_received;
+      boost::optional<safe_uint64> token_sent;
+      if (self.value().token_id != crypto::public_key{})
+      {
+        token_id = std::addressof(self.value().token_id);
+        token_received = safe_uint64(self.value().token_received);
+        token_sent = safe_uint64(self.value().token_sent);
+      }
+
       wire::object(dest,
         wire::field("id", std::uint64_t(self.index())),
         wire::field("hash", std::cref(self.value().info.link.tx_hash)),
@@ -308,7 +339,12 @@ namespace lws
         wire::field("coinbase", is_coinbase),
         wire::field("mempool", false),
         wire::field("mixin", self.value().info.spend_meta.mixin_count),
-        wire::field("spent_outputs", std::cref(self.value().spends))
+        wire::field("spent_outputs", std::cref(self.value().spends)),
+        // HF22: present only when this entry moved a privacy token, so an
+        // ordinary BDX transaction is byte-for-byte what it always was.
+        wire::optional_field("token_id", token_id),
+        wire::optional_field("token_received", token_received),
+        wire::optional_field("token_sent", token_sent)
       );
     }
   } // rpc
@@ -404,7 +440,14 @@ namespace lws
 
   void rpc::read_bytes(wire::json_reader& source, get_random_outs_request& self)
   {
-    wire::object(source, WIRE_FIELD(count), WIRE_FIELD(amounts));
+    boost::optional<std::vector<std::string>> token_ids;
+    wire::object(source,
+      WIRE_FIELD(count),
+      WIRE_FIELD(amounts),
+      wire::optional_field("token_ids", std::ref(token_ids))
+    );
+    if (token_ids)
+      self.token_ids = std::move(*token_ids);
   }
   void rpc::write_bytes(wire::json_writer& dest, const get_random_outs_response& self)
   {
@@ -416,6 +459,7 @@ namespace lws
     std::string address;
     boost::optional<std::uint64_t> min_height;
     boost::optional<std::uint64_t> max_count;
+    boost::optional<std::string> token_id;
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
@@ -424,8 +468,11 @@ namespace lws
       WIRE_OPTIONAL_FIELD(use_dust),
       WIRE_OPTIONAL_FIELD(dust_threshold),
       wire::optional_field("min_height", std::ref(min_height)),
-      wire::optional_field("max_count", std::ref(max_count))
+      wire::optional_field("max_count", std::ref(max_count)),
+      wire::optional_field("token_id", std::ref(token_id))
     );
+    if (token_id)
+      self.token_id = std::move(*token_id);
     convert_address(address, self.creds.address);
     self.min_height = min_height.value_or(0);
     self.max_count = max_count.value_or(0);
