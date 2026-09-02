@@ -213,8 +213,14 @@ namespace db
     constexpr const lmdb::basic_table<request, request_info> requests{
       "requests_by_type,address", (MDB_CREATE | MDB_DUPSORT), MONERO_COMPARE(request_info, address.spend_public)
     };
+    /* Keyed by a string, so it needs a string KEY comparator. `compare_string`
+       used to be passed as the VALUE comparator, which a non-DUPSORT table
+       never consults, leaving the key comparator as the default numeric one -
+       and that one refuses any key shorter than sizeof(char*). Combined with
+       the old `to_val(std::string)` behaviour, the stored schema version was
+       never found and the migration re-ran on every single startup. */
     constexpr const lmdb::basic_table<char *, unsigned> properties{
-      "properties", (MDB_CREATE), &compare_string
+      "properties", (MDB_CREATE), nullptr, &compare_string
     };
 
     template<typename D>
@@ -582,76 +588,108 @@ namespace db
   {
     MINFO("Checking outputs for locked_key_image migration (v1 -> v2)");
 
-    cursor::outputs cur;
-    const expect<void> opened = check_cursor(txn, tables.outputs, cur);
-    if (!opened)
-      MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
+    /* Converted in bounded batches.
+
+       The previous version accumulated EVERY converted row - key and 264-byte
+       value - in memory before writing any of them back, so migrating a large
+       outputs table needed the whole table resident at once. A record changes
+       size between layouts, so each row must be deleted and re-inserted rather
+       than updated in place; batching keeps that bounded.
+
+       After a batch is written the cursor position is no longer valid, so the
+       walk restarts from the beginning. Rows already in the v2 layout are
+       skipped cheaply, and only legacy rows are converted, so the number of
+       passes is (legacy rows / batch size) - zero for a database that is
+       already current.
+
+       Safe on any starting state: a fresh DB has no rows; a row whose size
+       matches neither layout cannot occur in a healthy DB and is treated as a
+       hard error, aborting the enclosing write txn and leaving the database
+       byte-for-byte unchanged. Output and spend rows are never deleted outright
+       - that would risk losing funds visibility. */
+    constexpr const std::size_t batch_rows = 200000; // ~53 MB of output_v2
 
     struct owned_key { std::vector<unsigned char> data; };
     std::vector<owned_key> keys;
     std::vector<output_v2> values;
+    keys.reserve(batch_rows);
+    values.reserve(batch_rows);
 
-    MDB_val key{}, value{};
-    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+    std::size_t converted_total = 0;
 
-    while (err == 0)
+    for (;;)
     {
-      if (value.mv_size == sizeof(output_v2))
+      cursor::outputs cur;
+      const expect<void> opened = check_cursor(txn, tables.outputs, cur);
+      if (!opened)
+        MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
+
+      keys.clear();
+      values.clear();
+
+      MDB_val key{}, value{};
+      int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+      while (err == 0 && values.size() < batch_rows)
       {
-        // Already in the current layout - leave untouched, advance.
+        if (value.mv_size == sizeof(output_v2))
+        {
+          err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT); // already current
+          continue;
+        }
+        if (value.mv_size != sizeof(output_v1))
+        {
+          MONERO_THROW(lws::error::bad_blockchain,
+            "Unexpected output record size during migration; refusing to modify the database");
+        }
+
+        const auto& old = *reinterpret_cast<const output_v1*>(value.mv_data);
+        output_v2 v2{};
+        v2.link = old.link;
+        v2.spend_meta.id = old.spend_meta.id;
+        v2.spend_meta.amount = old.spend_meta.amount;
+        v2.spend_meta.mixin_count = old.spend_meta.mixin_count;
+        v2.spend_meta.index = old.spend_meta.index;
+        v2.spend_meta.tx_public = old.spend_meta.tx_public;
+        v2.timestamp = old.timestamp;
+        v2.unlock_time = old.unlock_time;
+        v2.tx_prefix_hash = old.tx_prefix_hash;
+        v2.locked_key_image = crypto::key_image{}; // defaulted for old rows
+        v2.pub = old.pub;
+        v2.ringct_mask = old.ringct_mask;
+        std::memcpy(v2.reserved, old.reserved, sizeof(v2.reserved));
+        v2.extra = old.extra;
+        std::memcpy(&v2.payment_id, &old.payment_id, sizeof(v2.payment_id));
+
+        owned_key k;
+        k.data.assign(static_cast<unsigned char*>(key.mv_data),
+                      static_cast<unsigned char*>(key.mv_data) + key.mv_size);
+        keys.push_back(std::move(k));
+        values.push_back(v2);
+
+        err = mdb_cursor_del(cur.get(), 0);
+        if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
         err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
-        continue;
       }
-      if (value.mv_size != sizeof(output_v1))
+
+      if (err != 0 && err != MDB_NOTFOUND)
+        MONERO_THROW(lmdb::error(err), "cursor iteration failed");
+
+      if (values.empty())
+        break; // nothing legacy left
+
+      for (std::size_t i = 0; i < values.size(); ++i)
       {
-        // Impossible in a healthy DB. Abort instead of deleting/reinterpreting:
-        // aborting rolls back the txn and leaves every row intact.
-        MONERO_THROW(lws::error::bad_blockchain,
-          "Unexpected output record size during migration; refusing to modify the database");
+        MDB_val k{ keys[i].data.size(), keys[i].data.data() };
+        MDB_val v = lmdb::to_val(values[i]);
+        const int put = mdb_put(&txn, tables.outputs, &k, &v, 0);
+        if (put) MONERO_THROW(lmdb::error(put), "mdb_put failed");
       }
 
-      // Convert v1 -> v2 by inserting a zeroed locked_key_image. Record size
-      // changes, so we must delete the old row and re-insert the new one; stash
-      // both and apply the puts after the iteration completes.
-      const auto& old = *reinterpret_cast<const output_v1*>(value.mv_data);
-      output_v2 v2{};
-      v2.link = old.link;
-      v2.spend_meta.id = old.spend_meta.id;
-      v2.spend_meta.amount = old.spend_meta.amount;
-      v2.spend_meta.mixin_count = old.spend_meta.mixin_count;
-      v2.spend_meta.index = old.spend_meta.index;
-      v2.spend_meta.tx_public = old.spend_meta.tx_public;
-      v2.timestamp = old.timestamp;
-      v2.unlock_time = old.unlock_time;
-      v2.tx_prefix_hash = old.tx_prefix_hash;
-      v2.locked_key_image = crypto::key_image{};  // defaulted for old rows
-      v2.pub = old.pub;
-      v2.ringct_mask = old.ringct_mask;
-      std::memcpy(v2.reserved, old.reserved, sizeof(v2.reserved));
-      v2.extra = old.extra;
-      std::memcpy(&v2.payment_id, &old.payment_id, sizeof(v2.payment_id));
-
-      owned_key k;
-      k.data.assign(static_cast<unsigned char*>(key.mv_data), static_cast<unsigned char*>(key.mv_data) + key.mv_size);
-      keys.push_back(std::move(k));
-      values.push_back(v2);
-
-      err = mdb_cursor_del(cur.get(), 0);
-      if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
-      err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
+      converted_total += values.size();
+      MINFO("Output migration: converted " << converted_total << " legacy row(s) so far");
     }
 
-    if (err != MDB_NOTFOUND) MONERO_THROW(lmdb::error(err), "cursor iteration failed");
-
-    for (std::size_t i = 0; i < values.size(); ++i)
-    {
-      MDB_val k{ keys[i].data.size(), keys[i].data.data() };
-      MDB_val v = lmdb::to_val(values[i]);
-      err = mdb_put(&txn, tables.outputs, &k, &v, 0);
-      if (err) MONERO_THROW(lmdb::error(err), "mdb_put failed");
-    }
-
-    MINFO("Output migration complete: converted " << values.size() << " legacy row(s)");
+    MINFO("Output migration complete: converted " << converted_total << " legacy row(s)");
 
     // NB: no spend rows are touched. The old code had two destructive passes that
     // deleted spends via the account-id DUPSORT key (mis-modelled as an output
@@ -1098,6 +1136,87 @@ namespace db
   {
     MONERO_PRECOND(db != nullptr);
     return db->compact(dest_path);
+  }
+
+  expect<int> storage::check_readers() noexcept
+  {
+    MONERO_PRECOND(db != nullptr);
+    return db->check_readers();
+  }
+
+  expect<usage_info> storage::get_usage() const noexcept
+  {
+    MONERO_PRECOND(db != nullptr);
+
+    const expect<lmdb::database::usage> raw = db->get_usage();
+    if (!raw)
+      return raw.error();
+
+    usage_info out{};
+    out.map_size = std::uint64_t(raw->map_size);
+    out.used_bytes = std::uint64_t(raw->used_bytes);
+    out.readers_high_water = raw->readers_high_water;
+    out.max_readers = raw->max_readers;
+    return out;
+  }
+
+  namespace
+  {
+    //! Warn past this fraction of the map, error past the second threshold.
+    constexpr const double map_warn_fraction  = 0.75;
+    constexpr const double map_alert_fraction = 0.90;
+
+    std::string as_mib(std::uint64_t bytes)
+    {
+      return std::to_string(bytes / (1024 * 1024)) + " MiB";
+    }
+  } // anonymous
+
+  void run_maintenance(storage& disk, const char* context) noexcept
+  {
+    // Housekeeping must never propagate a failure to the scanner or the REST
+    // server, so everything here is logged and swallowed.
+    try
+    {
+      const expect<int> cleared = disk.check_readers();
+      if (!cleared)
+        MWARNING("[db-maintenance/" << context << "] reader check failed: " << cleared.error().message());
+      else if (0 < *cleared)
+      {
+        // Each of these was blocking page reclamation for the whole DB.
+        MGINFO("[db-maintenance/" << context << "] cleared " << *cleared
+               << " stale LMDB reader slot(s) left by a previous process");
+      }
+
+      const expect<usage_info> usage = disk.get_usage();
+      if (!usage)
+      {
+        MWARNING("[db-maintenance/" << context << "] usage query failed: " << usage.error().message());
+        return;
+      }
+
+      const double fraction = usage->used_fraction();
+      const auto pct = unsigned(fraction * 100.0 + 0.5);
+      const std::string line =
+        std::string("[db-maintenance/") + context + "] map " + as_mib(usage->used_bytes)
+        + " / " + as_mib(usage->map_size) + " (" + std::to_string(pct) + "%), reader slots peak "
+        + std::to_string(usage->readers_high_water) + "/" + std::to_string(usage->max_readers);
+
+      if (map_alert_fraction <= fraction)
+        MERROR(line << " - map nearly full; a resize or compaction is imminent");
+      else if (map_warn_fraction <= fraction)
+        MWARNING(line << " - map filling");
+      else
+        MINFO(line);
+    }
+    catch (const std::exception& e)
+    {
+      MWARNING("[db-maintenance/" << context << "] unexpected error: " << e.what());
+    }
+    catch (...)
+    {
+      MWARNING("[db-maintenance/" << context << "] unknown error");
+    }
   }
 
   expect<storage_reader> storage::start_read(lmdb::suspended_txn txn) const
@@ -2082,8 +2201,19 @@ namespace db
           MONERO_LMDB_CHECK(mdb_cursor_get(accounts_cur.get(), &key, &value, MDB_GET_BOTH));
         }
         expect<account> existing = accounts.get_value<account>(value);
-        if (!existing || existing->scan_height != user->scan_height())
-          continue; // to next account
+        if (!existing)
+        {
+          /* A malformed/unreadable account record is a real database fault, not
+             the benign height skew below. Both used to `continue`, so a genuine
+             read failure was indistinguishable from an account that had simply
+             moved on - the caller only saw `updated != users.size()`, discarded
+             the whole scanned batch and restarted, potentially forever. Surface
+             it instead. */
+          MERROR("Failed to read account record during update: " << existing.error().message());
+          return existing.error();
+        }
+        if (existing->scan_height != user->scan_height())
+          continue; // expected: this account moved on; skip it, not an error
 
         const block_id existing_height = existing->scan_height;
 

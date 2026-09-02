@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <iosfwd>
 #include <list>
 #include <memory>
@@ -43,6 +44,23 @@ namespace db
   }
 
   struct storage_internal;
+
+  //! Snapshot of LMDB map/reader utilisation, for monitoring and alerting.
+  struct usage_info
+  {
+    std::uint64_t map_size;    //!< Current memory-map size in bytes.
+    std::uint64_t used_bytes;  //!< Bytes of the map actually in use.
+    //! High-water mark of reader slots used, not a live count; it never
+    //! decreases, including after a stale slot is swept.
+    unsigned readers_high_water;
+    unsigned max_readers;      //!< Reader slot capacity.
+
+    //! \return Fraction of the map in use, in the range [0, 1].
+    double used_fraction() const noexcept
+    {
+      return map_size ? double(used_bytes) / double(map_size) : 0.0;
+    }
+  };
   
   struct reader_internal
   {
@@ -190,6 +208,24 @@ namespace db
     */
     expect<void> compact(const char* dest_path) const;
 
+    /*!
+      Clear LMDB reader slots left behind by processes that are no longer
+      running. A slot orphaned by a killed process pins an old snapshot and
+      stops LMDB reclaiming every page freed since - the map then grows without
+      bound until MDB_MAP_FULL, even though most of it is reclaimable. Call at
+      startup (to clear slots from a previous unclean shutdown) and
+      periodically thereafter.
+
+      Safe against a live database; slots owned by running processes are never
+      touched.
+
+      \return Number of stale reader slots cleared.
+    */
+    expect<int> check_readers() noexcept;
+
+    //! \return Current LMDB map and reader-table utilisation.
+    expect<usage_info> get_usage() const noexcept;
+
     // ! Rollback chain and accounts to `height`.
    expect<void> rollback(block_id height);
 
@@ -253,5 +289,22 @@ namespace db
     //! `txn` must have come from a previous call on the same thread.
     expect<storage_reader> start_read(lmdb::suspended_txn txn = nullptr) const;
   };
+
+  /*!
+    Periodic LMDB housekeeping: clear reader slots orphaned by dead processes
+    and log map utilisation, warning as it approaches the map size.
+
+    This is the guard against the recurring MDB_MAP_FULL. An orphaned reader
+    slot blocks reclamation of every page freed since its snapshot, so the map
+    grows without bound; clearing it restores normal page reuse. Call at
+    startup - to sweep slots left by a previous unclean shutdown - and on a
+    timer while running.
+
+    Never throws and never fails the caller: any error is logged and swallowed,
+    since housekeeping must not take down the scanner or the server.
+
+    \param context Short label identifying the call site, used in log lines.
+  */
+  void run_maintenance(storage& disk, const char* context) noexcept;
 } // db
 } // lws
