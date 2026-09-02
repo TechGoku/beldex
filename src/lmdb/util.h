@@ -93,6 +93,20 @@ namespace lmdb
         return MDB_val{sizeof(value), const_cast<void*>(temp)};
     }
 
+    /*! Overload for `std::string`, which must be sent to LMDB as its CHARACTERS.
+
+        The generic template above takes `sizeof(value)` bytes at
+        `addressof(value)` - for a `std::string` that is the string OBJECT,
+        whose first word is a pointer into its own small-string buffer. That
+        address changes every run under ASLR, so a string used as a key never
+        matched on a later run. */
+    inline MDB_val to_val(const std::string& value) noexcept
+    {
+        // lmdb does not touch user data, so const_cast is acceptable
+        void const* const temp = reinterpret_cast<void const*>(value.data());
+        return MDB_val{value.size(), const_cast<void*>(temp)};
+    }
+
     //! \return A span over the same chunk of memory as `value`.
     inline constexpr epee::span<const std::uint8_t> to_byte_span(MDB_val value) noexcept
     {

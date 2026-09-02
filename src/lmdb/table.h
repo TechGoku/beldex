@@ -39,6 +39,17 @@ namespace lmdb
           : table{name, compute_flags(flags), &lmdb::less<lmdb::native_type<K>>, value_cmp}
         {}
 
+        /*! Overload taking an explicit KEY comparator.
+
+            The default above compares the first `sizeof(K)` bytes numerically,
+            which is wrong for variable-length keys: `lmdb::less` bails out (and
+            returns -1 for every comparison) whenever a key is shorter than
+            `sizeof(K)`, so lookups never match. A table keyed by strings must
+            supply its own comparator. */
+        constexpr basic_table(const char* name, unsigned flags, MDB_cmp_func value_cmp, MDB_cmp_func key_cmp) noexcept
+          : table{name, compute_flags(flags), key_cmp, value_cmp}
+        {}
+
         /*!
             \tparam U must be same as `V`; used for sanity checking.
             \tparam F is the type within `U` that is being extracted.

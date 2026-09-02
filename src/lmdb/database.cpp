@@ -47,16 +47,25 @@ namespace lmdb
     namespace
     {
         constexpr const mdb_size_t max_resize = 1 * 1024 * 1024 * 1024; // 1 GB
+        //! Register an in-flight transaction, waiting out any pending resize.
         void acquire_context(context& ctx) noexcept
         {
-            while (ctx.lock.test_and_set());
-            ++(ctx.active);
-            ctx.lock.clear();
+            std::unique_lock<std::mutex> guard{ctx.lock};
+            ctx.drained.wait(guard, [&ctx] { return !ctx.resizing; });
+            ++ctx.active;
         }
 
+        //! Retire a transaction; wakes a waiting resize once the last one goes.
         void release_context(context& ctx) noexcept
         {
-            --(ctx.active);
+            std::unique_lock<std::mutex> guard{ctx.lock};
+            if (ctx.active)
+                --ctx.active;
+            if (ctx.active == 0)
+            {
+                guard.unlock();
+                ctx.drained.notify_all();
+            }
         }
     }
 
@@ -75,7 +84,7 @@ namespace lmdb
         }
     }
 
-    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size, unsigned max_readers) noexcept
+    expect<environment> open_environment(const char* path, MDB_dbi max_dbs, mdb_size_t map_size, unsigned max_readers, bool read_only) noexcept
     {
         MONERO_PRECOND(path != nullptr);
 
@@ -95,7 +104,7 @@ namespace lmdb
         // MDB_MAP_FULL. The map is sparse on 64-bit; the file only grows on demand.
         if (map_size)
             MONERO_LMDB_CHECK(mdb_env_set_mapsize(out.get(), map_size));
-        MONERO_LMDB_CHECK(mdb_env_open(out.get(), path, 0, open_flags));
+        MONERO_LMDB_CHECK(mdb_env_open(out.get(), path, read_only ? MDB_RDONLY : 0, open_flags));
         return {std::move(out)};
     }
 
@@ -122,7 +131,7 @@ namespace lmdb
     }
 
     database::database(environment env)
-      : env(std::move(env)), ctx{{}, ATOMIC_FLAG_INIT}
+      : env(std::move(env)), ctx{}
     {
         if (handle())
         {
@@ -134,25 +143,74 @@ namespace lmdb
 
     database::~database() noexcept
     {
-        while (ctx.active);
+        // Wait for in-flight transactions without spinning.
+        std::unique_lock<std::mutex> guard{ctx.lock};
+        ctx.drained.wait(guard, [this] { return ctx.active == 0; });
     }
 
     expect<void> database::resize() noexcept
     {
         MONERO_PRECOND(handle() != nullptr);
 
-        while (ctx.lock.test_and_set());
-        while (ctx.active);
+        /* Block new transactions, then wait for the in-flight ones to finish.
+           LMDB requires no active transactions in this process during
+           `mdb_env_set_mapsize`. Both waits are condition-variable based, so
+           threads sleep rather than spin. */
+        {
+            std::unique_lock<std::mutex> guard{ctx.lock};
+            ctx.drained.wait(guard, [this] { return !ctx.resizing; });
+            ctx.resizing = true;                                  // gate new txns
+            ctx.drained.wait(guard, [this] { return ctx.active == 0; });
+        }
 
         MDB_envinfo info{};
-        MONERO_LMDB_CHECK(mdb_env_info(handle(), &info));
+        int err = mdb_env_info(handle(), &info);
+        if (!err)
+        {
+            const mdb_size_t resize = std::min(info.me_mapsize, max_resize);
+            err = mdb_env_set_mapsize(handle(), info.me_mapsize + resize);
+        }
 
-        const mdb_size_t resize = std::min(info.me_mapsize, max_resize);
-        const int err = mdb_env_set_mapsize(handle(), info.me_mapsize + resize);
-        ctx.lock.clear();
+        {
+            const std::lock_guard<std::mutex> guard{ctx.lock};
+            ctx.resizing = false;
+        }
+        ctx.drained.notify_all();
+
         if (err)
             return {lmdb::error(err)};
         return success();
+    }
+
+    expect<int> database::check_readers() noexcept
+    {
+        MONERO_PRECOND(handle() != nullptr);
+
+        // Only clears slots whose owning PID is gone; slots held by live
+        // processes (this one included) are left alone, so this is safe to run
+        // against a busy environment.
+        int dead = 0;
+        MONERO_LMDB_CHECK(mdb_reader_check(handle(), &dead));
+        return dead;
+    }
+
+    expect<database::usage> database::get_usage() const noexcept
+    {
+        MONERO_PRECOND(handle() != nullptr);
+
+        MDB_envinfo info{};
+        MDB_stat stat{};
+        MONERO_LMDB_CHECK(mdb_env_info(handle(), &info));
+        MONERO_LMDB_CHECK(mdb_env_stat(handle(), &stat));
+
+        usage out{};
+        out.map_size = info.me_mapsize;
+        // `me_last_pgno` is the highest allocated page number and is 0-based,
+        // so the used byte count is (last + 1) pages.
+        out.used_bytes = mdb_size_t(info.me_last_pgno + 1) * mdb_size_t(stat.ms_psize);
+        out.readers_high_water = info.me_numreaders;
+        out.max_readers = info.me_maxreaders;
+        return out;
     }
 
     expect<read_txn> database::create_read_txn(suspended_txn txn) noexcept
