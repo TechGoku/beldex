@@ -16,19 +16,24 @@ class account
     struct internal;
 
     std::shared_ptr<const internal> immutable_;
+    /* Received output ids, sorted. Doubles as the duplicate check for
+       `add_out`: an output's global id is its identity, so a separate vector of
+       one-time public keys (32 bytes each, on top of these 16) was redundant.
+       Dropping it cuts the scanner's resident memory per output by ~2/3 and
+       removes a field from the per-account reload walk - which matters because
+       the whole set is held in RAM for every active account while scanning. */
     std::vector<db::output_id> spendable_;
-    std::vector<crypto::public_key> pubs_;
     std::vector<db::spend> spends_;
     std::vector<db::output> outputs_;
     db::block_id height_;
 
-    explicit account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable, std::vector<crypto::public_key> pubs) noexcept;
+    explicit account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable) noexcept;
     void null_check() const;
 
   public:
 
     //! Construct an account from `source` and current `spendable` outputs.
-    explicit account(db::account const& source, std::vector<db::output_id> spendable, std::vector<crypto::public_key> pubs);
+    explicit account(db::account const& source, std::vector<db::output_id> spendable);
 
     /*!
       \return False if this is a "moved-from" account (i.e. the internal memory
@@ -78,7 +83,7 @@ class account
     //! \return Spends matched during the latest scan.
     std::vector<db::spend> const& spends() const noexcept { return spends_; }
 
-    //! Track a newly received `out`, \return `false` if `out.pub` is duplicated.
+    //! Track a newly received `out`, \return `false` if its output id is already known.
     bool add_out(db::output const& out);
 
     //! Track a possible `spend`.

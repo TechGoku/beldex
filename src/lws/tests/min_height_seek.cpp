@@ -120,7 +120,7 @@ int main()
         throw std::runtime_error{"get_account failed"};
       reader->finish_read();
 
-      lws::account user{stored->second, {}, {}};
+      lws::account user{stored->second, {}};
       for (std::uint64_t height = 10; height <= blocks; height += 10)
       {
         for (std::uint64_t index = 0; index < 2; ++index)

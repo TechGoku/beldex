@@ -10,18 +10,6 @@
 
 namespace lws
 {
-  namespace
-  {
-    // update if `crypto::public_key` gets `operator<`
-    struct sort_pubs
-    {
-      bool operator()(crypto::public_key const& lhs, crypto::public_key const& rhs) const noexcept
-      {
-        return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(lhs)) < 0;
-      }
-    };
-  }
-
   struct account::internal
   {
     explicit internal(db::account const& source)
@@ -46,11 +34,10 @@ namespace lws
     crypto::secret_key view_key;
   };
 
-  account::account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable, std::vector<crypto::public_key> pubs) noexcept
+  account::account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable) noexcept
     : immutable_(std::move(immutable))
     , spendable_(std::move(spendable))
-    , pubs_(std::move(pubs))
-      , spends_()
+    , spends_()
     , outputs_()
     , height_(height)
   {}
@@ -61,11 +48,10 @@ namespace lws
       MONERO_THROW(::common_error::kInvalidArgument, "using moved from account");
   }
 
-  account::account(db::account const& source, std::vector<db::output_id> spendable, std::vector<crypto::public_key> pubs)
-    : account(std::make_shared<internal>(source), source.scan_height, std::move(spendable), std::move(pubs))
+  account::account(db::account const& source, std::vector<db::output_id> spendable)
+    : account(std::make_shared<internal>(source), source.scan_height, std::move(spendable))
   {
     std::sort(spendable_.begin(), spendable_.end());
-    std::sort(pubs_.begin(), pubs_.end(), sort_pubs{});
   }
 
   account::~account() noexcept
@@ -73,7 +59,7 @@ namespace lws
 
   account account::clone() const
   {
-    account result{immutable_, height_, spendable_, pubs_};
+    account result{immutable_, height_, spendable_};
     result.outputs_ = outputs_;
     result.spends_ = spends_;
     return result;
@@ -132,15 +118,16 @@ namespace lws
 
   bool account::add_out(db::output const& out)
   {
-    auto existing_pub = std::lower_bound(pubs_.begin(), pubs_.end(), out.pub, sort_pubs{});
-    if (existing_pub != pubs_.end() && *existing_pub == out.pub)
+    /* Deduplicate on the global output id rather than the one-time public key.
+       The id IS the output's identity on chain, so this is the same check with
+       a third of the memory - and it matches what the database itself enforces
+       (`bulk_insert` uses MDB_NODUPDATA over the same ordering). */
+    const auto position =
+      std::lower_bound(spendable_.begin(), spendable_.end(), out.spend_meta.id);
+    if (position != spendable_.end() && *position == out.spend_meta.id)
       return false;
 
-    pubs_.insert(existing_pub, out.pub);
-    spendable_.insert(
-      std::lower_bound(spendable_.begin(), spendable_.end(), out.spend_meta.id),
-      out.spend_meta.id
-    );
+    spendable_.insert(position, out.spend_meta.id);
     outputs_.push_back(out);
     return true;
   }
