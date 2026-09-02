@@ -35,11 +35,23 @@ target_link_libraries(beldex-lws-daemon PUBLIC
 find_package(ZLIB REQUIRED)
 target_link_libraries(beldex-lws-daemon PRIVATE nlohmann_json::nlohmann_json Boost::filesystem ZLIB::ZLIB)
 
+# Scheduled hot backups of a live LWS database; see backup_main.cpp.
+add_executable(beldex-lws-backup backup_main.cpp)
+target_link_libraries(beldex-lws-backup PRIVATE
+    beldex-lws-db
+    beldex-lws-common
+    beldex-lws-wire-json
+    Boost::filesystem
+    Boost::program_options
+    Threads::Threads
+)
+
 add_executable(beldex-lws-admin admin_main.cpp)
 target_link_libraries(beldex-lws-admin PRIVATE 
 beldex-lws-common
 beldex-lws-rpc
 beldex-lws-wire-json
+nlohmann_json::nlohmann_json
 )
 
 # Checks that get_outputs/get_spends(id, min_height) seek to exactly the tail of
@@ -57,6 +69,21 @@ if (BUILD_TESTS)
       Threads::Threads
   )
   add_test(NAME lws-min-height-seek COMMAND lws-min-height-seek-test)
+
+  # Reproduces the orphaned-reader -> blocked page reuse -> runaway map failure
+  # and proves check_readers() fixes it; see ../tests/stale_reader_reclaim.cpp.
+  add_executable(lws-stale-reader-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/stale_reader_reclaim.cpp)
+  # `epee` is needed for its include path (lmdb/util.h pulls in epee/span.h);
+  # lmdb_lib links common/lmdb PRIVATE so those dirs are not propagated.
+  target_link_libraries(lws-stale-reader-test PRIVATE
+      lmdb_lib
+      lmdb
+      epee
+      common
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-stale-reader COMMAND lws-stale-reader-test)
 endif ()
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )
