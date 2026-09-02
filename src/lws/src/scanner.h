@@ -29,8 +29,13 @@ namespace lws
         /*! As above, but rotates through `daemon_rpcs` (primary first) whenever a
             scan pass aborts immediately - i.e. when the daemon it was talking to
             is unreachable. A single-entry list behaves exactly like the overload
-            above. */
-        static void run(db::storage disk, std::vector<std::string> daemon_rpcs, std::size_t thread_count);
+            above.
+
+            \param spread Fan the scan threads out across every endpoint instead
+              of pointing them all at the current one. Only worth enabling when
+              accounts sit at genuinely different heights - see the note in
+              scanner.cpp. */
+        static void run(db::storage disk, std::vector<std::string> daemon_rpcs, std::size_t thread_count, bool spread = false);
 
         //! \return True if `stop()` has never been called.
         static bool is_running() noexcept { return running; }

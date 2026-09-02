@@ -794,10 +794,14 @@ namespace lws
       Launches `thread_count` threads to run `scan_loop`, and then polls for
       active account changes in background
     */
-    void check_loop(db::storage disk, std::size_t thread_count, std::string daemon_rpc,std::vector<lws::account> users, std::vector<db::account_id> active, std::map<db::account_id, db::block_id> start_heights)
+    /*! \param daemon_rpcs Endpoint per thread, assigned round-robin. A
+        single-entry list points every thread at the same daemon, which is the
+        historical behaviour. */
+    void check_loop(db::storage disk, std::size_t thread_count, std::vector<std::string> daemon_rpcs,std::vector<lws::account> users, std::vector<db::account_id> active, std::map<db::account_id, db::block_id> start_heights)
     {
       assert(0 < thread_count);
       assert(0 < users.size());
+      assert(!daemon_rpcs.empty());
       // std::cout << "thread_count : " << thread_count << std::endl;
       // std::cout << "users.size() : " << users.size() << std::endl;
       thread_sync self{};
@@ -857,7 +861,8 @@ namespace lws
         //   client.watch_scan_signals();
         //  std::cout << "entered in to the users thereads\n";
         auto data = std::make_shared<thread_data>(disk.clone(), std::move(thread_users));
-        threads.emplace_back(attrs, std::bind(&scan_loop, std::ref(self),daemon_rpc,std::move(data)));
+        const std::string& endpoint = daemon_rpcs[threads.size() % daemon_rpcs.size()];
+        threads.emplace_back(attrs, std::bind(&scan_loop, std::ref(self),endpoint,std::move(data)));
       }
 
       if (!users.empty())
@@ -866,7 +871,8 @@ namespace lws
         // client.watch_scan_signals();
         // std::cout << "entered in to the users users\n";
         auto data = std::make_shared<thread_data>(disk.clone(), std::move(users));
-        threads.emplace_back(attrs, std::bind(&scan_loop, std::ref(self), daemon_rpc,std::move(data)));
+        const std::string& endpoint = daemon_rpcs[threads.size() % daemon_rpcs.size()];
+        threads.emplace_back(attrs, std::bind(&scan_loop, std::ref(self), endpoint,std::move(data)));
       }
 
       auto last_check = std::chrono::steady_clock::now();
@@ -1183,10 +1189,10 @@ namespace lws
   // ---------------------------------------------------------------------------
   void scanner::run(db::storage disk, std::string daemon_rpc, std::size_t thread_count)
   {
-    run(std::move(disk), std::vector<std::string>{std::move(daemon_rpc)}, thread_count);
+    run(std::move(disk), std::vector<std::string>{std::move(daemon_rpc)}, thread_count, false);
   }
 
-  void scanner::run(db::storage disk, std::vector<std::string> daemon_rpcs, std::size_t thread_count)
+  void scanner::run(db::storage disk, std::vector<std::string> daemon_rpcs, std::size_t thread_count, bool spread)
   {
     thread_count = std::max(std::size_t(1), thread_count);
 
@@ -1309,7 +1315,40 @@ namespace lws
         checked_wait(account_poll_interval - (std::chrono::steady_clock::now() - last));
       }
       else
-        check_loop(disk.clone(),thread_count, daemon_rpc,std::move(users), std::move(active), std::move(start_heights));
+      {
+        /* Endpoints for this pass.
+
+           Off (the default), every thread uses the endpoint the pass selected,
+           which is the historical behaviour and the right one in steady state:
+           threads partition ACCOUNTS, not block ranges, and accounts converge on
+           the chain tip, so the threads mostly request the SAME heights and the
+           shared fetch cache already collapses those into one request per height.
+           Spreading them over several daemons there buys nothing, because the
+           work that actually dominates at large account counts is the per-output
+           key derivation - CPU, not block fetching.
+
+           On, the threads fan out across every endpoint. That pays only when
+           accounts sit at genuinely different heights, so the threads are asking
+           for different block ranges at the same time - a bulk rescan, or a large
+           population catching up from staggered heights. It also spreads the RPC
+           load off a single beldexd.
+
+           Opt-in because it has a real cost: the threads of one pass are then
+           reading from several daemons at once, so any disagreement between them
+           (one lagging, one on a fork) shows up as hash divergence and a rollback
+           rather than being confined to one source. */
+        std::vector<std::string> pass_endpoints;
+        if (spread && 1 < daemon_rpcs.size())
+        {
+          pass_endpoints.reserve(daemon_rpcs.size());
+          for (std::size_t i = 0; i < daemon_rpcs.size(); ++i)
+            pass_endpoints.push_back(daemon_rpcs[(endpoint + i) % daemon_rpcs.size()]);
+        }
+        else
+          pass_endpoints.push_back(daemon_rpc);
+
+        check_loop(disk.clone(),thread_count, std::move(pass_endpoints),std::move(users), std::move(active), std::move(start_heights));
+      }
 
       if (!scanner::is_running())
         return;

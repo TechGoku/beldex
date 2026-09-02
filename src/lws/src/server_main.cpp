@@ -36,6 +36,7 @@ namespace
     const command_line::arg_descriptor<std::string> daemon_sub;
     const command_line::arg_descriptor<std::string> daemon_backup;
     const command_line::arg_descriptor<std::uint64_t> rest_cache_bytes;
+    const command_line::arg_descriptor<bool> daemon_spread;
     const command_line::arg_descriptor<std::vector<std::string>> rest_servers;
     const command_line::arg_descriptor<std::vector<std::string>> admin_rest_servers;
     const command_line::arg_descriptor<std::string> rest_ssl_key;
@@ -74,6 +75,7 @@ namespace
       , daemon_sub{"sub", "tcp://address:port or ipc://path of a beldexd OMQ Pub", ""}
       , daemon_backup{"daemon-backup", "Comma-separated additional beldexd HTTP endpoints to fail over to, e.g. http://host2:19091,http://host3:19091", ""}
       , rest_cache_bytes{"rest-cache-bytes", "Memory ceiling for EACH per-account REST response cache, in bytes", 256 * 1024 * 1024}
+      , daemon_spread{"daemon-spread", "Fan scan threads across every --daemon/--daemon-backup endpoint instead of using one at a time. Helps only when accounts sit at different heights (bulk rescan, staggered catch-up); in steady state the threads request the same blocks and the shared fetch cache already dedupes them", false}
       , rest_servers{"rest-server", "[(https|http)://<address>:]<port>[/<prefix>] for incoming connections, multiple declarations allowed"}
       , admin_rest_servers{"admin-rest-server", "[(https|http])://<address>:]<port>[/<prefix>] for incoming admin connections, multiple declarations allowed"}      , rest_ssl_key{"rest-ssl-key", "<path> to PEM formatted SSL key for https REST server", ""}
       , rest_ssl_cert{"rest-ssl-certificate", "<path> to PEM formatted SSL certificate (chains supported) for https REST server", ""}
@@ -106,6 +108,7 @@ namespace
       command_line::add_arg(description, daemon_sub);
       command_line::add_arg(description, daemon_backup);
       command_line::add_arg(description, rest_cache_bytes);
+      command_line::add_arg(description, daemon_spread);
       description.add_options()(rest_servers.name, boost::program_options::value<std::vector<std::string>>()->default_value({rest_default}, rest_default), rest_servers.description);
       command_line::add_arg(description, admin_rest_servers);
       command_line::add_arg(description, rest_ssl_key);
@@ -142,6 +145,7 @@ namespace
         anywhere earlier shifts every following initialiser into the wrong
         member. Filled in after that initialisation. */
     std::vector<std::string> daemon_backups;
+    bool daemon_spread;
   };
 
   void print_help(std::ostream& out)
@@ -236,6 +240,7 @@ namespace
       lws::daemon_add = prog.daemon_rpc;
 
     lws::rest_cache_max_bytes = std::size_t(command_line::get_arg(args, opts.rest_cache_bytes));
+    prog.daemon_spread = command_line::get_arg(args, opts.daemon_spread);
 
     /* Build the failover endpoint list: primary first, then --daemon-backup.
 
@@ -374,7 +379,10 @@ namespace
         scan_endpoints.push_back(entry);
 
         // blocks until SIGINT
-   lws::scanner::run(std::move(disk), std::move(scan_endpoints), prog.scan_threads);
+    if (prog.daemon_spread && 1 < scan_endpoints.size())
+      MINFO("Scan threads will be spread across " << scan_endpoints.size() << " daemon endpoint(s)");
+
+   lws::scanner::run(std::move(disk), std::move(scan_endpoints), prog.scan_threads, prog.daemon_spread);
     
   }
 } // anonymous
