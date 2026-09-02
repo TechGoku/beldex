@@ -137,6 +137,11 @@ namespace
     unsigned create_queue_max;
     std::uint64_t db_map_size;
     unsigned db_max_readers;
+    /*! Parsed + normalised `--daemon-backup`. Last member on purpose: `program`
+        is aggregate-initialised from the option list, so inserting a field
+        anywhere earlier shifts every following initialiser into the wrong
+        member. Filled in after that initialisation. */
+    std::vector<std::string> daemon_backups;
   };
 
   void print_help(std::ostream& out)
@@ -230,37 +235,56 @@ namespace
     else
       lws::daemon_add = prog.daemon_rpc;
 
-    /* Build the failover pool: primary first, then --daemon-backup in order.
-
-       Each backup is normalised the same way the primary is - a bare endpoint
-       gets "/json_rpc" appended - so operators can pass the same form of URL
-       they pass to --daemon. Duplicates and blanks are dropped so a repeated
-       entry cannot make one dead daemon get retried twice per request. */
     lws::rest_cache_max_bytes = std::size_t(command_line::get_arg(args, opts.rest_cache_bytes));
 
-    lws::daemon_pool.clear();
-    lws::daemon_pool.push_back(lws::daemon_add);
+    /* Build the failover endpoint list: primary first, then --daemon-backup.
+
+       The two tiers cannot use the same set. The REST tier reaches beldexd over
+       HTTP with cpr, so it can only use http(s) endpoints. The scanner picks
+       its transport per endpoint (`is_ipc_uri`), so it can use an ipc:// socket
+       AND http:// endpoints in the same list - which is the useful arrangement:
+       a local socket for the fast path, remote hosts as the fallback.
+
+       Only http endpoints get "/json_rpc" appended. Doing that unconditionally
+       turned `ipc:///var/run/beldexd.sock` into
+       `ipc:///var/run/beldexd.sock/json_rpc`, a socket path that cannot exist. */
+    const auto is_ipc = [](const std::string& uri)
+    { return uri.rfind("ipc://", 0) == 0; };
+
+    const auto normalise = [&is_ipc](std::string entry) -> std::string
+    {
+      const auto first = entry.find_first_not_of(" \t");
+      const auto last  = entry.find_last_not_of(" \t");
+      entry = (first == std::string::npos) ? std::string{} : entry.substr(first, last - first + 1);
+      if (entry.empty())
+        return entry;
+
+      if (is_ipc(entry))
+        return entry; // a socket path - leave exactly as given
+
+      while (!entry.empty() && entry.back() == '/')
+        entry.pop_back();
+      if (entry.find("/json_rpc") == std::string::npos)
+        entry += "/json_rpc";
+      return entry;
+    };
+
+    prog.daemon_backups.clear();
     {
       const std::string& backups = prog.daemon_backup;
       std::size_t pos = 0;
-      while (pos <= backups.size() && !backups.empty())
+      while (!backups.empty() && pos <= backups.size())
       {
         const std::size_t comma = backups.find(',', pos);
-        std::string entry = backups.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        std::string entry = normalise(
+          backups.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
 
-        // trim surrounding whitespace
-        const auto first = entry.find_first_not_of(" \t");
-        const auto last  = entry.find_last_not_of(" \t");
-        entry = (first == std::string::npos) ? std::string{} : entry.substr(first, last - first + 1);
-
-        if (!entry.empty())
+        // Duplicates are dropped so one dead daemon cannot be retried twice per
+        // request; the primary counts as already present.
+        if (!entry.empty() && entry != prog.daemon_rpc && entry != lws::daemon_add &&
+            std::find(prog.daemon_backups.begin(), prog.daemon_backups.end(), entry) == prog.daemon_backups.end())
         {
-          while (!entry.empty() && entry.back() == '/')
-            entry.pop_back();
-          if (entry.find("/json_rpc") == std::string::npos)
-            entry += "/json_rpc";
-          if (std::find(lws::daemon_pool.begin(), lws::daemon_pool.end(), entry) == lws::daemon_pool.end())
-            lws::daemon_pool.push_back(std::move(entry));
+          prog.daemon_backups.push_back(std::move(entry));
         }
 
         if (comma == std::string::npos)
@@ -268,11 +292,39 @@ namespace
         pos = comma + 1;
       }
     }
-    if (1 < lws::daemon_pool.size())
+
+    // REST tier: http only. `lws::daemon_add` is already forced to an http
+    // endpoint above even when the primary is ipc://, so this is never empty.
+    lws::daemon_pool.clear();
+    lws::daemon_pool.push_back(lws::daemon_add);
+    for (const std::string& entry : prog.daemon_backups)
     {
-      MINFO("Daemon failover pool has " << lws::daemon_pool.size() << " endpoint(s):");
+      if (is_ipc(entry))
+        continue; // cannot be dialled with cpr; scanner still uses it
+      if (std::find(lws::daemon_pool.begin(), lws::daemon_pool.end(), entry) == lws::daemon_pool.end())
+        lws::daemon_pool.push_back(entry);
+    }
+
+    if (!prog.daemon_backups.empty())
+    {
+      MINFO("Daemon failover configured:");
+      MINFO("  scanner endpoints (" << (1 + prog.daemon_backups.size()) << "):");
+      MINFO("    1. " << prog.daemon_rpc << (is_ipc(prog.daemon_rpc) ? "   [ipc]" : "   [http]"));
+      unsigned n = 1;
+      for (const std::string& entry : prog.daemon_backups)
+        MINFO("    " << ++n << ". " << entry << (is_ipc(entry) ? "   [ipc]" : "   [http]"));
+
+      MINFO("  REST endpoints (" << lws::daemon_pool.size() << ", http only):");
+      unsigned m = 0;
       for (const std::string& url : lws::daemon_pool)
-        MINFO("  - " << url);
+        MINFO("    " << ++m << ". " << url);
+
+      const std::size_t skipped = (1 + prog.daemon_backups.size()) - lws::daemon_pool.size();
+      if (skipped)
+      {
+        MINFO("  (" << skipped << " ipc endpoint(s) are scanner-only - the REST tier "
+              "talks to beldexd over HTTP)");
+      }
     }
     return prog;
   }
@@ -312,13 +364,14 @@ namespace
       MINFO("Listening for REST admin clients at " << address);
 
     /* Scanner endpoint list: its own primary (which may be an ipc:// URI, so it
-       is not necessarily `lws::daemon_add`) followed by the HTTP backups. The
-       scanner falls over to the next entry only after a pass aborts early, so a
+       is not necessarily `lws::daemon_add`) followed by every backup - ipc and
+       http alike, since the scanner selects its transport per endpoint. It
+       falls over only after a pass aborts early or a chain sync fails, so a
        single-daemon deployment is unaffected. */
     std::vector<std::string> scan_endpoints{prog.daemon_rpc};
-    for (std::size_t i = 1; i < lws::daemon_pool.size(); ++i)
-      if (lws::daemon_pool[i] != prog.daemon_rpc)
-        scan_endpoints.push_back(lws::daemon_pool[i]);
+    for (const std::string& entry : prog.daemon_backups)
+      if (entry != prog.daemon_rpc)
+        scan_endpoints.push_back(entry);
 
         // blocks until SIGINT
    lws::scanner::run(std::move(disk), std::move(scan_endpoints), prog.scan_threads);
