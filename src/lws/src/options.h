@@ -17,7 +17,17 @@ namespace lws
    const std::string default_db_subdir = "/light_wallet_server";
    const std::string dir_slash = "/";
   //  std::cout<< std::getenv("HOME");
-   const std::string default_db_dir = std::getenv("HOME")+ dir_slash + std::string(cryptonote::DATA_DIRNAME);
+   /* `HOME` is unset under systemd units, in containers, and after a bare
+      `su`. The previous form was `const char* + std::string`, so an unset HOME
+      was a null-pointer dereference during static initialisation - the process
+      died before `main()` with no diagnostic at all. Fall back to the current
+      directory instead; `--db-path` overrides this either way. */
+   inline std::string default_home_dir()
+   {
+     const char* const home = std::getenv("HOME");
+     return (home && *home) ? std::string{home} : std::string{"."};
+   }
+   const std::string default_db_dir = default_home_dir() + dir_slash + std::string(cryptonote::DATA_DIRNAME);
   // const std::string default_db_dir = std::string("/home/blockhash")+ dir_slash + CRYPTONOTE_NAME;
    struct options
   {

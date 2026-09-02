@@ -55,9 +55,13 @@ namespace lws
     {
       //go to loop
       MINFO("Run net_service loop( " << threads_count << " threads)...");
+      // Report the failure instead of swallowing it: this returned `true`
+      // unconditionally, so `rest_server` treated a server that never started
+      // as running and the process carried on serving nothing.
       if(!m_net_server.run_server(threads_count, wait))
       {
         LOG_ERROR("Failed to run net tcp server!");
+        return false;
       }
 
       if(wait)

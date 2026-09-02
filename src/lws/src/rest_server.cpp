@@ -5,6 +5,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -29,6 +31,7 @@
 #include "db/storage.h"
 #include "rpc/admin.h"
 #include "rpc/client.h"
+#include "scanner.h"
 #include "util/http_server.h"
 #include "util/gamma_picker.h"
 #include "util/random_outputs.h"
@@ -177,6 +180,111 @@ namespace lws
       }
     }
 
+    /* Daemon endpoint pool with failover.
+
+       Every daemon call used to go to one hardcoded URL, so a single beldexd
+       restart broke balance queries for every user of the server until it came
+       back - exactly the single point of failure the deployment is meant not to
+       have. Requests now try the preferred endpoint first and fall through to
+       the rest on a transport-level failure.
+
+       A failed endpoint is benched for `daemon_retry_cooldown` so a dead daemon
+       is not re-dialled (and re-timed-out) on every request; if every endpoint
+       is benched the pool ignores the marks and tries them all anyway, so a
+       total outage degrades to the old behaviour rather than failing fast
+       forever. `preferred` sticks to whichever endpoint last answered, so
+       traffic does not oscillate between daemons.
+
+       With no `--daemon-backup` configured the pool holds one entry and this is
+       exactly the previous code path plus one atomic read. */
+    constexpr const std::chrono::seconds daemon_retry_cooldown{30};
+
+    struct daemon_pool_state
+    {
+      std::mutex lock;
+      std::vector<std::chrono::steady_clock::time_point> benched_until;
+      std::size_t preferred = 0;
+    };
+
+    daemon_pool_state& get_daemon_pool_state()
+    {
+      static daemon_pool_state state{};
+      return state;
+    }
+
+    const std::vector<std::string>& daemon_endpoints()
+    {
+      // daemon_pool is populated once, before the server starts listening, and
+      // never mutated afterwards - so a reference is safe to hand out.
+      static const std::vector<std::string> fallback{lws::daemon_add};
+      return lws::daemon_pool.empty() ? fallback : lws::daemon_pool;
+    }
+
+    //! POST `body` to the first daemon that answers. `used` receives its URL.
+    cpr::Response post_to_daemon(const std::string& body, std::string& used)
+    {
+      const std::vector<std::string>& endpoints = daemon_endpoints();
+      daemon_pool_state& state = get_daemon_pool_state();
+
+      std::vector<std::size_t> order;
+      std::size_t start = 0;
+      {
+        const std::lock_guard<std::mutex> guard{state.lock};
+        state.benched_until.resize(endpoints.size());
+        start = state.preferred < endpoints.size() ? state.preferred : 0;
+
+        const auto now = std::chrono::steady_clock::now();
+        order.reserve(endpoints.size());
+        // Healthy endpoints first, starting at the preferred one...
+        for (std::size_t i = 0; i < endpoints.size(); ++i)
+        {
+          const std::size_t idx = (start + i) % endpoints.size();
+          if (state.benched_until[idx] <= now)
+            order.push_back(idx);
+        }
+        // ...then the benched ones, so a full outage still gets attempted.
+        for (std::size_t i = 0; i < endpoints.size(); ++i)
+        {
+          const std::size_t idx = (start + i) % endpoints.size();
+          if (now < state.benched_until[idx])
+            order.push_back(idx);
+        }
+      }
+
+      cpr::Response response{};
+      for (const std::size_t idx : order)
+      {
+        used = endpoints[idx];
+        response = cpr::Post(
+          cpr::Url{used},
+          cpr::Body{body},
+          cpr::Header{{"Content-Type", "application/json"}},
+          cpr::Timeout{std::chrono::milliseconds{30000}}
+        );
+
+        const std::lock_guard<std::mutex> guard{state.lock};
+        if (response.status_code == 200)
+        {
+          state.benched_until[idx] = std::chrono::steady_clock::time_point{};
+          if (state.preferred != idx)
+          {
+            MINFO("daemon endpoint switched to " << used);
+            state.preferred = idx;
+          }
+          return response;
+        }
+
+        state.benched_until[idx] = std::chrono::steady_clock::now() + daemon_retry_cooldown;
+        if (order.size() > 1)
+        {
+          MWARNING("daemon endpoint " << used << " failed (HTTP "
+                   << response.status_code << "); trying next of "
+                   << order.size() << " endpoint(s)");
+        }
+      }
+      return response; // last failure; caller logs and maps to an error
+    }
+
     expect<json> post_json_rpc(std::string method, json params = json::object())
     {
       json request_body = {
@@ -187,12 +295,8 @@ namespace lws
       if (!params.empty())
         request_body["params"] = std::move(params);
 
-      auto response = cpr::Post(
-        cpr::Url{lws::daemon_add},
-        cpr::Body{request_body.dump()},
-        cpr::Header{{"Content-Type", "application/json"}},
-        cpr::Timeout{std::chrono::milliseconds{30000}}
-      );
+      std::string used_url{};
+      auto response = post_to_daemon(request_body.dump(), used_url);
 
       if (response.status_code != 200)
       {
@@ -202,7 +306,7 @@ namespace lws
         // failure points at its actual cause instead of being anonymous.
         MERROR("daemon RPC '" << method << "' failed: HTTP status " << response.status_code
                << ", transport error [" << static_cast<int>(response.error.code) << "] "
-               << response.error.message << ", url=" << lws::daemon_add
+               << response.error.message << ", url=" << used_url
                << ", req_bytes=" << request_body.dump().size()
                << ", elapsed=" << response.elapsed << "s");
         return make_error_code(std::errc::io_error);
@@ -250,18 +354,22 @@ namespace lws
       std::unordered_map<crypto::key_image, std::uint64_t, key_image_hash> locked_by_image;
     };
 
-    expect<master_node_cache> get_master_node_cache()
+    expect<std::shared_ptr<const master_node_cache>> get_master_node_cache()
     {
       static constexpr const auto cache_ttl = std::chrono::seconds{10};
       static std::mutex cache_mutex;
-      static master_node_cache cache{};
+      /* Published as shared_ptr<const>: entries are immutable once visible, so a
+         hit hands back a refcount bump instead of deep-copying two nlohmann
+         documents and two hash maps on EVERY request (including cache hits) -
+         which it did for get_address_info, get_address_txs, get_unspent_outs
+         and get_random_outs alike. */
+      static std::shared_ptr<const master_node_cache> cache;
       static auto last_update = std::chrono::steady_clock::now();
-      static bool cache_initialized = false;
 
       const auto now = std::chrono::steady_clock::now();
       {
         const std::lock_guard<std::mutex> lock{cache_mutex};
-        if (cache_initialized && now - last_update < cache_ttl)
+        if (cache && now - last_update < cache_ttl)
           return cache;
       }
 
@@ -273,13 +381,14 @@ namespace lws
       if (!blacklist)
         return blacklist.error();
 
-      const std::lock_guard<std::mutex> lock{cache_mutex};
+      // Built into a fresh object, then published; never mutated in place.
+      auto fresh = std::make_shared<master_node_cache>();
       // Peel any envelope-level array wrapping (single, or doubly nested as
       // get_output_distribution returns), leaving the envelope object.
-      cache.master_nodes = std::move(*master_nodes);
-      cache.blacklist = std::move(*blacklist);
-      unwrap_json_rpc(cache.master_nodes);
-      unwrap_json_rpc(cache.blacklist);
+      fresh->master_nodes = std::move(*master_nodes);
+      fresh->blacklist = std::move(*blacklist);
+      unwrap_json_rpc(fresh->master_nodes);
+      unwrap_json_rpc(fresh->blacklist);
 
       // Some daemon builds also wrap "result" itself in a single-element array
       // (get_fee_estimate does; see deep_unwrap). Peel it in place so the
@@ -297,22 +406,20 @@ namespace lws
           *it = std::move(inner);
         }
       };
-      dearray_result(cache.blacklist);
-      dearray_result(cache.master_nodes);
+      dearray_result(fresh->blacklist);
+      dearray_result(fresh->master_nodes);
 
-      cache.blacklist_by_image.clear();
-      cache.locked_by_image.clear();
       try
       {
-        for (const auto& item : cache.blacklist["result"]["blacklist"])
+        for (const auto& item : fresh->blacklist["result"]["blacklist"])
         {
           crypto::key_image image;
           const std::string image_str = item["key_image"];
           if (epee::string_tools::hex_to_pod(image_str, image))
-            cache.blacklist_by_image[image] = item["amount"].get<std::uint64_t>();
+            fresh->blacklist_by_image[image] = item["amount"].get<std::uint64_t>();
         }
 
-        for (const auto& mn_all : cache.master_nodes["result"]["master_node_states"])
+        for (const auto& mn_all : fresh->master_nodes["result"]["master_node_states"])
         {
           if (!mn_all.contains("contributors"))
             continue;
@@ -325,7 +432,7 @@ namespace lws
               crypto::key_image image;
               const std::string image_str = contribution["key_image"].get<std::string>();
               if (tools::hex_to_type(image_str, image))
-                cache.locked_by_image[image] = contribution["amount"].get<std::uint64_t>();
+                fresh->locked_by_image[image] = contribution["amount"].get<std::uint64_t>();
             }
           }
         }
@@ -336,8 +443,9 @@ namespace lws
         return {lws::error::bad_daemon_response};
       }
 
+      const std::lock_guard<std::mutex> lock{cache_mutex};
+      cache = std::move(fresh);
       last_update = std::chrono::steady_clock::now();
-      cache_initialized = true;
       return cache;
     }
 
@@ -350,17 +458,18 @@ namespace lws
     // (only up to `cache_ttl` stale), so clients are unaffected. A few blocks of
     // staleness in the distribution is harmless: decoy selection deliberately
     // avoids the very newest outputs anyway.
-    expect<json> get_fee_estimate_cache()
+    expect<std::shared_ptr<const json>> get_fee_estimate_cache()
     {
       static constexpr const auto cache_ttl = std::chrono::seconds{30};
       static std::mutex cache_mutex;
-      static json cache{};
+      // shared_ptr<const>: a hit is a refcount bump, not a deep copy of the
+      // document (the RingCT output distribution in particular is large).
+      static std::shared_ptr<const json> cache;
       static auto last_update = std::chrono::steady_clock::now();
-      static bool cache_initialized = false;
 
       {
         const std::lock_guard<std::mutex> lock{cache_mutex};
-        if (cache_initialized && std::chrono::steady_clock::now() - last_update < cache_ttl)
+        if (cache && std::chrono::steady_clock::now() - last_update < cache_ttl)
           return cache;
       }
 
@@ -370,24 +479,26 @@ namespace lws
       if (!fetched)
         return fetched.error();
 
+      auto fresh = std::make_shared<const json>(std::move(*fetched));
+
       const std::lock_guard<std::mutex> lock{cache_mutex};
-      cache = std::move(*fetched);
+      cache = std::move(fresh);
       last_update = std::chrono::steady_clock::now();
-      cache_initialized = true;
       return cache;
     }
 
-    expect<json> get_output_distribution_cache()
+    expect<std::shared_ptr<const json>> get_output_distribution_cache()
     {
       static constexpr const auto cache_ttl = std::chrono::seconds{30};
       static std::mutex cache_mutex;
-      static json cache{};
+      // shared_ptr<const>: a hit is a refcount bump, not a deep copy of the
+      // document (the RingCT output distribution in particular is large).
+      static std::shared_ptr<const json> cache;
       static auto last_update = std::chrono::steady_clock::now();
-      static bool cache_initialized = false;
 
       {
         const std::lock_guard<std::mutex> lock{cache_mutex};
-        if (cache_initialized && std::chrono::steady_clock::now() - last_update < cache_ttl)
+        if (cache && std::chrono::steady_clock::now() - last_update < cache_ttl)
           return cache;
       }
 
@@ -401,10 +512,11 @@ namespace lws
       if (!fetched)
         return fetched.error();
 
+      auto fresh = std::make_shared<const json>(std::move(*fetched));
+
       const std::lock_guard<std::mutex> lock{cache_mutex};
-      cache = std::move(*fetched);
+      cache = std::move(fresh);
       last_update = std::chrono::steady_clock::now();
-      cache_initialized = true;
       return cache;
     }
 
@@ -459,6 +571,14 @@ namespace lws
     {
       db::block_id scan_height;                    //!< every output in a block <= this is present
       crypto::hash scan_hash;                      //!< "our" block hash at `scan_height`
+      /*! Total output rows stored for this account when the entry was built.
+
+          `scan_height` + `scan_hash` identify the chain position, but NOT the
+          account's stored output set. A rescan rewrites that set and can finish
+          at the SAME height on the SAME branch, which scored an exact cache hit
+          and served the pre-rescan projection forever. Observed live: the DB
+          held 1,400,000,051.6 BDX while the API kept reporting 51.6 BDX. */
+      std::uint64_t output_total;
       std::uint64_t total_received;
       std::vector<db::output::spend_meta_> metas;  //!< sorted by id, for find_metadata
       std::vector<locked_entry> locked;            //!< output-walk order
@@ -490,7 +610,7 @@ namespace lws
       static std::size_t cache_bytes = 0;
       // Bound total cached bytes so many distinct large accounts cannot grow memory
       // without limit (a single projection larger than this is never cached).
-      constexpr const std::size_t cache_max_bytes = 256 * 1024 * 1024;
+      const std::size_t cache_max_bytes = lws::rest_cache_max_bytes;
 
       const std::uint32_t key = std::uint32_t(user.id);
       const auto now = std::chrono::steady_clock::now();
@@ -508,6 +628,15 @@ namespace lws
       const expect<crypto::hash> scan_hash = reader.get_block_hash(user.scan_height);
       const bool cacheable = bool(scan_hash);
 
+      /* Cheap O(1) dup-count of the account's stored outputs, used to notice a
+         rescan that rewrote the output set without moving `scan_height`. */
+      std::uint64_t live_output_total = 0;
+      {
+        auto counter = reader.get_outputs(user.id);
+        if (counter)
+          live_output_total = counter->count();
+      }
+
       std::shared_ptr<const account_index> base{};
       if (cacheable)
       {
@@ -517,7 +646,8 @@ namespace lws
         {
           it->second.last_access = now;
           if (it->second.value->scan_height == user.scan_height &&
-              it->second.value->scan_hash == *scan_hash)
+              it->second.value->scan_hash == *scan_hash &&
+              it->second.value->output_total == live_output_total)
             return it->second.value; // exact hit - no DB reads at all
           if (user.scan_height <= it->second.value->scan_height)
           {
@@ -541,11 +671,14 @@ namespace lws
         const expect<crypto::hash> base_hash = reader.get_block_hash(base->scan_height);
         if (!base_hash || !(*base_hash == base->scan_hash))
           base.reset(); // history below the cursor changed - rebuild from scratch
+        else if (base->output_total > live_output_total)
+          base.reset(); // outputs were removed underneath us (rescan) - rebuild
       }
 
       auto fresh = std::make_shared<account_index>();
       fresh->scan_height = user.scan_height;
       fresh->scan_hash = cacheable ? *scan_hash : crypto::hash{};
+      fresh->output_total = live_output_total;
       fresh->total_received = 0;
       if (base)
       {
@@ -569,8 +702,29 @@ namespace lws
         fresh->locked.reserve(outputs->count());
       }
 
+      /* Stop at the account's scan height.
+
+         The entry records `scan_height` and promises "every output in a block
+         <= this is present". A full walk returns EVERY stored output though,
+         including ones above that height, which breaks the promise in the other
+         direction - and the extend path then re-reads those same rows from
+         `base->scan_height + 1` and counts them a second time.
+
+         Normally outputs never sit above scan_height: `storage::update` writes
+         the outputs and advances scan_height in one transaction. A rescan
+         breaks that - it lowers scan_height and deliberately leaves the stored
+         outputs in place - so a request landing mid-rescan cached all 1802
+         outputs under scan_height 1, and the later extend added them again for
+         a reported balance of exactly double. Observed on the private testnet:
+         1802 BDX became 3604 BDX after a rescan, while the DB held the correct
+         1802 rows. */
+      const std::uint64_t index_bound = std::uint64_t(user.scan_height);
       for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
       {
+        // Outputs are ordered by height, so the first one past the bound ends the walk.
+        if (index_bound < std::uint64_t(output.get_value<MONERO_FIELD(db::output, link.height)>()))
+          break;
+
         const db::output::spend_meta_ meta =
           output.get_value<MONERO_FIELD(db::output, spend_meta)>();
 
@@ -656,17 +810,14 @@ namespace lws
                 {"method", "get_info"}
             };
     
-            // Call the daemon
-            auto response_http = cpr::Post(
-                cpr::Url{lws::daemon_add},
-                cpr::Body{request_body.dump()},
-                cpr::Header{{"Content-Type", "application/json"}},
-                cpr::Timeout{std::chrono::milliseconds{30000}}
-            );
+            // Call the daemon (with failover across the configured pool)
+            std::string used_url{};
+            auto response_http = post_to_daemon(request_body.dump(), used_url);
     
             if (response_http.status_code != 200)
             {
-                MERROR("get_info call failed with HTTP code: " << response_http.status_code);
+                MERROR("get_info call failed with HTTP code: " << response_http.status_code
+                       << " (url=" << used_url << ")");
                 return make_error_code(std::errc::io_error);
             }
     
@@ -748,6 +899,7 @@ namespace lws
         auto master_node_data = get_master_node_cache();
         if (!master_node_data)
           return master_node_data.error();
+        const master_node_cache& mn = **master_node_data;
 
         response resp{};
 
@@ -789,7 +941,20 @@ namespace lws
         if (!last)
           return last.error();
 
-        resp.blockchain_height = std::uint64_t(last->id);
+        /* Report whichever of the stored chain tip and the account's own scan
+           height is further along.
+
+           `get_last_block()` reads the `blocks` table, which is only extended by
+           `scanner::sync` - and `sync` runs between scan passes, not during one.
+           A long scan therefore advances account scan heights well past the last
+           recorded block, and this endpoint reported a `blockchain_height`
+           BELOW `scanned_height` (observed live: scanned 55,398 vs chain 33,326,
+           a 22,072-block inversion). Clients derive "blocks remaining" and
+           unlock heights from this pair, so an understated tip yields nonsense
+           - negative progress, and transactions built against a stale height
+           that the network relays but never mines. */
+        resp.blockchain_height =
+          std::max(std::uint64_t(last->id), std::uint64_t(user->first.scan_height));
         resp.transaction_height = resp.blockchain_height;
         resp.scanned_height = std::uint64_t(user->first.scan_height);
         resp.scanned_block_height = resp.scanned_height;
@@ -814,16 +979,16 @@ namespace lws
             // O(1) lookup against the maps built once per master-node cache
             // refresh (10s TTL), instead of walking every masternode /
             // contributor / contribution for this output.
-            const auto blacklisted = master_node_data->blacklist_by_image.find(out.image);
-            if (blacklisted != master_node_data->blacklist_by_image.end())
+            const auto blacklisted = mn.blacklist_by_image.find(out.image);
+            if (blacklisted != mn.blacklist_by_image.end())
             {
               resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + blacklisted->second);
               processed.insert(out.image);
             }
             else
             {
-              const auto locked = master_node_data->locked_by_image.find(out.image);
-              if (locked != master_node_data->locked_by_image.end())
+              const auto locked = mn.locked_by_image.find(out.image);
+              if (locked != mn.locked_by_image.end())
               {
                 resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + locked->second);
                 processed.insert(out.image);
@@ -886,6 +1051,7 @@ namespace lws
         auto master_node_data = get_master_node_cache();
         if (!master_node_data)
           return master_node_data.error();
+        const master_node_cache& mn = **master_node_data;
 
         // Fee estimate is request-independent (constant grace_blocks) and
         // changes slowly; served from a short-TTL cache instead of a live
@@ -894,9 +1060,14 @@ namespace lws
         if (!fee_data)
           return fee_data.error();
 
-        json resp = std::move(*fee_data);
+        const json& resp = **fee_data;
 
-        if ((req.use_dust && req.use_dust) || !req.dust_threshold)
+        /* `use_dust` is boost::optional<bool>: `req.use_dust && req.use_dust`
+           tested only that the field was PRESENT (twice), so `"use_dust": false`
+           behaved exactly like `true` and silently forced the dust threshold to
+           zero. Test the contained value. A caller that omits the field, or
+           omits dust_threshold, keeps the previous behaviour. */
+        if (req.use_dust.value_or(false) || !req.dust_threshold)
           req.dust_threshold = rpc::safe_uint64(0);
 
         if (!req.mixin)
@@ -955,15 +1126,15 @@ namespace lws
             // refresh (10s TTL), instead of walking every masternode /
             // contributor / contribution for this output. Amount is still
             // checked to match the prior per-entry comparison.
-            const auto blacklisted = master_node_data->blacklist_by_image.find(locked_key_image);
-            if (blacklisted != master_node_data->blacklist_by_image.end() && blacklisted->second == value_l)
+            const auto blacklisted = mn.blacklist_by_image.find(locked_key_image);
+            if (blacklisted != mn.blacklist_by_image.end() && blacklisted->second == value_l)
             {
               should_skip_output = true;
             }
             else
             {
-              const auto locked = master_node_data->locked_by_image.find(locked_key_image);
-              if (locked != master_node_data->locked_by_image.end() && locked->second == value_l)
+              const auto locked = mn.locked_by_image.find(locked_key_image);
+              if (locked != mn.locked_by_image.end() && locked->second == value_l)
                 should_skip_output = true;
             }
           }
@@ -1051,6 +1222,7 @@ namespace lws
         auto master_node_data = get_master_node_cache();
         if (!master_node_data)
           return master_node_data.error();
+        const master_node_cache& mn = **master_node_data;
         std::unordered_set<crypto::key_image, key_image_hash> locked_processed;
 
         // Outputs are walked in full even for an incremental request: they feed
@@ -1078,7 +1250,20 @@ namespace lws
         resp.scanned_height = std::uint64_t(user->first.scan_height);
         resp.scanned_block_height = resp.scanned_height;
         resp.start_height = std::uint64_t(user->first.start_height);
-        resp.blockchain_height = std::uint64_t(last->id);
+        /* Report whichever of the stored chain tip and the account's own scan
+           height is further along.
+
+           `get_last_block()` reads the `blocks` table, which is only extended by
+           `scanner::sync` - and `sync` runs between scan passes, not during one.
+           A long scan therefore advances account scan heights well past the last
+           recorded block, and this endpoint reported a `blockchain_height`
+           BELOW `scanned_height` (observed live: scanned 55,398 vs chain 33,326,
+           a 22,072-block inversion). Clients derive "blocks remaining" and
+           unlock heights from this pair, so an understated tip yields nonsense
+           - negative progress, and transactions built against a stale height
+           that the network relays but never mines. */
+        resp.blockchain_height =
+          std::max(std::uint64_t(last->id), std::uint64_t(user->first.scan_height));
         resp.transaction_height = resp.blockchain_height;
 
         // merge input and output info into a single set of txes.
@@ -1143,16 +1328,16 @@ namespace lws
                 output.get_value<MONERO_FIELD(db::output, locked_key_image)>();
             if (locked_key_image != crypto::key_image{} && !locked_processed.count(locked_key_image))
             {
-              const auto blacklisted = master_node_data->blacklist_by_image.find(locked_key_image);
-              if (blacklisted != master_node_data->blacklist_by_image.end())
+              const auto blacklisted = mn.blacklist_by_image.find(locked_key_image);
+              if (blacklisted != mn.blacklist_by_image.end())
               {
                 resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + blacklisted->second);
                 locked_processed.insert(locked_key_image);
               }
               else
               {
-                const auto locked = master_node_data->locked_by_image.find(locked_key_image);
-                if (locked != master_node_data->locked_by_image.end())
+                const auto locked = mn.locked_by_image.find(locked_key_image);
+                if (locked != mn.locked_by_image.end())
                 {
                   resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + locked->second);
                   locked_processed.insert(locked_key_image);
@@ -1257,8 +1442,27 @@ namespace lws
         
         std::vector<std::uint64_t> amounts = std::move(req.amounts.values);
 
-        if (50 < req.count || 20 < amounts.size())
+        /* Ring size and input-count ceilings for one decoy request.
+
+           `max_decoy_amounts` was 20, i.e. a transaction spending more than 20
+           inputs could not obtain decoys and simply failed - and a wallet that
+           has accumulated many small outputs routinely needs more than that.
+           The cap is a resource guard, not a protocol rule, so it is raised to
+           a value that covers any transaction the network will actually accept
+           (tx weight limits bind well before this) while still bounding the
+           per-request work. Raising a cap cannot break an existing client: a
+           request that used to be rejected now succeeds.
+
+           Verified against a wallet with 499 outputs, which needed >20 inputs
+           and was rejected outright with `exceeded_rest_request_limit`. */
+        constexpr const std::size_t max_ring_size = 50;
+        constexpr const std::size_t max_decoy_amounts = 200;
+        if (max_ring_size < req.count || max_decoy_amounts < amounts.size())
+        {
+          MINFO("get_random_outs rejected: count=" << req.count << " (max " << max_ring_size
+                << "), amounts=" << amounts.size() << " (max " << max_decoy_amounts << ")");
           return {lws::error::exceeded_rest_request_limit};
+        }
 
         const std::greater<std::uint64_t> rsort{};
         std::sort(amounts.begin(), amounts.end(), rsort);
@@ -1342,7 +1546,7 @@ namespace lws
           if (!distribution_data)
             return distribution_data.error();
 
-          json resp = std::move(*distribution_data);
+          const json& resp = **distribution_data;
           try
           {
             const json& dists = deep_unwrap(deep_unwrap(resp).at("result")).at("distributions");
@@ -1419,10 +1623,19 @@ namespace lws
               for (const auto& raw : deep_unwrap(deep_unwrap(resp).at("result")).at("outs"))
               {
                 const json& it = deep_unwrap(raw);
-                get_keys_rpc key;
-                std::string key_p = it.at("key");
-                tools::hex_to_type(key_p, key.key);
-                tools::hex_to_type(it.at("mask").get<std::string>(), key.mask);
+                /* `key` is default-initialised, so its members are
+                   indeterminate until successfully filled. The conversion
+                   results used to be discarded, so malformed daemon hex left
+                   uninitialised bytes that were handed straight back to the
+                   client as ring members. Treat a bad conversion as a bad
+                   daemon response instead. */
+                get_keys_rpc key{};
+                if (!tools::hex_to_type(it.at("key").get<std::string>(), key.key) ||
+                    !tools::hex_to_type(it.at("mask").get<std::string>(), key.mask))
+                {
+                  MERROR("get_random_outs: malformed output key/mask hex from daemon");
+                  return {lws::error::bad_daemon_response};
+                }
                 key.unlocked = it.at("unlocked");
                 keys.push_back(key);
               }
@@ -1523,10 +1736,19 @@ namespace lws
             return account.error();
         }
 
+        /* Accounts are created directly on login, by design: wallets - including
+           third-party front ends - onboard users without an approval step. That
+           behaviour is deliberately preserved here; only the defects around it
+           are fixed.
+
+           1. `flags` was computed and then dropped, so `generated_locally` was
+              never persisted. A later login re-read it from the DB and always
+              reported false. It is now passed through to `add_account`.
+           2. `MONERO_UNWRAP` THROWS on any DB error. That escaped the handler
+              (see the try/catch in handle_http_request) instead of becoming a
+              clean error response. Return the error code instead. */
         const auto flags = req.generated_locally ? db::account_generated_locally : db::default_account;
-        // MONERO_CHECK(disk.creation_request(req.creds.address, req.creds.key, flags));
-        MONERO_UNWRAP(disk.add_account(req.creds.address, req.creds.key));
-        // std::cout <<"add_account called\n";
+        MONERO_CHECK(disk.add_account(req.creds.address, req.creds.key, flags));
         return response{true, req.generated_locally};
       }
     };//login
@@ -1619,6 +1841,7 @@ namespace lws
       std::uint64_t min_height;
       std::uint64_t max_count;
       epee::byte_slice bytes;
+      std::chrono::steady_clock::time_point last_access;
     };
 
     expect<epee::byte_slice> call_get_address_txs(std::string&& root, db::storage disk)
@@ -1629,7 +1852,7 @@ namespace lws
       static std::size_t cache_bytes = 0;
       // Bound total cached bytes so many distinct large accounts can't grow
       // memory without limit (a single response larger than this is not cached).
-      constexpr const std::size_t cache_max_bytes = 256 * 1024 * 1024;
+      const std::size_t cache_max_bytes = lws::rest_cache_max_bytes;
 
       expect<E::request> req = wire::json::from_bytes<E::request>(std::move(root));
       if (!req)
@@ -1657,7 +1880,10 @@ namespace lws
         if (it != cache.end() && it->second.scan_height == scan_height &&
             it->second.last_block == last_block && it->second.min_height == min_height &&
             it->second.max_count == max_count)
+        {
+          it->second.last_access = std::chrono::steady_clock::now(); // for LRU eviction
           return it->second.bytes.clone();
+        }
       }
 
       expect<E::response> resp = E::handle(*req, std::move(disk));
@@ -1677,18 +1903,116 @@ namespace lws
           cache_bytes -= it->second.bytes.size();
           cache.erase(it);
         }
-        if (cache_bytes + sz > cache_max_bytes)
+        /* Evict least-recently-used until the new entry fits, instead of
+           clearing the whole cache. A single overshoot used to drop every
+           account's cached response at once, so they all rebuilt and
+           re-serialized their full history together - a stampede exactly when
+           the server was already under memory pressure. */
+        while (!cache.empty() && cache_bytes + sz > cache_max_bytes)
         {
-          cache.clear();
-          cache_bytes = 0;
+          auto oldest = cache.begin();
+          for (auto i = cache.begin(); i != cache.end(); ++i)
+          {
+            if (i->second.last_access < oldest->second.last_access)
+              oldest = i;
+          }
+          cache_bytes -= oldest->second.bytes.size();
+          cache.erase(oldest);
         }
         if (sz <= cache_max_bytes)
         {
-          cache.emplace(key, address_txs_cache_entry{scan_height, last_block, min_height, max_count, bytes->clone()});
+          cache.emplace(key, address_txs_cache_entry{scan_height, last_block, min_height, max_count, bytes->clone(), std::chrono::steady_clock::now()});
           cache_bytes += sz;
         }
       }
       return bytes;
+    }
+
+    /* Liveness / readiness probe.
+
+       There was no way to ask this server whether it was healthy. A load
+       balancer or orchestrator could only test that the TCP port accepted a
+       connection, which stays true while the scanner is wedged, the daemon is
+       unreachable or the LMDB map is nearly full - i.e. precisely the states an
+       operator needs to route traffic away from.
+
+       Deliberately unauthenticated and cheap: one LMDB read for the chain tip
+       plus in-memory counters, no daemon round-trip on the hot path. It takes
+       no request body, so a bare GET or an empty POST both work.
+
+       `status` is "ok" when this server can serve wallet queries, and
+       "degraded" when it cannot be trusted to - which is what a probe should
+       key on. Everything else is diagnostic detail. */
+    expect<epee::byte_slice> call_health(std::string&&, db::storage disk)
+    {
+      std::ostringstream out;
+
+      std::uint64_t last_block = 0;
+      bool db_ok = false;
+      {
+        auto reader = disk.start_read();
+        if (reader)
+        {
+          const auto last = reader->get_last_block();
+          if (last)
+          {
+            last_block = std::uint64_t(last->id);
+            db_ok = true;
+          }
+          reader->finish_read();
+        }
+      }
+
+      // Map utilisation is the metric behind the recurring MDB_MAP_FULL
+      // incidents; surfacing it lets it be alerted on instead of discovered.
+      double map_used_pct = 0.0;
+      std::uint64_t map_size = 0, map_used = 0;
+      unsigned readers_high_water = 0, max_readers = 0;
+      {
+        const auto usage = disk.get_usage();
+        if (usage)
+        {
+          map_size = usage->map_size;
+          map_used = usage->used_bytes;
+          readers_high_water = usage->readers_high_water;
+          max_readers = usage->max_readers;
+          if (map_size)
+            map_used_pct = (100.0 * double(map_used)) / double(map_size);
+        }
+      }
+
+      // Report the daemon pool as the server currently sees it.
+      std::size_t endpoints_total = 0, endpoints_benched = 0;
+      {
+        const std::vector<std::string>& pool = daemon_endpoints();
+        endpoints_total = pool.size();
+        daemon_pool_state& state = get_daemon_pool_state();
+        const std::lock_guard<std::mutex> guard{state.lock};
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& until : state.benched_until)
+          if (now < until)
+            ++endpoints_benched;
+      }
+
+      const bool scanner_ok = lws::scanner::is_running();
+      const bool daemons_ok = (endpoints_benched < endpoints_total) || endpoints_total == 0;
+      const bool map_ok = (map_used_pct < 95.0);
+      const bool healthy = db_ok && scanner_ok && daemons_ok && map_ok;
+
+      out << "{\"status\":\"" << (healthy ? "ok" : "degraded") << "\""
+          << ",\"scanner_running\":" << (scanner_ok ? "true" : "false")
+          << ",\"database\":" << (db_ok ? "true" : "false")
+          << ",\"last_block\":" << last_block
+          << ",\"db_map_size\":" << map_size
+          << ",\"db_map_used\":" << map_used
+          << ",\"db_map_used_pct\":" << std::fixed << std::setprecision(2) << map_used_pct
+          << ",\"db_readers_high_water\":" << readers_high_water
+          << ",\"db_max_readers\":" << max_readers
+          << ",\"daemon_endpoints\":" << endpoints_total
+          << ",\"daemon_endpoints_down\":" << endpoints_benched
+          << "}";
+
+      return epee::byte_slice{out.str()};
     }
 
     template<typename T>
@@ -1756,6 +2080,7 @@ namespace lws
       {"/get_random_outs",       call<get_random_outs>,  2 * 1024},
             // {"/get_txt_records",       nullptr,                0       },
       {"/get_unspent_outs",      call<get_unspent_outs>, 2 * 1024},
+      {"/health",                call_health,                 512},
       {"/import_request",        call<import_request>,   2 * 1024},
       {"/login",                 call<login>,            2 * 1024},
       {"/submit_raw_tx",         call<submit_raw_tx>,   50 * 1024}
@@ -1801,6 +2126,7 @@ namespace lws
     db::storage disk;
     boost::optional<std::string> prefix;
     boost::optional<std::string> admin_prefix;
+    std::size_t max_response_bytes = 0; //!< 0 = unlimited (default)
 
 
     explicit internal(boost::asio::io_service& io_service, lws::db::storage disk)
@@ -1872,8 +2198,39 @@ namespace lws
         return true;
       }
 
-      // \TODO remove copy of json string here :/
-      auto body = handler->run(std::string{query.m_body}, disk.clone());
+      /* Handlers can throw: two `std::logic_error`s in the address endpoints,
+         the ISO timestamp writer, the gamma picker, and `std::bad_alloc` on a
+         large account. Neither this function nor epee's
+         `handle_request_and_send_response` used to catch anything, so a throw
+         unwound out of `io_service_.run()` and was only caught by
+         `boosted_tcp_server::worker_thread`, which logs it and re-enters the
+         loop. The client got no response at all and the connection was
+         abandoned mid-flight - and with the default `--rest-threads 1` every
+         other in-flight handler in that io_service was dropped with it.
+         Contain it here and answer 500 instead. */
+      expect<epee::byte_slice> body{common_error::kInvalidArgument};
+      try
+      {
+        // \TODO remove copy of json string here :/
+        body = handler->run(std::string{query.m_body}, disk.clone());
+      }
+      catch (const std::exception& e)
+      {
+        MERROR("Unhandled exception in " << handler->name << " from "
+               << ctx.m_remote_address.str() << ": " << e.what());
+        response.m_response_code = 500;
+        response.m_response_comment = "Internal Server Error";
+        return true;
+      }
+      catch (...)
+      {
+        MERROR("Unhandled unknown exception in " << handler->name << " from "
+               << ctx.m_remote_address.str());
+        response.m_response_code = 500;
+        response.m_response_comment = "Internal Server Error";
+        return true;
+      }
+
       if (!body)
       {
         MINFO(body.error().message() << " from " << ctx.m_remote_address.str() << " on " << handler->name);
@@ -1898,6 +2255,21 @@ namespace lws
           response.m_response_code = 500;
           response.m_response_comment = "Internal Server Error";
         }
+        return true;
+      }
+
+      /* Optional response ceiling (`--rest-max-response-bytes`, default 0 =
+         unlimited). A full-history response for a large account can reach
+         hundreds of MB, and gzip below needs roughly another copy on top. This
+         lets an operator bound that without changing behaviour for anyone who
+         does not set it. */
+      if (max_response_bytes && max_response_bytes < body->size())
+      {
+        MWARNING("Response for " << handler->name << " is " << body->size()
+                 << " bytes, over the configured limit of " << max_response_bytes
+                 << "; refusing. The client should paginate with max_count.");
+        response.m_response_code = 503;
+        response.m_response_comment = "Service Unavailable";
         return true;
       }
 
@@ -2017,6 +2389,8 @@ namespace lws
       epee::net_utils::ssl_options_t ssl_options = https ? epee::net_utils::ssl_support_t::e_ssl_support_enabled : epee::net_utils::ssl_support_t::e_ssl_support_disabled;
       ssl_options.verification = epee::net_utils::ssl_verification_t::none; // clients verified with view key
       ssl_options.auth = std::move(config.auth);
+
+      port.max_response_bytes = config.max_response_bytes;
 
       if (!port.init(std::to_string(url.port), std::move(url.host), std::move(config.access_controls), std::move(ssl_options)))
         MONERO_THROW(lws::error::http_server, "REST server failed to initialize");

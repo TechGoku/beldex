@@ -200,11 +200,16 @@ namespace rct
 
     // std::cout << "txnFee :" << txnFee << std::endl;
     // std::cout << "self.type != RCTType::Null : " << (self.type != RCTType::Null) << "\n";
-    if (ecdhInfo || outPk || txnFee){  //|| txnFee
+    /* Each field is assigned only if it is actually present. The previous
+       form tested `ecdhInfo || outPk || txnFee` and then dereferenced ALL
+       THREE, so a response carrying only one of them dereferenced two
+       disengaged optionals - undefined behaviour. */
+    if (ecdhInfo)
       self.ecdhInfo = std::move(*ecdhInfo);
+    if (outPk)
       self.outPk = std::move(*outPk);
+    if (txnFee)
       self.txnFee = std::move(*txnFee);
-    }
 
     // if (self.type != RCTType::Null)
     // {
@@ -221,8 +226,13 @@ namespace rct
   
   static void read_bytes(wire::json_reader& source, RCTType& self)
   {
-    unsigned char dest = (unsigned char)self;
+    /* Was: read into a local seeded from the (uninitialised) `self`, then
+       discard it - so `rct_signatures.type` was never actually parsed and kept
+       whatever the default-constructed transaction had. Read into a zeroed
+       local and assign it back. */
+    unsigned char dest = 0;
     wire::read_bytes(source, dest);
+    self = static_cast<RCTType>(dest);
   }
 
 } // rct
