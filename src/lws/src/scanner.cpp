@@ -701,19 +701,49 @@ namespace lws
           if (fetched.result.blocks.size() != fetched.result.output_indices.size())
             throw std::runtime_error{"Bad daemon response - need same number of blocks and indices"};
 
-          blockchain.push_back(cryptonote::get_block_hash(fetched.result.blocks.front().block));
-
           auto blocks = epee::to_span(fetched.result.blocks);
           auto indices = epee::to_span(fetched.result.output_indices);
 
+          /* Height of `blockchain[0]`.
+
+             `storage::update` stores `chain_base + chain.size() - 1` as the new
+             scan height, so this must be the height of the FIRST hash in
+             `blockchain` or the stored height is wrong by however far off it
+             is.
+
+             Two shapes, and they are not symmetric:
+
+               * Normally the daemon replays the block the caller already has as
+                 an overlap. That block is the anchor: its hash goes into
+                 `blockchain` but it is trimmed from the range to be scanned, so
+                 chain[0] is the anchor at `start_height`.
+               * Starting from height 1 there is no earlier block to anchor on,
+                 so nothing is trimmed and block 1 is itself scanned. Pushing it
+                 as an anchor as well put it in `blockchain` TWICE, making the
+                 chain one longer than the range it described and storing a
+                 height one above the last block actually scanned. The in-memory
+                 height stayed correct, so from the next batch on every account
+                 looked like it had "moved on" and was skipped - 0 updated,
+                 reset, retry, forever. It only bit when an account started at
+                 height 1 exactly; from 0 the two errors cancelled and it
+                 worked, which is why a rescan from 0 was fine and from 1 was
+                 not. */
+          std::uint64_t chain_base = 0;
           if (fetched.result.start_height != 1)
           {
-            // skip overlap block
+            // Anchor: recorded in the chain, not re-scanned.
+            blockchain.push_back(
+              cryptonote::get_block_hash(fetched.result.blocks.front().block));
+            chain_base = fetched.result.start_height;
             blocks.remove_prefix(1);
             indices.remove_prefix(1);
           }
           else
+          {
+            // No anchor exists below height 1; block 1 is scanned like any other.
+            chain_base = 1;
             fetched.result.start_height = 0;
+          }
 
           for (auto block_data : boost::combine(blocks, indices))
           {
@@ -770,8 +800,9 @@ namespace lws
             blockchain.push_back(cryptonote::get_block_hash(block));
           }
 
+          // `chain_base` is the height of blockchain[0]; see above.
           expect<std::size_t> updated = disk.update(
-            users.front().scan_height(), epee::to_span(blockchain), epee::to_span(users)
+            db::block_id(chain_base), epee::to_span(blockchain), epee::to_span(users)
           );
           if (!updated)
           {
