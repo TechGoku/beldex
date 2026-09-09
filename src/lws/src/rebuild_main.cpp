@@ -157,6 +157,35 @@ namespace
     out << description;
   }
 
+  /*! Normalise one daemon endpoint exactly as beldex-lws-daemon does.
+
+      `--daemon` is documented as "[(https|http)://<address>:]<port>", so the
+      obvious thing to pass is the base URL - and that is what the daemon
+      accepts, because it appends "/json_rpc" itself. This binary did not, so
+      the same value that works for the daemon posted to the bare address here.
+      beldexd answers that with a non-JSON "Not found", and the only symptom was
+      a parse error on its first character:
+
+          Chain sync failed ... invalid literal; last read: 'N'
+
+      ipc:// endpoints are socket paths and are left exactly as given. */
+  std::string normalise_endpoint(std::string entry)
+  {
+    while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.front())))
+      entry.erase(entry.begin());
+    while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.back())))
+      entry.pop_back();
+
+    if (entry.empty() || entry.rfind("ipc://", 0) == 0)
+      return entry;
+
+    while (!entry.empty() && entry.back() == '/')
+      entry.pop_back();
+    if (entry.find("/json_rpc") == std::string::npos)
+      entry += "/json_rpc";
+    return entry;
+  }
+
   //! Split a comma separated endpoint list, dropping blanks and duplicates.
   void append_endpoints(std::vector<std::string>& out, const std::string& list)
   {
@@ -164,13 +193,8 @@ namespace
     while (pos <= list.size() && !list.empty())
     {
       const std::size_t comma = list.find(',', pos);
-      std::string entry =
-        list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-
-      while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.front())))
-        entry.erase(entry.begin());
-      while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.back())))
-        entry.pop_back();
+      std::string entry = normalise_endpoint(
+        list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
 
       if (!entry.empty() && std::find(out.begin(), out.end(), entry) == out.end())
         out.push_back(std::move(entry));
@@ -660,6 +684,32 @@ namespace
     MGINFO("seeding shadow chain from " << prog.daemon_rpcs.front());
     if (!lws::scanner::sync(shadow.clone(), prog.daemon_rpcs.front()))
       throw std::runtime_error{"could not sync the shadow chain from " + prog.daemon_rpcs.front()};
+
+    /* `sync` returning true only means the daemon answered - not that it had a
+       chain to give. `add_account` stamps each account at the shadow's current
+       tip and fails with MDB_NOTFOUND when the blocks table is empty, so a
+       daemon that is still syncing (or freshly initialised) produced one such
+       error PER ACCOUNT and no explanation. Check once, and say the useful
+       thing instead. */
+    {
+      const std::uint64_t shadow_height = read_accounts(shadow).height;
+      if (shadow_height == 0)
+      {
+        throw std::runtime_error{
+          "the shadow chain is empty after syncing from " + prog.daemon_rpcs.front() +
+          "\n  That daemon has no blocks to serve yet - it is probably still syncing."
+          "\n  Check its height with get_info and retry once it has caught up."};
+      }
+      if (shadow_height < prog.rescan_height)
+      {
+        throw std::runtime_error{
+          "--rescan-height " + std::to_string(prog.rescan_height) +
+          " is above the shadow chain height " + std::to_string(shadow_height) +
+          "\n  The daemon at " + prog.daemon_rpcs.front() +
+          " has not reached that height yet."};
+      }
+      MGINFO("shadow chain synced to height " << shadow_height);
+    }
 
     {
       const account_set existing = read_accounts(shadow);
