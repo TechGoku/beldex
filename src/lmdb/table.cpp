@@ -40,4 +40,22 @@ namespace lmdb
             MONERO_LMDB_CHECK(mdb_set_dupsort(&write_txn, out, value_cmp));
         return out;
     }
+
+    expect<MDB_dbi> table::open_readonly(MDB_txn& read_txn) const noexcept
+    {
+        MONERO_PRECOND(name != nullptr);
+
+        MDB_dbi out;
+        MONERO_LMDB_CHECK(mdb_dbi_open(&read_txn, name, flags & ~unsigned(MDB_CREATE), &out));
+        /* Comparators live in the environment's shared `me_dbxs`, not in the
+           transaction, so setting them from a read-only txn is both legal and
+           persistent. Getting this wrong is not a loud failure - the default
+           comparator silently fails to match keys - so it must happen here too,
+           exactly as in `open` above. */
+        if (key_cmp && !(flags & MDB_INTEGERKEY))
+            MONERO_LMDB_CHECK(mdb_set_compare(&read_txn, out, key_cmp));
+        if (value_cmp && !(flags & MDB_INTEGERDUP))
+            MONERO_LMDB_CHECK(mdb_set_dupsort(&read_txn, out, value_cmp));
+        return out;
+    }
 }

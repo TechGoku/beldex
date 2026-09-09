@@ -213,6 +213,12 @@ namespace
     };
 
     prog.rest_config.threads = std::max(std::size_t(1), prog.rest_config.threads);
+    /* The REST tier needs to know where its database lives so `/switch_db` can
+       back it up before switching away from it, and name it in the response. */
+    prog.rest_config.db_path = prog.db_path;
+    prog.rest_config.create_queue_max = prog.create_queue_max;
+    prog.rest_config.db_map_size = prog.db_map_size;
+    prog.rest_config.db_max_readers = prog.db_max_readers;
     prog.scan_threads = std::max(std::size_t(1), prog.scan_threads);
 
     // Detect IPC mode

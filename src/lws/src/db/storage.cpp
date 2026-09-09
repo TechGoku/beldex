@@ -564,6 +564,13 @@ namespace db
   } tables;
 
   const unsigned create_queue_max;
+  /*! True when the environment was opened `MDB_RDONLY`.
+
+      LMDB already enforces this - `mdb_txn_begin` without `MDB_RDONLY` on such
+      an environment returns `EACCES` - so this exists to give a caller a clear
+      answer instead of a bare errno, and to keep the schema migration from even
+      being attempted against a database another process owns. */
+  const bool read_only;
 
   // *** Add migration functions ***
   expect<void> complete_migration(MDB_txn& txn, tables_ const& tables, unsigned version)
@@ -709,7 +716,7 @@ namespace db
 
   // *** Updated constructor with version check ***
   explicit storage_internal(lmdb::environment env, unsigned create_queue_max)
-    : lmdb::database(std::move(env)), tables{}, create_queue_max(create_queue_max)
+    : lmdb::database(std::move(env)), tables{}, create_queue_max(create_queue_max), read_only(false)
   {
     lmdb::write_txn txn = this->create_write_txn().value();
     assert(txn != nullptr);
@@ -750,6 +757,84 @@ namespace db
     }
 
     MONERO_UNWRAP(this->commit(std::move(txn)));
+  }
+
+  //! Tag selecting the read-only constructor below.
+  struct read_only_t {};
+
+  /*! Open every table for reading, without writing anything at all.
+
+      The read-write constructor above opens a *write* transaction and may run
+      the schema migration inside it. That makes any second process opening the
+      database a writer: it contends for the single LMDB writer lock with the
+      running daemon, and can rewrite rows in a database it does not own. Tools
+      that only want to look - `beldex-lws-admin list_accounts`, the shadow
+      rebuild reading the live account set - must not do that.
+
+      Two details make this work:
+
+        * `MDB_CREATE` has to be masked off (`table::open_readonly`), because
+          `mdb_dbi_open` rejects it outright on a read-only transaction.
+        * The setup transaction is *committed*, not aborted. Aborting drops
+          every DBI handle opened inside it (`mdb_dbis_update(txn, 0)`);
+          committing a read-only txn keeps them at environment level, which is
+          what later read transactions need. */
+  explicit storage_internal(read_only_t, lmdb::environment env)
+    : lmdb::database(std::move(env)), tables{}, create_queue_max(0), read_only(true)
+  {
+    /* Raw LMDB rather than `create_read_txn`, whose RAII handle aborts on
+       scope exit and would take the table handles with it. This runs once,
+       single-threaded, before the environment is shared with anyone. */
+    MDB_txn* txn = nullptr;
+    const int begun = mdb_txn_begin(this->handle(), nullptr, MDB_RDONLY, &txn);
+    if (begun)
+      MONERO_THROW(lmdb::error(begun), "Failed to open read-only setup transaction");
+
+    try
+    {
+      tables.blocks      = MONERO_UNWRAP(blocks.open_readonly(*txn));
+      tables.accounts    = MONERO_UNWRAP(accounts.open_readonly(*txn));
+      tables.accounts_ba = MONERO_UNWRAP(accounts_by_address.open_readonly(*txn));
+      tables.accounts_bh = MONERO_UNWRAP(accounts_by_height.open_readonly(*txn));
+      tables.outputs     = MONERO_UNWRAP(outputs.open_readonly(*txn));
+      tables.spends      = MONERO_UNWRAP(spends.open_readonly(*txn));
+      tables.images      = MONERO_UNWRAP(images.open_readonly(*txn));
+      tables.requests    = MONERO_UNWRAP(requests.open_readonly(*txn));
+      tables.properties  = MONERO_UNWRAP(properties.open_readonly(*txn));
+    }
+    catch (...)
+    {
+      mdb_txn_abort(txn);
+      throw;
+    }
+
+    const int committed = mdb_txn_commit(txn);
+    if (committed)
+      MONERO_THROW(lmdb::error(committed), "Failed to commit read-only setup transaction");
+
+    /* Report a stale schema, never repair it. Migrating here would mean writing
+       to a database owned by another process - exactly what this constructor
+       exists to avoid. */
+    unsigned current_version = 0;
+    {
+      lmdb::read_txn read = MONERO_UNWRAP(this->create_read_txn());
+      const std::string version_key = "version";
+      MDB_val key = lmdb::to_val(version_key);
+      MDB_val value{};
+      const int err = mdb_get(read.get(), tables.properties, &key, &value);
+      if (err == 0)
+        current_version = MONERO_UNWRAP(properties.get_value<unsigned>(value));
+      else if (err != MDB_NOTFOUND)
+        MONERO_THROW(lmdb::error(err), "Failed to get DB version");
+    }
+
+    /* Not fatal. A database last written by a build that never stored the
+       version key readably reports 0 here even though its rows are current, so
+       refusing to open would block the very tools an operator needs on a live
+       server. Say so and carry on reading. */
+    if (current_version < 2)
+      MWARNING("Database schema reports version " << current_version
+               << " (expected 2); opened read-only, so it will not be migrated");
   }
 };
 
@@ -1122,6 +1207,29 @@ namespace db
         MONERO_UNWRAP(lmdb::open_environment(path, 20, effective_map_size, effective_max_readers)), create_queue_max
       )
     };
+  }
+
+  storage storage::open_readonly(const char* path, unsigned max_readers)
+  {
+    static constexpr const unsigned default_max_readers = 1024;
+    /* `map_size` is deliberately 0 so LMDB adopts whatever size the existing
+       file already has. Setting one on a database another process owns and is
+       actively growing is both unnecessary and wrong. */
+    return {
+      std::make_shared<storage_internal>(
+        storage_internal::read_only_t{},
+        MONERO_UNWRAP(
+          lmdb::open_environment(
+            path, 20, 0, max_readers ? max_readers : default_max_readers, /*read_only=*/true
+          )
+        )
+      )
+    };
+  }
+
+  bool storage::is_read_only() const noexcept
+  {
+    return db != nullptr && db->read_only;
   }
 
   storage::~storage() noexcept

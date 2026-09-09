@@ -1,5 +1,5 @@
-set(beldex-lws-db_sources account.cpp data.cpp storage.cpp string.cpp)
-set(beldex-lws-db_headers account.h data.h fwd.h storage.h string.h)
+set(beldex-lws-db_sources account.cpp backup.cpp data.cpp storage.cpp string.cpp)
+set(beldex-lws-db_headers account.h backup.h data.h fwd.h storage.h string.h)
 add_library(beldex-lws-db ${beldex-lws-db_sources} ${beldex-lws-db_headers})
 
 message( "--------- INSIDE THE LWS db------") 

@@ -92,10 +92,17 @@ namespace lmdb
         environment env;
         context ctx;
 
-        //! \return The LMDB environment associated with the object.
-        MDB_env* handle() const noexcept { return env.get(); }
-
         expect<write_txn> do_create_txn(unsigned int flags) noexcept;
+
+    protected:
+        /*! \return The LMDB environment associated with the object.
+
+            Protected rather than private so a derived class can run one-shot
+            setup that the RAII transaction handles cannot express - notably
+            opening table handles inside a read-only transaction that must be
+            *committed* rather than aborted, since aborting discards every DBI
+            opened in it. */
+        MDB_env* handle() const noexcept { return env.get(); }
 
     public: 
         database(environment env);

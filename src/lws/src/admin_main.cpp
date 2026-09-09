@@ -15,6 +15,7 @@
 
 #include "common/command_line.h" // beldex/src
 #include "common/expect.h"       // beldex/src
+#include "common/fs.h"           // beldex/src
 #include "epee/misc_log_ex.h"         // beldex/contrib/epee/include/epee
 #include "epee/span.h"                // beldex/contrib/epee/include
 #include "epee/string_tools.h"        // beldex/contrib/epee/include
@@ -102,6 +103,8 @@ namespace
     lws::db::storage disk;
     std::vector<std::string> arguments;
     bool show_sensitive;
+    //! The `--db-path` this invocation was given; `retire_db` guards on it.
+    std::string db_path;
   };
 
   crypto::secret_key get_key(std::string const& hex)
@@ -627,30 +630,110 @@ namespace
     json.finish();
   }
 
+  /*! Permanently delete a database directory.
+
+      Deliberately the only thing in this codebase that deletes a database, and
+      deliberately awkward to invoke. A rebuild leaves the old database in
+      place, and `/switch_db` leaves the one it switched away from in place, so
+      that reverting is always possible; the cost of that is that stale
+      databases accumulate and eventually somebody has to remove one. That
+      somebody is a person typing this, never the software deciding on its own.
+
+      Three guards, all of them necessary:
+
+        * The path must not be the `--db-path` this invocation was given, which
+          is the database the running daemon is most likely using.
+        * It must look like an LWS database (`data.mdb`), so a mistyped path
+          cannot take a home directory with it.
+        * The literal word `confirm` must follow it. */
+  void retire_db(program prog, std::ostream& out)
+  {
+    if (prog.arguments.size() != 2 || prog.arguments[1] != "confirm")
+    {
+      throw std::runtime_error{
+        "retire_db <path> confirm\n"
+        "  Permanently deletes the LWS database at <path>. This cannot be undone.\n"
+        "  Re-run with the literal word 'confirm' after the path to proceed."};
+    }
+
+    const std::string& target = prog.arguments[0];
+    std::error_code ec{};
+
+    const fs::path target_dir = fs::weakly_canonical(fs::path{target}, ec);
+    const fs::path live_dir = fs::weakly_canonical(fs::path{prog.db_path}, ec);
+    if (!ec && target_dir == live_dir)
+    {
+      throw std::runtime_error{
+        "refusing to delete " + target + ": it is the --db-path given to this command. "
+        "If you really mean to retire it, point --db-path somewhere else."};
+    }
+
+    if (!fs::exists(fs::path{target}, ec))
+      throw std::runtime_error{target + " does not exist"};
+    if (!fs::is_directory(fs::path{target}, ec))
+      throw std::runtime_error{target + " is not a directory"};
+    if (!fs::exists(fs::path{target} / "data.mdb", ec))
+    {
+      throw std::runtime_error{
+        "refusing to delete " + target + ": it contains no data.mdb, so it is not "
+        "an LWS database. Check the path."};
+    }
+
+    fs::remove_all(fs::path{target}, ec);
+    if (ec)
+      throw std::runtime_error{"could not delete " + target + ": " + ec.message()};
+
+    wire::json_stream_writer json{out};
+    wire::object(json,
+      wire::field("deleted", std::cref(target)),
+      wire::field("warning", std::string{"this database is gone and cannot be recovered"})
+    );
+    json.finish();
+  }
+
   struct command
   {
     char const* const name;
     void (*const handler)(program, std::ostream&);
     char const* const parameters;
-    };
+    /*! True if the command only reads.
+
+        These open the database `MDB_RDONLY`, which never takes the single LMDB
+        writer lock and cannot modify a byte - so they are safe to run against
+        the database a live daemon is actively writing. Everything else opens
+        read-write and will contend with that daemon. */
+    const bool read_only;
+  };
 
   static constexpr const command commands[] =
   {
-    {"accept_requests",       &accept_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]..."},
-    {"add_account",           &add_account,     "\t\t<base58 address> <view key hex>"},
-    {"compact",               &compact,         "\t\t<destination path>"},
-    {"create_admin",          &create_admin,    ""},
-    {"debug_database",        &debug_database,  ""},
-    {"export_accounts",       &export_accounts, "\t<output file>  (address+view key+heights; file contains SECRETS)"},
-    {"import_accounts",       &import_accounts, "\t<input file> [rescan height]"},
-    {"list_accounts",         &list_accounts,   ""},
-    {"list_admin",            &list_admin,      ""},
-    {"list_requests",         &list_requests,   ""},
-    {"modify_account_status", &modify_account,  "\t<\"active\"|\"inactive\"|\"hidden\"> <base58 address> [base 58 address]..."},
-    {"reject_requests",       &reject_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]..."},
-    {"rescan",                &rescan,          "\t\t<height> <base58 address> [base 58 address]..."},
-    {"rollback",              &rollback,        "\t\t<height>"}
+    {"accept_requests",       &accept_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]...", false},
+    {"add_account",           &add_account,     "\t\t<base58 address> <view key hex>", false},
+    // mdb_env_copy2 snapshots under an internal read txn; no writer lock needed.
+    {"compact",               &compact,         "\t\t<destination path>", true},
+    {"create_admin",          &create_admin,    "", false},
+    {"debug_database",        &debug_database,  "", true},
+    {"export_accounts",       &export_accounts, "\t<output file>  (address+view key+heights; file contains SECRETS)", true},
+    {"import_accounts",       &import_accounts, "\t<input file> [rescan height]", false},
+    {"list_accounts",         &list_accounts,   "", true},
+    {"list_admin",            &list_admin,      "", true},
+    {"list_requests",         &list_requests,   "", true},
+    {"modify_account_status", &modify_account,  "\t<\"active\"|\"inactive\"|\"hidden\"> <base58 address> [base 58 address]...", false},
+    {"reject_requests",       &reject_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]...", false},
+    {"rescan",                &rescan,          "\t\t<height> <base58 address> [base 58 address]...", false},
+    // Never opens --db-path for writing; it deletes a DIFFERENT directory.
+    {"retire_db",             &retire_db,       "\t\t<path> confirm  (PERMANENTLY deletes that database)", true},
+    {"rollback",              &rollback,        "\t\t<height>", false}
   };
+
+  //! \return The command called `name`, or `nullptr`.
+  command const* find_command(boost::string_ref name) noexcept
+  {
+    for (command const& cmd : commands)
+      if (name == cmd.name)
+        return std::addressof(cmd);
+    return nullptr;
+  }
 
   void print_help(std::ostream& out)
   {
@@ -659,10 +742,11 @@ namespace
 
     out << "Usage: [options] [command] [arguments]" << std::endl;
     out << description << std::endl;
-    out << "Commands:" << std::endl;
+    out << "Commands (*  = read-only, safe against a running daemon's DB):" << std::endl;
     for (command cmd : commands)
     {
-      out << "  " << cmd.name << "\t\t" << cmd.parameters << std::endl;
+      out << (cmd.read_only ? " * " : "   ")
+          << cmd.name << "\t\t" << cmd.parameters << std::endl;
     }
   }
 
@@ -696,17 +780,57 @@ namespace
 
     opts.set_network(args); // do this first, sets global variable :/
 
-    program prog{
-      lws::db::storage::open(command_line::get_arg(args, opts.db_path).c_str(), 0)
-    };
-
-    prog.show_sensitive = command_line::get_arg(args, opts.show_sensitive);
     auto cmd = args[opts.command.name];
     if (cmd.empty())
       throw std::runtime_error{"No command given"};
 
+    const std::string name = cmd.as<std::string>();
+
+    /* Resolve the command BEFORE opening anything. How the database is opened
+       depends on what the command does, and a typo must not cause a read-write
+       open - which would take the writer lock and, on a database last written
+       by an older build, run the schema migration. */
+    command const* const selected = find_command(name);
+    if (selected == nullptr)
+      throw std::runtime_error{"No such command: " + name};
+
+    const std::string db_path = command_line::get_arg(args, opts.db_path);
+
+    if (selected->read_only)
+    {
+      /* A read-only open cannot create anything, so a wrong `--db-path` now
+         surfaces as a bare LMDB "No such file or directory" instead of
+         silently creating an empty database and reporting nothing in it. Say
+         what actually went wrong, and what the caller most likely meant. */
+      std::error_code ec{};
+      if (!fs::exists(fs::path{db_path} / "data.mdb", ec))
+      {
+        throw std::runtime_error{
+          "no LWS database at " + db_path + "\n"
+          "  '" + name + "' opens the database read-only and will not create one. "
+          "Check --db-path,\n"
+          "  or start beldex-lws-daemon against it once to create it."};
+      }
+    }
+    else
+    {
+      std::cerr << "warning: '" << name << "' opens " << db_path
+                << " read-write. It takes the LMDB writer lock, so running it "
+                   "against a database a live daemon owns will stall that "
+                   "daemon's scanner for the duration."
+                << std::endl;
+    }
+
+    program prog{
+      selected->read_only ?
+        lws::db::storage::open_readonly(db_path.c_str()) :
+        lws::db::storage::open(db_path.c_str(), 0)
+    };
+
+    prog.show_sensitive = command_line::get_arg(args, opts.show_sensitive);
     prog.arguments = command_line::get_arg(args, opts.arguments);
-    return {{cmd.as<std::string>(), std::move(prog)}};
+    prog.db_path = db_path;
+    return {{name, std::move(prog)}};
   }
 
   void run(boost::string_ref name, program prog, std::ostream& out)
@@ -731,10 +855,8 @@ namespace
     };
 
     assert(std::is_sorted(std::begin(commands), std::end(commands), by_name{}));
-    const auto found = std::lower_bound(
-      std::begin(commands), std::end(commands), name, by_name{}
-    );
-    if (found == std::end(commands) || found->name != name)
+    command const* const found = find_command(name);
+    if (found == nullptr)
       throw std::runtime_error{"No such command"};
 
     assert(found->handler != nullptr);

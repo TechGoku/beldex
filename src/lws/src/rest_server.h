@@ -2,6 +2,7 @@
 
 #include <boost/asio/io_service.hpp>
 #include <cstddef>
+#include <cstdint>
 #include <list>
 #include <string>
 #include <vector>
@@ -58,6 +59,22 @@ namespace lws
                 account's FULL history. A cap enabled by default would silently
                 truncate them. Operators who need the memory ceiling can set it. */
             std::size_t max_response_bytes;
+            /*! Directory of the database this server starts on.
+
+                Needed because a `db::storage` handle does not remember where it
+                came from, and `/switch_db` has to know what it is switching
+                *away* from - both to back it up first and to report it. */
+            std::string db_path;
+            /*! How the database was opened, so `/switch_db` can open the
+                incoming one the same way.
+
+                Opening the new database with defaults instead would silently
+                change the server's behaviour at the moment of the switch - most
+                sharply `create_queue_max`, where a default of 0 rejects every
+                `/login` that would register a new account. */
+            unsigned create_queue_max;
+            std::uint64_t db_map_size;
+            unsigned db_max_readers;
         }; //configre
 
         explicit rest_server(epee::span<const std::string> addresses, std::vector<std::string> admin, db::storage disk, configuration config);

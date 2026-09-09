@@ -26,7 +26,14 @@
 #include "lmdb/util.h"                          // beldex/src
 #include "rpc/core_rpc_server_commands_defs.h"  // beldex/src
 
+#include <boost/thread/locks.hpp>
+#include <boost/thread/mutex.hpp>
+#include <boost/thread/shared_mutex.hpp>
+
+#include "common/fs.h"                          // beldex/src
+
 #include "error.h"
+#include "db/backup.h"
 #include "db/data.h"
 #include "db/storage.h"
 #include "rpc/admin.h"
@@ -2022,6 +2029,116 @@ namespace lws
       crypto::secret_key auth;
     };
 
+    /*! The database every REST handler serves, and where it lives on disk.
+
+        Held once for the process rather than once per listening port, because
+        all ports serve the same database and a switch has to be a single
+        observable event - two ports briefly disagreeing about which database is
+        live would let one wallet see the old balances and another the new.
+
+        Read under a shared lock and copied per request, so an in-flight handler
+        keeps the environment it started on alive through its own `shared_ptr`
+        even after the switch has moved everyone else on. That is what lets the
+        swap happen without draining or refusing a single request. */
+    struct active_db_
+    {
+      std::shared_ptr<db::storage> disk;
+      std::string path;
+      //! Copied from the server configuration; reused when switching.
+      unsigned create_queue_max = 0;
+      std::uint64_t map_size = 0;
+      unsigned max_readers = 0;
+    };
+    boost::shared_mutex active_db_mutex;
+    active_db_ active_db{};
+
+    /*! Serialises whole switches.
+
+        The creation latch below only covers the final verify-and-swap, so
+        without this two concurrent `/switch_db` calls could both preflight
+        against the same live database and then swap in turn, leaving the server
+        on whichever finished last and having taken two backups of a database
+        the first one had already replaced. */
+    boost::mutex switch_mutex;
+
+    /*! Held shared by anything that can create an account, exclusively by a
+        switch.
+
+        A switch verifies that every live account exists in the incoming
+        database and then swaps. An account created between those two steps
+        would exist only in the outgoing database and would be lost. Latching
+        just account creation for that instant closes the gap; readers, balance
+        queries and transaction submission never touch this lock, so from a
+        user's point of view nothing stops. Creators block briefly rather than
+        failing, so no signup is rejected either. */
+    boost::shared_mutex creation_latch;
+
+    //! \return A handle to the database currently being served.
+    db::storage current_disk()
+    {
+      boost::shared_lock<boost::shared_mutex> lock{active_db_mutex};
+      assert(active_db.disk != nullptr);
+      return active_db.disk->clone();
+    }
+
+    //! \return Directory of the database currently being served.
+    std::string current_db_path()
+    {
+      boost::shared_lock<boost::shared_mutex> lock{active_db_mutex};
+      return active_db.path;
+    }
+
+    //! \return How the active database was opened, so a new one matches it.
+    active_db_ current_db_params()
+    {
+      boost::shared_lock<boost::shared_mutex> lock{active_db_mutex};
+      active_db_ out{};
+      out.path = active_db.path;
+      out.create_queue_max = active_db.create_queue_max;
+      out.map_size = active_db.map_size;
+      out.max_readers = active_db.max_readers;
+      return out;
+    }
+
+    void set_active_db(db::storage disk, std::string path)
+    {
+      auto held = std::make_shared<db::storage>(std::move(disk));
+      boost::unique_lock<boost::shared_mutex> lock{active_db_mutex};
+      active_db.disk = std::move(held);
+      active_db.path = std::move(path);
+    }
+
+    void init_active_db(db::storage disk, const rest_server::configuration& config)
+    {
+      auto held = std::make_shared<db::storage>(std::move(disk));
+      boost::unique_lock<boost::shared_mutex> lock{active_db_mutex};
+      active_db.disk = std::move(held);
+      active_db.path = config.db_path;
+      active_db.create_queue_max = config.create_queue_max;
+      active_db.map_size = config.db_map_size;
+      active_db.max_readers = config.db_max_readers;
+    }
+
+    /*! \return Success if `auth` belongs to an active account flagged admin. */
+    expect<void> check_admin_auth(db::storage& disk, const crypto::secret_key& auth)
+    {
+      db::account_address address{};
+      if (!crypto::secret_key_to_public_key(auth, address.view_public))
+        return {error::crypto_failure};
+
+      auto reader = disk.start_read();
+      if (!reader)
+        return reader.error();
+      const auto account = reader->get_account(address);
+      if (!account)
+        return account.error();
+      if (account->first == db::account_status::inactive)
+        return {error::account_not_found};
+      if (!(account->second.flags & db::account_flags::admin_account))
+        return {error::account_not_found};
+      return success();
+    }
+
     template<typename T>
     void read_bytes(wire::json_reader& source, admin<T>& self)
     {
@@ -2043,25 +2160,364 @@ namespace lws
       if (!req)
         return req.error();
 
-      {
-        db::account_address address{};
-        if (!crypto::secret_key_to_public_key(req->auth, address.view_public))
-          return {error::crypto_failure};
-
-        auto reader = disk.start_read();
-        if (!reader)
-          return reader.error();
-        const auto account = reader->get_account(address);
-        if (!account)
-          return account.error();
-        if (account->first == db::account_status::inactive)
-          return {error::account_not_found};
-        if (!(account->second.flags & db::account_flags::admin_account))
-          return {error::account_not_found};
-      }
+      MONERO_CHECK(check_admin_auth(disk, req->auth));
 
       wire::json_slice_writer dest{};
       MONERO_CHECK(E{}(dest, std::move(disk), req->params));
+      return dest.take_bytes();
+    }
+
+    struct switch_db_req
+    {
+      //! Database to switch onto (required).
+      std::string path;
+      /*! Where to put the pre-switch backup. Defaults to a sibling of the
+          outgoing database. */
+      boost::optional<std::string> backup_path;
+      //! Explicit opt-out of that backup. Absent means "take one".
+      boost::optional<bool> skip_backup;
+      //! Allow a switch while the incoming database still lags.
+      boost::optional<bool> force;
+    };
+
+    void read_bytes(wire::json_reader& source, switch_db_req& self)
+    {
+      wire::object(source,
+        WIRE_FIELD(path),
+        WIRE_OPTIONAL_FIELD(backup_path),
+        WIRE_OPTIONAL_FIELD(skip_backup),
+        WIRE_OPTIONAL_FIELD(force)
+      );
+    }
+
+    //! Summary of one database, for the preflight comparison below.
+    struct db_summary
+    {
+      std::uint64_t height = 0;
+      std::size_t accounts = 0;
+      std::size_t behind = 0; //!< Accounts not yet scanned up to `height`.
+      std::vector<db::account_address> addresses;
+      /*! Pending create/import requests, as (type, address) pairs.
+
+          Counted because they are user-visible state a switch could otherwise
+          drop: a wallet told "Accepted, waiting for approval" by
+          `/import_request` would find its request had never existed, with
+          nothing left for an operator to approve. */
+      std::vector<std::pair<db::request, db::account_address>> requests;
+    };
+
+    expect<db_summary> summarise(db::storage& disk)
+    {
+      db_summary out{};
+
+      auto reader = disk.start_read();
+      if (!reader)
+        return reader.error();
+
+      const auto last = reader->get_last_block();
+      if (last)
+        out.height = std::uint64_t(last->id);
+
+      const db::account_status all[] = {
+        db::account_status::active,
+        db::account_status::inactive,
+        db::account_status::hidden
+      };
+
+      for (const db::account_status status : all)
+      {
+        auto users = reader->get_accounts(status);
+        if (!users)
+          return users.error();
+        for (auto user = users->make_iterator(); !user.is_end(); ++user)
+        {
+          const db::account acct = *user;
+          out.addresses.push_back(acct.address);
+          ++out.accounts;
+          // Only active accounts are scanned, so only they can be "behind".
+          if (status == db::account_status::active &&
+              std::uint64_t(acct.scan_height) + 1 < out.height)
+          {
+            ++out.behind;
+          }
+        }
+      }
+
+      {
+        auto pending = reader->get_requests();
+        if (!pending)
+          return pending.error();
+        for (auto entry = pending->make_iterator(); !entry.is_end(); ++entry)
+        {
+          const db::request type = entry.get_key();
+          for (const db::request_info& info : entry.make_value_range())
+            out.requests.emplace_back(type, info.address);
+        }
+      }
+
+      reader->finish_read();
+      return out;
+    }
+
+    struct address_less
+    {
+      bool operator()(const db::account_address& l, const db::account_address& r) const noexcept
+      {
+        const int spend = std::memcmp(
+          std::addressof(l.spend_public), std::addressof(r.spend_public), sizeof(l.spend_public));
+        if (spend != 0)
+          return spend < 0;
+        return std::memcmp(
+          std::addressof(l.view_public), std::addressof(r.view_public), sizeof(l.view_public)) < 0;
+      }
+    };
+
+    //! \return Number of `live` addresses absent from `incoming`.
+    std::size_t count_missing(
+      std::vector<db::account_address> live, std::vector<db::account_address> incoming)
+    {
+      std::sort(incoming.begin(), incoming.end(), address_less{});
+      std::size_t missing = 0;
+      for (const db::account_address& address : live)
+        if (!std::binary_search(incoming.begin(), incoming.end(), address, address_less{}))
+          ++missing;
+      return missing;
+    }
+
+    //! \return Number of `live` pending requests absent from `incoming`.
+    std::size_t count_missing_requests(
+      const std::vector<std::pair<db::request, db::account_address>>& live,
+      const std::vector<std::pair<db::request, db::account_address>>& incoming)
+    {
+      std::size_t missing = 0;
+      for (const auto& want : live)
+      {
+        bool found = false;
+        for (const auto& have : incoming)
+        {
+          if (have.first == want.first &&
+              std::memcmp(std::addressof(have.second), std::addressof(want.second),
+                          sizeof(want.second)) == 0)
+          {
+            found = true;
+            break;
+          }
+        }
+        if (!found)
+          ++missing;
+      }
+      return missing;
+    }
+
+    /*! Move the running server onto the database at `path`.
+
+        This is the cutover step of a zero-downtime rebuild: `beldex-lws-rebuild`
+        produces a fully rescanned database alongside the live one, and this
+        endpoint activates it without closing a socket or dropping a request.
+        Listening ports are untouched; only the handle handlers read from
+        changes, and in-flight handlers keep the outgoing environment alive
+        until they finish.
+
+        Order matters and is strict:
+
+          1. Preflight the incoming database, read-only. Refuse if it is missing
+             accounts, is behind the chain, or still has accounts mid-scan.
+          2. Take a verified backup of the OUTGOING database. If that fails the
+             switch is abandoned and nothing has changed.
+          3. Latch account creation, re-check for accounts that appeared during
+             the backup, swap, unlatch.
+
+        Nothing is ever deleted, including the database being switched away
+        from: reverting is another call to this endpoint pointing back at it. */
+    expect<epee::byte_slice> call_switch_db(std::string&& root, db::storage disk)
+    {
+      const expect<admin<switch_db_req>> req =
+        wire::json::from_bytes<admin<switch_db_req>>(std::move(root));
+      if (!req)
+        return req.error();
+
+      MONERO_CHECK(check_admin_auth(disk, req->auth));
+
+      const switch_db_req& params = req->params;
+      if (params.path.empty())
+        return {lws::error::configuration};
+
+      const bool skip_backup = params.skip_backup.value_or(false);
+      const bool force = params.force.value_or(false);
+      const std::string backup_root = params.backup_path.value_or(std::string{});
+
+      // One switch at a time, start to finish.
+      boost::unique_lock<boost::mutex> switching{switch_mutex};
+
+      const active_db_ params_of_live = current_db_params();
+      const std::string live_path = params_of_live.path;
+
+      /* Refuse to "switch" onto the database already being served: it would
+         take a backup and reopen the live environment for no reason. Compare
+         canonical paths, but fall back to the raw strings if either cannot be
+         resolved - a guard that disables itself on error is not a guard. */
+      {
+        std::error_code incoming_ec{}, live_ec{};
+        const fs::path incoming_dir = fs::weakly_canonical(fs::path{params.path}, incoming_ec);
+        const fs::path live_dir = fs::weakly_canonical(fs::path{live_path}, live_ec);
+        const bool same = (!incoming_ec && !live_ec) ?
+          (incoming_dir == live_dir) : (params.path == live_path);
+        if (same)
+        {
+          MWARNING("/switch_db: already serving " << live_path);
+          return {lws::error::configuration};
+        }
+      }
+
+      {
+        std::error_code ec{};
+        if (!fs::exists(fs::path{params.path}, ec))
+        {
+          MERROR("/switch_db: " << params.path << " does not exist");
+          return {lws::error::configuration};
+        }
+      }
+
+      // --- 1. preflight, entirely read-only on both databases -------------
+      db_summary live{};
+      db_summary incoming{};
+      try
+      {
+        db::storage candidate = db::storage::open_readonly(params.path.c_str());
+        const auto summary = summarise(candidate);
+        if (!summary)
+          return summary.error();
+        incoming = std::move(*summary);
+      }
+      catch (const std::exception& e)
+      {
+        MERROR("/switch_db: cannot open " << params.path << " as an LWS database: " << e.what());
+        return {lws::error::bad_blockchain};
+      }
+
+      {
+        const auto summary = summarise(disk);
+        if (!summary)
+          return summary.error();
+        live = std::move(*summary);
+      }
+
+      const std::size_t missing = count_missing(live.addresses, incoming.addresses);
+      if (missing != 0)
+      {
+        MERROR("/switch_db: refusing - " << missing << " live account(s) are absent from "
+               << params.path << ". Let beldex-lws-rebuild finish its account sync first.");
+        return {lws::error::account_not_found};
+      }
+
+      const std::size_t missing_requests =
+        count_missing_requests(live.requests, incoming.requests);
+      if (missing_requests != 0)
+      {
+        MERROR("/switch_db: refusing - " << missing_requests << " pending request(s) are "
+               "absent from " << params.path << ". Switching would drop them and the "
+               "wallets waiting on them would never be approved. Let beldex-lws-rebuild "
+               "mirror them first.");
+        return {lws::error::account_not_found};
+      }
+
+      if (!force)
+      {
+        if (incoming.height + 1 < live.height)
+        {
+          MERROR("/switch_db: refusing - " << params.path << " is at height " << incoming.height
+                 << " but the live database is at " << live.height
+                 << ". Wait for it to catch up, or pass \"force\": true.");
+          return {lws::error::bad_height};
+        }
+        if (incoming.behind != 0)
+        {
+          MERROR("/switch_db: refusing - " << incoming.behind << " account(s) in "
+                 << params.path << " are still mid-scan. Wait for the rebuild to finish, "
+                 "or pass \"force\": true.");
+          return {lws::error::bad_height};
+        }
+      }
+      else
+      {
+        MWARNING("/switch_db: force set - skipping the height and scan-progress checks");
+      }
+
+      // --- 2. back up what we are switching away from ---------------------
+      std::string backup_taken;
+      if (skip_backup)
+      {
+        MWARNING("/switch_db: skip_backup was set, so " << live_path
+                 << " is being switched away from WITHOUT a fresh backup. "
+                 "It is not deleted and can still be switched back to.");
+      }
+      else
+      {
+        const std::string root_dir = backup_root.empty() ?
+          (fs::path{live_path}.parent_path() / "lws-switch-backups").string() :
+          backup_root;
+
+        const expect<db::backup_result> backup = db::take_backup(live_path, root_dir);
+        if (!backup)
+        {
+          MERROR("/switch_db: aborting - could not back up " << live_path << " to "
+                 << root_dir << ": " << backup.error().message()
+                 << ". Nothing has been changed.");
+          return backup.error();
+        }
+        backup_taken = backup->path;
+        MGINFO("/switch_db: pre-switch backup written to " << backup_taken);
+      }
+
+      // --- 3. latch account creation, re-check, swap ----------------------
+      std::size_t appeared = 0;
+      {
+        boost::unique_lock<boost::shared_mutex> latch{creation_latch};
+
+        /* The backup above can take a while, so re-read the live account list
+           now that creation is latched. Anything that appeared in the meantime
+           would exist only in the outgoing database. */
+        const auto recheck = summarise(disk);
+        if (!recheck)
+          return recheck.error();
+
+        appeared = count_missing(recheck->addresses, incoming.addresses) +
+                   count_missing_requests(recheck->requests, incoming.requests);
+        if (appeared != 0 && !force)
+        {
+          MERROR("/switch_db: aborting - " << appeared << " account(s)/request(s) appeared "
+                 "while the backup ran and are not in " << params.path
+                 << ". Nothing has been changed; let the rebuild sync them and retry.");
+          return {lws::error::account_not_found};
+        }
+
+        /* Opened exactly as the outgoing database was. Falling back to
+           defaults here would change the server's behaviour at the moment of
+           the switch - `create_queue_max` of 0 rejects every signup. */
+        db::storage activated = db::storage::open(
+          params.path.c_str(),
+          params_of_live.create_queue_max,
+          std::size_t(params_of_live.map_size),
+          params_of_live.max_readers
+        );
+        lws::scanner::swap_storage(activated.clone());
+        set_active_db(std::move(activated), params.path);
+      }
+
+      MGINFO("/switch_db: now serving " << params.path
+             << " (was " << live_path << ", left intact)");
+
+      wire::json_slice_writer dest{};
+      wire::object(dest,
+        wire::field("switched_to", std::cref(params.path)),
+        wire::field("previous", std::cref(live_path)),
+        wire::field("previous_backup", std::cref(backup_taken)),
+        wire::field("accounts", std::uint64_t(incoming.accounts)),
+        wire::field("pending_requests", std::uint64_t(incoming.requests.size())),
+        wire::field("height", incoming.height),
+        wire::field("accounts_missed", std::uint64_t(appeared)),
+        wire::field("note", std::string{"the previous database was not deleted"})
+      );
       return dest.take_bytes();
     }
 
@@ -2070,6 +2526,12 @@ namespace lws
       char const* const name;
       expect<epee::byte_slice> (*const run)(std::string&&, db::storage);
       const unsigned max_size;
+      /*! True if this endpoint can create an account.
+
+          These take the creation latch, so they pause for the instant a
+          `/switch_db` needs between verifying the incoming database and
+          activating it. Nothing else is ever held up by a switch. */
+      const bool creates_accounts = false;
     };
 
     constexpr const endpoint endpoints[] =
@@ -2082,18 +2544,20 @@ namespace lws
       {"/get_unspent_outs",      call<get_unspent_outs>, 2 * 1024},
       {"/health",                call_health,                 512},
       {"/import_request",        call<import_request>,   2 * 1024},
-      {"/login",                 call<login>,            2 * 1024},
+      // `login` registers an account on first sight, so it takes the latch.
+      {"/login",                 call<login>,            2 * 1024, true},
       {"/submit_raw_tx",         call<submit_raw_tx>,   50 * 1024}
     };
     constexpr const endpoint admin_endpoints[] =
     {
-      {"/accept_requests",       call_admin<rpc::accept_requests_>, 50 * 1024},
-      {"/add_account",           call_admin<rpc::add_account_>,     50 * 1024},
+      {"/accept_requests",       call_admin<rpc::accept_requests_>, 50 * 1024, true},
+      {"/add_account",           call_admin<rpc::add_account_>,     50 * 1024, true},
       {"/list_accounts",         call_admin<rpc::list_accounts_>,   100},
       {"/list_requests",         call_admin<rpc::list_requests_>,   100},
       {"/modify_account_status", call_admin<rpc::modify_account_>,  50 * 1024},
       {"/reject_requests",       call_admin<rpc::reject_requests_>, 50 * 1024},
       {"/rescan",                call_admin<rpc::rescan_>,          50 * 1024},
+      {"/switch_db",             call_switch_db,                     4 * 1024},
       {"/validate",              call_admin<rpc::validate_>,        50 * 1024}
     };
 
@@ -2123,15 +2587,16 @@ namespace lws
   } //anonymous
   struct rest_server::internal final : public lws::http_server_impl_base<rest_server::internal, context>
   {
-    db::storage disk;
+    /* No `db::storage` member: the database is process-wide state now (see
+       `active_db`), because a switch has to be one event for every port at
+       once. Handlers take a fresh handle per request from `current_disk()`. */
     boost::optional<std::string> prefix;
     boost::optional<std::string> admin_prefix;
     std::size_t max_response_bytes = 0; //!< 0 = unlimited (default)
 
 
-    explicit internal(boost::asio::io_service& io_service, lws::db::storage disk)
+    explicit internal(boost::asio::io_service& io_service)
       : lws::http_server_impl_base<rest_server::internal, context>(io_service)
-      , disk(std::move(disk))
       , prefix()
       , admin_prefix()
     {
@@ -2211,8 +2676,24 @@ namespace lws
       expect<epee::byte_slice> body{common_error::kInvalidArgument};
       try
       {
-        // \TODO remove copy of json string here :/
-        body = handler->run(std::string{query.m_body}, disk.clone());
+        /* Take the database per request rather than from a member, so a
+           `/switch_db` between two requests is picked up immediately and this
+           handler still finishes against whichever database it started on. */
+        db::storage serving = current_disk();
+
+        if (handler->creates_accounts)
+        {
+          /* Shared, so any number of signups run concurrently; it only ever
+             blocks for the instant a switch holds it exclusively. */
+          boost::shared_lock<boost::shared_mutex> latch{creation_latch};
+          // \TODO remove copy of json string here :/
+          body = handler->run(std::string{query.m_body}, std::move(serving));
+        }
+        else
+        {
+          // \TODO remove copy of json string here :/
+          body = handler->run(std::string{query.m_body}, std::move(serving));
+        }
       }
       catch (const std::exception& e)
       {
@@ -2310,6 +2791,10 @@ namespace lws
     if (addresses.empty())
       MONERO_THROW(common_error::kInvalidArgument, "REST server requires 1 or more addresses");
 
+    /* Publish the starting database before any port is constructed: handlers
+       read it per request, so it has to be there before one can be served. */
+    init_active_db(std::move(disk), config);
+
     std::sort(admin.begin(), admin.end());
     const auto init_port = [&admin] (internal& port, const std::string& address, configuration config, const bool is_admin) -> bool
   
@@ -2401,13 +2886,13 @@ namespace lws
 
     for (const std::string& address : addresses)
     {
-      ports_.emplace_back(io_service_, disk.clone());
+      ports_.emplace_back(io_service_);
       any_ssl |= init_port(ports_.back(), address, config, false);
     }
 
     for (const std::string& address : admin)
     {
-      ports_.emplace_back(io_service_, disk.clone());
+      ports_.emplace_back(io_service_);
       any_ssl |= init_port(ports_.back(), address, config, true);
     }
 

@@ -46,6 +46,27 @@ target_link_libraries(beldex-lws-backup PRIVATE
     Threads::Threads
 )
 
+# Rebuilds the DB from chain into a shadow copy while the live server keeps
+# serving; see rebuild_main.cpp.
+add_executable(beldex-lws-rebuild rebuild_main.cpp scanner.cpp)
+target_link_libraries(beldex-lws-rebuild PUBLIC
+    beldex-lws-common
+    beldex-lws-rpc
+    beldex-lws-util
+    PRIVATE
+    nlohmann_json::nlohmann_json
+    Boost::serialization
+    Boost::program_options
+    Boost::filesystem
+    Boost::thread
+    Boost::system
+    Boost::regex
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    filesystem
+    Threads::Threads
+)
+
 add_executable(beldex-lws-admin admin_main.cpp)
 target_link_libraries(beldex-lws-admin PRIVATE 
 beldex-lws-common
@@ -81,6 +102,30 @@ if (BUILD_TESTS)
       Threads::Threads
   )
   add_test(NAME lws-update-no-regress COMMAND lws-update-no-regress-test)
+
+  # Proves storage::open_readonly() leaves the database byte-for-byte alone;
+  # see ../tests/readonly_open.cpp.
+  add_executable(lws-readonly-open-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/readonly_open.cpp)
+  target_link_libraries(lws-readonly-open-test PRIVATE
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-readonly-open COMMAND lws-readonly-open-test)
+
+  # Proves a shadow seeded the way beldex-lws-rebuild seeds one reproduces the
+  # live account set exactly; see ../tests/rebuild_seed.cpp.
+  add_executable(lws-rebuild-seed-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/rebuild_seed.cpp)
+  target_link_libraries(lws-rebuild-seed-test PRIVATE
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-rebuild-seed COMMAND lws-rebuild-seed-test)
 
   # Reproduces the orphaned-reader -> blocked page reuse -> runaway map failure
   # and proves check_readers() fixes it; see ../tests/stale_reader_reclaim.cpp.

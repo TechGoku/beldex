@@ -20,6 +20,17 @@ namespace lmdb
 
         //! \pre `name != nullptr` \return Open table.
         expect<MDB_dbi> open(MDB_txn& write_txn) const noexcept;
+
+        /*! As `open`, but usable inside a read-only transaction.
+
+            `MDB_CREATE` is masked out: `mdb_dbi_open` rejects it on a read-only
+            txn with `EACCES`, and a read-only open must never create a table
+            anyway. A table that is genuinely absent surfaces as `MDB_NOTFOUND`,
+            which is the honest answer - the caller is inspecting someone else's
+            database and cannot repair it.
+
+            \pre `name != nullptr` \return Open table. */
+        expect<MDB_dbi> open_readonly(MDB_txn& read_txn) const noexcept;
     };
 
     //! Helper for grouping typical LMDB DBI options when key and value are fixed types.

@@ -189,6 +189,34 @@ namespace db
     */
     static storage open(const char* path, unsigned create_queue_max, std::size_t map_size = 0, unsigned max_readers = 0);
 
+    /*!
+      Open a database for reading only, without modifying it in any way.
+
+      `open` above takes a write transaction and may run the schema migration,
+      so it contends for the single LMDB writer lock and can rewrite rows in a
+      database a running daemon owns. This overload opens the environment
+      `MDB_RDONLY`: it never takes the writer lock, never migrates, and cannot
+      alter a single byte, which is what makes it safe to point at the live
+      server's database while it is running.
+
+      Every write method still exists on the returned handle but will fail -
+      LMDB refuses a write transaction on a read-only environment - so a
+      mistake surfaces as an error rather than as corruption.
+
+      \param path Directory for LMDB storage; must already exist.
+      \param max_readers Maximum concurrent LMDB reader slots; `0` uses the
+        default. Note that LMDB keeps the value the environment was first
+        created with while other processes have it open.
+
+      \throw std::system_error on any LMDB error, including a missing table.
+
+      \return A read-only light-wallet server database.
+    */
+    static storage open_readonly(const char* path, unsigned max_readers = 0);
+
+    //! \return True if this handle was opened by `open_readonly`.
+    bool is_read_only() const noexcept;
+
     storage(storage&&) = default;
     storage(storage const&) = delete;
 

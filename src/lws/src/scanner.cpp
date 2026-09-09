@@ -74,7 +74,28 @@ namespace lws
        The bound applies to rescans too. An admin `rescan` is picked up within
        the window rather than instantly, which is well inside the tolerance for
        an operation that then has to re-walk the chain anyway. */
-    constexpr const std::chrono::seconds account_change_coalesce{30};
+    /*! How long a change to the active account set is coalesced before the
+        scan threads are restarted to pick it up.
+
+        Mutable because the right value depends on what the scanner is doing.
+        On a live server 30s is right: most accounts sit at the chain tip with
+        an unchanged `scan_height`, so the restart's account reload is served
+        almost entirely from `output_cache` and is cheap.
+
+        During a full rebuild it is badly wrong. Every account is actively
+        advancing, so `cached->second.height == user.scan_height` fails for
+        essentially all of them and each restart re-walks EVERY account's entire
+        output history out of LMDB. On a server that auto-accepts signups there
+        is always a change pending, so the rebuild would restart every 30s and
+        spend a growing share of each cycle reloading instead of scanning - the
+        more it has scanned, the more each reload costs. `beldex-lws-rebuild`
+        therefore raises this; see `--restart-coalesce`. */
+    std::atomic<std::chrono::seconds::rep> account_change_coalesce_secs{30};
+
+    std::chrono::seconds account_change_coalesce() noexcept
+    {
+      return std::chrono::seconds{account_change_coalesce_secs.load()};
+    }
 
     /* Shared, very short lived dedup cache for get_blocks_fast.
 
@@ -229,6 +250,15 @@ namespace lws
 
       return fut.get();
     }
+
+    /*! Slot for a database handed over by `scanner::swap_storage`.
+
+        Guarded by its own mutex rather than folded into `thread_sync`, because
+        it outlives any single scan pass: it is set from a REST admin thread and
+        consumed by `scanner::run` between passes. */
+    boost::mutex swap_mutex;
+    boost::optional<db::storage> swap_slot;
+    std::atomic<bool> swap_flag{false};
 
     void checked_wait(const std::chrono::nanoseconds wait)
     {
@@ -900,7 +930,12 @@ namespace lws
           //! \TODO use signalfd + ZMQ? Windows is the difficult case...
           // self.user_poll.wait_for(lock, boost::chrono::seconds{1});
           std::this_thread::sleep_for(1s);
-          if (self.update || !scanner::is_running())
+          /* A pending storage swap ends the pass the same way an account-set
+             change does. Returning here joins the thread group, so the threads
+             finish and commit their current batch against the OLD database
+             before `scanner::run` picks the new one up - no scanned work is
+             thrown away by the switch. */
+          if (self.update || !scanner::is_running() || swap_flag)
             return;
           auto this_check = std::chrono::steady_clock::now();
           if (account_poll_interval <= (this_check - last_check))
@@ -980,10 +1015,10 @@ namespace lws
             change_pending = true;
             change_first_seen = now_change;
             MINFO("Change in active user accounts detected; coalescing further "
-                  "changes for " << account_change_coalesce.count()
+                  "changes for " << account_change_coalesce().count()
                   << "s before restarting scan threads");
           }
-          if (change_pending && account_change_coalesce <= (now_change - change_first_seen))
+          if (change_pending && account_change_coalesce() <= (now_change - change_first_seen))
           {
             MINFO("Restarting scan threads to pick up account changes");
             return;
@@ -1228,6 +1263,31 @@ namespace lws
 
     for (;;)
     {
+      /* Pick up a database handed over by `swap_storage`.
+
+         Done here, between passes, so no scan thread is holding the outgoing
+         handle: `check_loop` has already returned and joined them. The output
+         cache must go with it - it is keyed by `account_id`, and ids are
+         assigned per database, so reusing it against a different one would
+         attribute one account's outputs to another. */
+      if (swap_flag)
+      {
+        boost::optional<db::storage> incoming;
+        {
+          boost::unique_lock<boost::mutex> lock{swap_mutex};
+          incoming = std::move(swap_slot);
+          swap_slot = boost::none;
+          swap_flag = false;
+        }
+        if (incoming)
+        {
+          disk = std::move(*incoming);
+          output_cache.clear();
+          cache_entries = 0;
+          MGINFO("Scanner switched to the newly activated database");
+        }
+      }
+
       const auto last = std::chrono::steady_clock::now();
       const std::string& daemon_rpc = daemon_rpcs[endpoint];
 
@@ -1397,6 +1457,31 @@ namespace lws
         endpoint = next;
       }
     }
+  }
+
+  void scanner::swap_storage(db::storage disk)
+  {
+    {
+      boost::unique_lock<boost::mutex> lock{swap_mutex};
+      /* Last writer wins. Two switches racing is an operator error, not a
+         state worth preserving, and queueing them would mean scanning a
+         database that is already superseded. */
+      swap_slot = std::move(disk);
+    }
+    swap_flag = true;
+    MGINFO("Scan pass will restart against the newly activated database");
+  }
+
+  bool scanner::swap_pending() noexcept
+  {
+    return swap_flag;
+  }
+
+  void scanner::set_change_coalesce(std::chrono::seconds window) noexcept
+  {
+    account_change_coalesce_secs = std::max<std::chrono::seconds::rep>(1, window.count());
+    MINFO("Account-change restarts coalesced over "
+          << account_change_coalesce_secs.load() << "s");
   }
 
 } // namespace lws
