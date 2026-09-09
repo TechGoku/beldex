@@ -225,18 +225,25 @@ namespace
   const bool ipc_mode = prog.daemon_rpc.rfind("ipc://", 0) == 0;
 
   if (command_line::is_arg_defaulted(args, opts.daemon_rpc))
-  {
-      prog.daemon_rpc = options::get_default_zmq();
+    prog.daemon_rpc = options::get_default_zmq();
 
-      // Append only for HTTP mode
-      if (!ipc_mode)
-          prog.daemon_rpc += "/json_rpc";
-  }
-  else
+  /* Append "/json_rpc" for HTTP endpoints, but only when it is not already
+     there. This used to be unconditional, so passing the full URL - which is
+     what the endpoint actually is, and the obvious thing to hand it - produced
+     ".../json_rpc/json_rpc". beldexd answers that with "Not found", and since
+     the reply is not JSON every chain sync died on a parse error ("last read:
+     'N'") with nothing in the message pointing at the URL as the cause.
+     `--daemon-backup` already guarded against this in `normalise` below; the
+     primary did not.
+
+     Trailing slashes are stripped first so ".../:29391/" does not become
+     "...//json_rpc". */
+  if (!ipc_mode)
   {
-      // Append only for HTTP mode
-      if (!ipc_mode)
-          prog.daemon_rpc += "/json_rpc";
+    while (!prog.daemon_rpc.empty() && prog.daemon_rpc.back() == '/')
+      prog.daemon_rpc.pop_back();
+    if (prog.daemon_rpc.find("/json_rpc") == std::string::npos)
+      prog.daemon_rpc += "/json_rpc";
   }
 
     // For cpr::Post HTTP calls in rest_server.cpp, always use HTTP endpoint

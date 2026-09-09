@@ -103,8 +103,19 @@ namespace db
     return out.str();
   }
 
-  expect<backup_result> take_backup(const std::string& source_path, const std::string& root_path)
+  namespace
   {
+    /*! Shared body of both `take_backup` overloads.
+
+        `copy` produces the raw LMDB copy at the given destination; everything
+        around it - the `.partial` staging, the verification, the rename, the
+        reporting - is identical and must stay identical, because the whole
+        point of sharing this code is that both callers get the same
+        guarantees. */
+    template<typename Copy>
+    expect<backup_result> take_backup_with(
+      const std::string& label, const std::string& root_path, Copy copy)
+    {
     const fs::path root{root_path};
     std::error_code ec{};
     fs::create_directories(root, ec);
@@ -134,29 +145,17 @@ namespace db
     }
 
     const auto started = std::chrono::steady_clock::now();
-    MGINFO("starting hot backup of " << source_path << " -> " << final_dir.string());
+    MGINFO("starting hot backup of " << label << " -> " << final_dir.string());
 
     {
-      /* Read-only open: no writer lock, no migration, cannot modify the source.
-         `map_size` is passed as 0 so LMDB adopts the existing file's size rather
-         than trying to set one on a database another process owns. */
-      auto env = lmdb::open_environment(source_path.c_str(), 20, 0, 1024, true);
-      if (!env)
-      {
-        MERROR("cannot open source database read-only: " << env.error().message());
-        fs::remove_all(partial_dir, ec);
-        return env.error();
-      }
-
-      lmdb::database source{std::move(*env)};
-      const expect<void> copied = source.compact(partial_dir.string().c_str());
+      const expect<void> copied = copy(partial_dir.string());
       if (!copied)
       {
         MERROR("backup copy failed: " << copied.error().message());
         fs::remove_all(partial_dir, ec);
         return copied.error();
       }
-    } // source environment closed before verification
+    }
 
     const auto verified = verify_backup(partial_dir.string());
     if (!verified)
@@ -190,6 +189,39 @@ namespace db
            << ", took " << result.elapsed.count() << "s)");
 
     return result;
+    }
+  } // anonymous
+
+  expect<backup_result> take_backup(const std::string& source_path, const std::string& root_path)
+  {
+    return take_backup_with(source_path, root_path,
+      [&source_path] (const std::string& dest) -> expect<void>
+      {
+        /* Read-only open: no writer lock, no migration, cannot modify the
+           source. `map_size` is 0 so LMDB adopts the existing file's size
+           rather than trying to set one on a database another process owns.
+
+           Only valid because this overload is for a database THIS process does
+           not already have open; see the header. */
+        auto env = lmdb::open_environment(source_path.c_str(), 20, 0, 1024, true);
+        if (!env)
+        {
+          MERROR("cannot open source database read-only: " << env.error().message());
+          return env.error();
+        }
+        lmdb::database source{std::move(*env)};
+        return source.compact(dest.c_str());
+      });
+  }
+
+  expect<backup_result> take_backup(storage& source, const std::string& root_path)
+  {
+    return take_backup_with("the active database", root_path,
+      [&source] (const std::string& dest) -> expect<void>
+      {
+        // Through the handle we already hold - no second environment.
+        return source.compact(dest.c_str());
+      });
   }
 
   void apply_retention(const std::string& root_path, unsigned keep)

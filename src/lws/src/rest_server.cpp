@@ -2403,22 +2403,35 @@ namespace lws
       }
 
       const std::size_t missing = count_missing(live.addresses, incoming.addresses);
-      if (missing != 0)
-      {
-        MERROR("/switch_db: refusing - " << missing << " live account(s) are absent from "
-               << params.path << ". Let beldex-lws-rebuild finish its account sync first.");
-        return {lws::error::account_not_found};
-      }
-
       const std::size_t missing_requests =
         count_missing_requests(live.requests, incoming.requests);
-      if (missing_requests != 0)
+
+      /* `force` has to cover this, not just the height checks.
+
+         Reverting a switch is the recovery path: the database switched away
+         from is deliberately left intact so that going back is another call
+         here. But the moment one account signs up on the new database, the old
+         one is missing it - so without an override, revert becomes impossible
+         exactly when it is most likely to be needed. The accounts are not
+         destroyed by going back: they remain in the database being left, which
+         is itself left in place, and in the pre-switch backup taken below. */
+      if (missing != 0 || missing_requests != 0)
       {
-        MERROR("/switch_db: refusing - " << missing_requests << " pending request(s) are "
-               "absent from " << params.path << ". Switching would drop them and the "
-               "wallets waiting on them would never be approved. Let beldex-lws-rebuild "
-               "mirror them first.");
-        return {lws::error::account_not_found};
+        if (!force)
+        {
+          MERROR("/switch_db: refusing - " << missing << " account(s) and "
+                 << missing_requests << " pending request(s) are absent from "
+                 << params.path << ". Let beldex-lws-rebuild finish its sync, or pass "
+                 "\"force\": true to switch anyway and leave them behind.");
+          return {lws::error::account_not_found};
+        }
+
+        MWARNING("/switch_db: force set - switching to " << params.path
+                 << " even though " << missing << " account(s) and " << missing_requests
+                 << " pending request(s) are missing from it. Those remain in "
+                 << live_path << ", which is not deleted, and in the backup taken below; "
+                 "the wallets behind them will look unregistered until they are "
+                 "brought across.");
       }
 
       if (!force)
@@ -2457,7 +2470,11 @@ namespace lws
           (fs::path{live_path}.parent_path() / "lws-switch-backups").string() :
           backup_root;
 
-        const expect<db::backup_result> backup = db::take_backup(live_path, root_dir);
+        /* Through the handle this process already holds, NOT by path: opening
+           a second LMDB environment for a database this process already has
+           open corrupts the shared per-thread reader-slot bookkeeping, and the
+           next read transaction here fails with MDB_BAD_RSLOT. */
+        const expect<db::backup_result> backup = db::take_backup(disk, root_dir);
         if (!backup)
         {
           MERROR("/switch_db: aborting - could not back up " << live_path << " to "

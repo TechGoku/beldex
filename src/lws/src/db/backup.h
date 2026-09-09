@@ -17,6 +17,8 @@
 
 #include "common/expect.h" // beldex/src
 
+#include "db/fwd.h"
+
 namespace lws
 {
 namespace db
@@ -50,6 +52,21 @@ namespace db
 
       \return The finished backup, or the reason it could not be produced. */
   expect<backup_result> take_backup(const std::string& source_path, const std::string& root);
+
+  /*! As above, but copying through a database this process already has open.
+
+      Required whenever the caller is the process that owns the database - the
+      daemon taking a pre-switch backup of itself, for instance. The overload
+      above opens its own environment for `source_path`, and LMDB does not
+      support two environments for one database inside a single process: the
+      per-thread reader-slot bookkeeping is shared, so the second open leaves
+      the first environment's next read transaction failing with
+      `MDB_BAD_RSLOT`. Copying through the existing handle avoids the second
+      open entirely.
+
+      Identical guarantees to the path overload - the copy is taken under an
+      internal read snapshot, verified, and renamed only once it is good. */
+  expect<backup_result> take_backup(storage& source, const std::string& root);
 
   /*! Delete backups in `root` beyond the newest `keep`.
 
