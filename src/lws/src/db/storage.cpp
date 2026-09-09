@@ -2215,6 +2215,28 @@ namespace db
         if (existing->scan_height != user->scan_height())
           continue; // expected: this account moved on; skip it, not an error
 
+        /* Never move an account backwards.
+
+           A thread group is scanned from the LOWEST `scan_height` in it (see
+           `users.begin()->scan_height()` in scanner.cpp), and `last_update` is
+           derived from that. Without this guard every account in the group -
+           including ones already at the chain tip - had its height rewritten to
+           that low value. So a single rescanning account dragged every account
+           grouped with it back to the rescan height: their wallets saw
+           `scanned_height` jump backwards and they re-scanned the whole chain
+           for nothing.
+
+           Every block in this batch is at or below such an account's
+           `scan_height`, so `scan_transaction` skipped it and matched nothing -
+           there is no output or spend to store here. Count it as updated so the
+           caller's `updated != users.size()` check does not discard the batch
+           and restart the thread. */
+        if (block_id(last_update) <= existing->scan_height)
+        {
+          ++updated;
+          continue;
+        }
+
         const block_id existing_height = existing->scan_height;
 
         existing->scan_height = block_id(last_update);

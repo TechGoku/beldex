@@ -70,6 +70,18 @@ if (BUILD_TESTS)
   )
   add_test(NAME lws-min-height-seek COMMAND lws-min-height-seek-test)
 
+  # Proves a rescanned account cannot drag the accounts grouped with it
+  # backwards; see ../tests/update_no_regress.cpp.
+  add_executable(lws-update-no-regress-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/update_no_regress.cpp)
+  target_link_libraries(lws-update-no-regress-test PRIVATE
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-update-no-regress COMMAND lws-update-no-regress-test)
+
   # Reproduces the orphaned-reader -> blocked page reuse -> runaway map failure
   # and proves check_readers() fixes it; see ../tests/stale_reader_reclaim.cpp.
   add_executable(lws-stale-reader-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/stale_reader_reclaim.cpp)
