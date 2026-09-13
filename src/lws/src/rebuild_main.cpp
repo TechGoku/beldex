@@ -49,6 +49,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -91,6 +93,8 @@ namespace
     const command_line::arg_descriptor<std::size_t> scan_threads;
     const command_line::arg_descriptor<unsigned> sync_interval;
     const command_line::arg_descriptor<unsigned> restart_coalesce;
+    const command_line::arg_descriptor<unsigned> progress_interval;
+    const command_line::arg_descriptor<unsigned short> log_level;
     const command_line::arg_descriptor<bool> status;
 
     options()
@@ -110,6 +114,8 @@ namespace
          New accounts still arrive well before the switch, which is the only
          deadline that matters: `/switch_db` refuses if any is missing. */
       , restart_coalesce{"restart-coalesce", "Seconds to batch newly seeded accounts before restarting the rebuild scan threads", 900}
+      , progress_interval{"progress-interval", "Seconds between progress lines", 30}
+      , log_level{"log-level", "Log level 0-4; progress is always printed", 0}
       , status{"status", "Print rebuild progress and exit", false}
     {}
 
@@ -124,6 +130,8 @@ namespace
       command_line::add_arg(description, scan_threads);
       command_line::add_arg(description, sync_interval);
       command_line::add_arg(description, restart_coalesce);
+      command_line::add_arg(description, progress_interval);
+      command_line::add_arg(description, log_level);
       command_line::add_arg(description, status);
     }
   };
@@ -137,6 +145,8 @@ namespace
     std::size_t scan_threads;
     std::chrono::seconds sync_interval;
     std::chrono::seconds restart_coalesce;
+    std::chrono::seconds progress_interval;
+    unsigned short log_level;
     bool daemon_spread;
     bool status_only;
   };
@@ -237,6 +247,9 @@ namespace
     prog.sync_interval = std::chrono::seconds{command_line::get_arg(args, opts.sync_interval)};
     prog.restart_coalesce =
       std::chrono::seconds{command_line::get_arg(args, opts.restart_coalesce)};
+    prog.progress_interval = std::chrono::seconds{
+      std::max(1u, command_line::get_arg(args, opts.progress_interval))};
+    prog.log_level = command_line::get_arg(args, opts.log_level);
     prog.daemon_spread = command_line::get_arg(args, opts.daemon_spread);
     prog.status_only = command_line::get_arg(args, opts.status);
 
@@ -273,6 +286,7 @@ namespace
     lws::db::account_address address;
     crypto::secret_key key;
     lws::db::block_id start_height;
+    lws::db::block_id scan_height;
     lws::db::account_status status;
     lws::db::account_flags flags;
   };
@@ -297,7 +311,18 @@ namespace
   {
     std::vector<seed_account> accounts;
     std::vector<seed_request> requests;
-    std::uint64_t height; //!< Chain tip recorded in that database.
+    std::uint64_t height;      //!< Chain tip recorded in that database.
+    /*! How far the ACTIVE accounts have actually been scanned.
+
+        The chain tip above says only how many block hashes the database holds,
+        which jumps to the daemon's tip within seconds of starting and then
+        never moves - useless as a progress signal. What an operator actually
+        wants to know is how far the accounts have been scanned, and the
+        rebuild is finished only when the furthest-behind one reaches the tip,
+        so `scanned_low` is the number that matters. */
+    std::uint64_t scanned_low = 0;
+    std::uint64_t scanned_high = 0;
+    std::size_t active = 0;
   };
 
   //! Read every account, in every status, out of `disk`.
@@ -329,8 +354,21 @@ namespace
         entry.address = acct.address;
         std::memcpy(std::addressof(entry.key), std::addressof(acct.key), sizeof(entry.key));
         entry.start_height = acct.start_height;
+        entry.scan_height = acct.scan_height;
         entry.status = status;
         entry.flags = acct.flags;
+
+        // Only active accounts are scanned, so only they bound progress.
+        if (status == lws::db::account_status::active)
+        {
+          const std::uint64_t at = std::uint64_t(acct.scan_height);
+          if (out.active == 0 || at < out.scanned_low)
+            out.scanned_low = at;
+          if (at > out.scanned_high)
+            out.scanned_high = at;
+          ++out.active;
+        }
+
         out.accounts.push_back(entry);
       }
     }
@@ -602,6 +640,92 @@ namespace
     return added;
   }
 
+  //! \return `n` with thousands separators, e.g. "4,186,347".
+  std::string with_commas(std::uint64_t n)
+  {
+    std::string digits = std::to_string(n);
+    std::string out;
+    int count = 0;
+    for (auto c = digits.rbegin(); c != digits.rend(); ++c)
+    {
+      if (count && count % 3 == 0)
+        out.push_back(',');
+      out.push_back(*c);
+      ++count;
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
+  }
+
+  //! \return `seconds` as a compact "2h 14m" / "45s" style duration.
+  std::string as_duration(std::uint64_t seconds)
+  {
+    std::ostringstream out;
+    if (seconds >= 86400)
+      out << (seconds / 86400) << "d " << ((seconds % 86400) / 3600) << "h";
+    else if (seconds >= 3600)
+      out << (seconds / 3600) << "h " << ((seconds % 3600) / 60) << "m";
+    else if (seconds >= 60)
+      out << (seconds / 60) << "m " << (seconds % 60) << "s";
+    else
+      out << seconds << "s";
+    return out.str();
+  }
+
+  /*! One human-readable progress line.
+
+      Printed with MGINFO so it survives the default log level. Without it the
+      rebuild said "rebuild running" and then nothing at all for hours, leaving
+      no way to tell a working scan from a wedged one - which is exactly the
+      state this tool is most often left in, unattended and overnight. */
+  std::string progress_line(
+    const account_set& shadow,
+    std::uint64_t target,
+    std::uint64_t previous_low,
+    std::chrono::seconds elapsed,
+    unsigned quiet_intervals)
+  {
+    std::ostringstream out;
+    out << "progress: scanned " << with_commas(shadow.scanned_low)
+        << " / " << with_commas(target);
+
+    if (target)
+    {
+      const double pct = (100.0 * double(shadow.scanned_low)) / double(target);
+      out << std::fixed << std::setprecision(2) << " (" << pct << "%)";
+    }
+
+    out << " | " << shadow.active << " account(s)";
+
+    if (shadow.scanned_high != shadow.scanned_low)
+      out << " | furthest " << with_commas(shadow.scanned_high);
+
+    if (elapsed.count() > 0 && shadow.scanned_low > previous_low)
+    {
+      const std::uint64_t done = shadow.scanned_low - previous_low;
+      const std::uint64_t rate = done / std::uint64_t(elapsed.count());
+      out << " | +" << with_commas(done) << " blocks in " << elapsed.count()
+          << "s (" << with_commas(rate) << "/s)";
+
+      if (rate && target > shadow.scanned_low)
+        out << " | eta " << as_duration((target - shadow.scanned_low) / rate);
+    }
+    else if (elapsed.count() > 0)
+    {
+      /* A batch can easily span one interval, so a single quiet tick means
+         nothing and crying "stalled" on it trains the operator to ignore this
+         line. Only say so once several intervals have passed with nothing
+         committed. */
+      if (quiet_intervals >= 3)
+        out << " | STALLED: nothing committed in the last " << quiet_intervals
+            << " checks - see --log-level 1";
+      else
+        out << " | scanning (batch in flight)";
+    }
+
+    return out.str();
+  }
+
   //! Print how far the rebuild has got, then return.
   int report_status(const program& prog)
   {
@@ -620,13 +744,34 @@ namespace
     lws::db::storage shadow = lws::db::storage::open_readonly(prog.shadow_path.c_str());
     const account_set shadow_set = read_accounts(shadow);
 
+    /* Lag is measured against how far the ACCOUNTS have been scanned, not
+       against the shadow's block-hash table. The latter reaches the daemon's
+       tip within seconds of the first run and then never moves, so reporting
+       it made a rebuild that had scanned nothing look finished.
+
+       The target is the higher of the two chains. The live LWS server can
+       itself be behind the daemon, and taking its height alone reported
+       percentages over 100% once the shadow passed it. */
+    const std::uint64_t target =
+      std::max(std::max(live_set.height, shadow_set.height), shadow_set.scanned_low);
     const std::uint64_t lag =
-      live_set.height > shadow_set.height ? live_set.height - shadow_set.height : 0;
+      target > shadow_set.scanned_low ? target - shadow_set.scanned_low : 0;
 
     std::cout
-      << "live:    " << live_set.accounts.size() << " account(s), height " << live_set.height << "\n"
-      << "shadow:  " << shadow_set.accounts.size() << " account(s), height " << shadow_set.height << "\n"
-      << "lag:     " << lag << " block(s)\n"
+      << "live:    " << live_set.accounts.size() << " account(s), chain height "
+      << with_commas(live_set.height) << "\n"
+      << "target:  " << with_commas(target) << " (highest chain seen)\n"
+      << "shadow:  " << shadow_set.accounts.size() << " account(s), scanned to "
+      << with_commas(shadow_set.scanned_low);
+    if (target)
+    {
+      std::cout << std::fixed << std::setprecision(2)
+                << " (" << (100.0 * double(shadow_set.scanned_low) / double(target)) << "%)";
+    }
+    std::cout
+      << "\n"
+      << "furthest: " << with_commas(shadow_set.scanned_high) << "\n"
+      << "lag:     " << with_commas(lag) << " block(s) behind the live chain\n"
       << "missing: " << (live_set.accounts.size() > shadow_set.accounts.size()
                           ? live_set.accounts.size() - shadow_set.accounts.size() : 0)
       << " account(s) not yet seeded\n"
@@ -635,7 +780,7 @@ namespace
 
     // Caught up enough to switch? Deliberately strict: the operator can decide
     // to force it, this only reports the safe case.
-    const bool ready = lag == 0 &&
+    const bool ready = lag <= 1 &&
       shadow_set.accounts.size() >= live_set.accounts.size() &&
       shadow_set.requests.size() >= live_set.requests.size();
     std::cout << "ready:   " << (ready ? "yes" : "no") << std::endl;
@@ -659,7 +804,14 @@ namespace
       lws::db::storage live = lws::db::storage::open_readonly(prog.db_path.c_str());
       live_set = read_accounts(live);
     }
-    MGINFO("live database: " << live_set.accounts.size() << " account(s), height " << live_set.height);
+    MGINFO("live database: " << live_set.accounts.size() << " account(s), height "
+           << with_commas(live_set.height));
+
+    /* What the rebuild is aiming at. Tracked as a variable, not a constant:
+       the live chain keeps growing while a multi-hour rebuild runs, and the
+       sync loop raises this as it does so, so the percentage and ETA stay
+       honest instead of converging on a target that has already moved. */
+    std::uint64_t target_height = live_set.height;
 
     if (live_set.height <= prog.rescan_height)
     {
@@ -708,19 +860,56 @@ namespace
           "\n  The daemon at " + prog.daemon_rpcs.front() +
           " has not reached that height yet."};
       }
-      MGINFO("shadow chain synced to height " << shadow_height);
+      MGINFO("shadow chain synced to height " << with_commas(shadow_height));
+
+      /* The rebuild scans against the daemon, so the daemon's tip - which is
+         what the shadow just synced to - is what "finished" means. The live
+         LWS database is a separate thing that may itself be behind; using its
+         height as the target produced percentages over 100%. */
+      if (shadow_height > target_height)
+        target_height = shadow_height;
     }
 
     {
       const account_set existing = read_accounts(shadow);
+
+      /* Only a shadow with no accounts at all is a fresh seed. On a resume,
+         accounts that appeared since the last run are treated exactly as the
+         sync loop treats them - seeded at their own start height, not dragged
+         back to `--rescan-height`. Seeding them at the rebuild height would
+         make one late signup re-scan every block the rest of the run had
+         already covered, and would yank the reported progress back to the
+         start with it. */
+      const bool fresh = existing.accounts.empty();
       const std::size_t added = seed_accounts(
         shadow, live_set.accounts, existing.accounts,
-        existing.height, prog.rescan_height, /*initial=*/true);
+        existing.height, prog.rescan_height, fresh);
       const std::size_t mirrored =
         seed_requests(shadow, live_set.requests, existing.requests);
-      MGINFO("seeded " << added << " account(s) at height " << prog.rescan_height
-             << " (" << existing.accounts.size() << " already present), "
-             << mirrored << " pending request(s) mirrored");
+      MGINFO("seeded " << added << " account(s) (" << existing.accounts.size()
+             << " already present), " << mirrored << " pending request(s) mirrored");
+
+      /* Say plainly whether this is a fresh rebuild or a resume. The shadow
+         keeps every committed batch, so an interrupted run continues from
+         where it stopped - but with no output saying so, a resume looked
+         identical to starting over and there was no way to tell which had
+         happened. */
+      const account_set resumed = read_accounts(shadow);
+      if (resumed.scanned_low > prog.rescan_height)
+      {
+        MGINFO("RESUMING an existing rebuild: " << resumed.active
+               << " account(s) already scanned to height "
+               << with_commas(resumed.scanned_low)
+               << " (" << with_commas(resumed.scanned_low - prog.rescan_height)
+               << " blocks done, " << with_commas(target_height - resumed.scanned_low)
+               << " to go)");
+      }
+      else
+      {
+        MGINFO("starting a fresh rebuild from height " << with_commas(prog.rescan_height)
+               << " to " << with_commas(target_height) << " ("
+               << with_commas(target_height - prog.rescan_height) << " blocks)");
+      }
     }
 
     /* Batch the restarts caused by newly seeded accounts; see
@@ -746,52 +935,104 @@ namespace
       }
     };
 
-    MGINFO("rebuild running; polling " << prog.db_path << " for new accounts every "
-           << prog.sync_interval.count() << "s");
+    MGINFO("rebuild running; progress every " << prog.progress_interval.count()
+           << "s, new-account poll every " << prog.sync_interval.count() << "s");
+    MGINFO("safe to stop at any time (Ctrl-C or SIGTERM): every scanned batch is "
+           "committed, and re-running the same command resumes from there");
+
+    /* Progress is reported on its own cadence, independent of the account
+       poll: an operator wants to see life every few seconds, but re-reading
+       the live account list that often is wasted work on a large server. */
+    auto last_progress = std::chrono::steady_clock::now();
+    auto last_sync = last_progress;
+    std::uint64_t previous_low = read_accounts(shadow).scanned_low;
+    unsigned quiet_intervals = 0;
 
     while (running && lws::scanner::is_running())
     {
-      const auto deadline = std::chrono::steady_clock::now() + prog.sync_interval;
-      while (running && lws::scanner::is_running() &&
-             std::chrono::steady_clock::now() < deadline)
-      {
-        std::this_thread::sleep_for(std::chrono::seconds{1});
-      }
+      std::this_thread::sleep_for(std::chrono::seconds{1});
       if (!running || !lws::scanner::is_running())
         break;
 
-      try
+      const auto now = std::chrono::steady_clock::now();
+
+      if (prog.progress_interval <= (now - last_progress))
       {
-        lws::db::storage live = lws::db::storage::open_readonly(prog.db_path.c_str());
-        const account_set current = read_accounts(live);
-        const account_set existing = read_accounts(shadow);
-
-        const std::size_t added = seed_accounts(
-          shadow, current.accounts, existing.accounts,
-          existing.height, prog.rescan_height, /*initial=*/false);
-        if (added)
-          MGINFO("sync: added " << added << " newly registered account(s) to the shadow");
-
-        const std::size_t mirrored =
-          seed_requests(shadow, current.requests, existing.requests);
-        if (mirrored)
-          MGINFO("sync: mirrored " << mirrored << " pending request(s) to the shadow");
-
-        const std::uint64_t lag =
-          current.height > existing.height ? current.height - existing.height : 0;
-        MINFO("sync: shadow height " << existing.height << ", live height "
-              << current.height << ", lag " << lag << " block(s), "
-              << existing.accounts.size() << "/" << current.accounts.size() << " account(s)");
+        const auto elapsed =
+          std::chrono::duration_cast<std::chrono::seconds>(now - last_progress);
+        last_progress = now;
+        try
+        {
+          const account_set state = read_accounts(shadow);
+          /* The chain grows between the 30s target refreshes, so scanning can
+             legitimately pass the last known tip. Raise the target rather than
+             reporting 100.46%. */
+          if (state.scanned_low > target_height)
+            target_height = state.scanned_low;
+          if (state.scanned_low > previous_low)
+            quiet_intervals = 0;
+          else
+            ++quiet_intervals;
+          MGINFO(progress_line(state, target_height, previous_low, elapsed, quiet_intervals));
+          previous_low = state.scanned_low;
+        }
+        catch (const std::exception& e)
+        {
+          MWARNING("could not read progress: " << e.what());
+        }
       }
-      catch (const std::exception& e)
+
+      if (prog.sync_interval <= (now - last_sync))
       {
-        // A transient failure to read the live DB must not end the rebuild.
-        MWARNING("sync pass failed, will retry: " << e.what());
+        last_sync = now;
+        try
+        {
+          lws::db::storage live = lws::db::storage::open_readonly(prog.db_path.c_str());
+          const account_set current = read_accounts(live);
+          const account_set existing = read_accounts(shadow);
+
+          /* The chain moves on while a long rebuild runs; follow it. The
+             shadow's own block table tracks the daemon, so it is the better
+             signal, but take whichever is higher. */
+          if (current.height > target_height)
+            target_height = current.height;
+          if (existing.height > target_height)
+            target_height = existing.height;
+
+          const std::size_t added = seed_accounts(
+            shadow, current.accounts, existing.accounts,
+            existing.height, prog.rescan_height, /*initial=*/false);
+          if (added)
+            MGINFO("sync: added " << added << " newly registered account(s) to the shadow");
+
+          const std::size_t mirrored =
+            seed_requests(shadow, current.requests, existing.requests);
+          if (mirrored)
+            MGINFO("sync: mirrored " << mirrored << " pending request(s) to the shadow");
+        }
+        catch (const std::exception& e)
+        {
+          // A transient failure to read the live DB must not end the rebuild.
+          MWARNING("sync pass failed, will retry: " << e.what());
+        }
       }
     }
 
+    MGINFO("stopping: waiting for the scan threads to commit their current batch...");
     lws::scanner::stop();
     scan_thread.join();
+
+    try
+    {
+      const account_set final_state = read_accounts(shadow);
+      MGINFO("stopped at height " << with_commas(final_state.scanned_low)
+             << " of " << with_commas(std::max(target_height, final_state.scanned_low))
+             << "; re-run the same command to resume from here");
+    }
+    catch (const std::exception& e)
+    {
+      MWARNING("could not read final progress: " << e.what());
+    }
     MGINFO("rebuild stopped; shadow left intact at " << prog.shadow_path);
     return 0;
   }
@@ -802,7 +1043,12 @@ int main(int argc, char** argv)
   try
   {
     mlog_configure("", true);
-    return run(get_program(argc, argv));
+    program prog = get_program(argc, argv);
+    /* Progress uses MGINFO so it prints regardless; this only opens up the
+       scanner's own per-batch chatter for diagnosing a stall. */
+    if (prog.log_level)
+      mlog_set_log_level(prog.log_level);
+    return run(std::move(prog));
   }
   catch (const std::exception& e)
   {
