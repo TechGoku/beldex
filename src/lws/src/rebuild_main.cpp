@@ -59,6 +59,7 @@
 #include <thread>
 #include <vector>
 
+#include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 
 #include "common/command_line.h" // beldex/src
@@ -95,6 +96,10 @@ namespace
     const command_line::arg_descriptor<unsigned> restart_coalesce;
     const command_line::arg_descriptor<unsigned> progress_interval;
     const command_line::arg_descriptor<unsigned short> log_level;
+    const command_line::arg_descriptor<std::string> switch_admin;
+    const command_line::arg_descriptor<std::string> switch_key_file;
+    const command_line::arg_descriptor<std::string> switch_backup_path;
+    const command_line::arg_descriptor<bool> switch_when_ready;
     const command_line::arg_descriptor<bool> status;
 
     options()
@@ -116,6 +121,10 @@ namespace
       , restart_coalesce{"restart-coalesce", "Seconds to batch newly seeded accounts before restarting the rebuild scan threads", 900}
       , progress_interval{"progress-interval", "Seconds between progress lines", 30}
       , log_level{"log-level", "Log level 0-4; progress is always printed", 0}
+      , switch_admin{"switch-admin", "Admin REST endpoint of the running beldex-lws-daemon, e.g. http://127.0.0.1:28091", ""}
+      , switch_key_file{"switch-admin-key-file", "File holding the admin account's view key (kept out of the process list)", ""}
+      , switch_backup_path{"switch-backup-path", "Where the daemon writes its mandatory pre-switch backup", ""}
+      , switch_when_ready{"switch-when-ready", "Once the shadow has caught up, tell the daemon to switch onto it and exit", false}
       , status{"status", "Print rebuild progress and exit", false}
     {}
 
@@ -132,6 +141,10 @@ namespace
       command_line::add_arg(description, restart_coalesce);
       command_line::add_arg(description, progress_interval);
       command_line::add_arg(description, log_level);
+      command_line::add_arg(description, switch_admin);
+      command_line::add_arg(description, switch_key_file);
+      command_line::add_arg(description, switch_backup_path);
+      command_line::add_arg(description, switch_when_ready);
       command_line::add_arg(description, status);
     }
   };
@@ -147,6 +160,10 @@ namespace
     std::chrono::seconds restart_coalesce;
     std::chrono::seconds progress_interval;
     unsigned short log_level;
+    std::string switch_admin;
+    std::string switch_key;
+    std::string switch_backup_path;
+    bool switch_when_ready;
     bool daemon_spread;
     bool status_only;
   };
@@ -250,6 +267,37 @@ namespace
     prog.progress_interval = std::chrono::seconds{
       std::max(1u, command_line::get_arg(args, opts.progress_interval))};
     prog.log_level = command_line::get_arg(args, opts.log_level);
+    prog.switch_admin = command_line::get_arg(args, opts.switch_admin);
+    prog.switch_backup_path = command_line::get_arg(args, opts.switch_backup_path);
+    prog.switch_when_ready = command_line::get_arg(args, opts.switch_when_ready);
+
+    if (prog.switch_when_ready)
+    {
+      if (prog.switch_admin.empty())
+        throw std::runtime_error{"--switch-when-ready needs --switch-admin"};
+
+      /* Read from a file rather than an argument: everything on a command line
+         is visible in `ps` to every user on the box, and this is the key that
+         authorises switching the production database. */
+      const std::string key_file = command_line::get_arg(args, opts.switch_key_file);
+      if (key_file.empty())
+        throw std::runtime_error{"--switch-when-ready needs --switch-admin-key-file"};
+
+      std::ifstream keys{key_file};
+      if (!keys)
+        throw std::runtime_error{"cannot read " + key_file};
+      std::getline(keys, prog.switch_key);
+      while (!prog.switch_key.empty() &&
+             std::isspace(static_cast<unsigned char>(prog.switch_key.back())))
+      {
+        prog.switch_key.pop_back();
+      }
+      if (prog.switch_key.empty())
+        throw std::runtime_error{key_file + " is empty"};
+
+      while (!prog.switch_admin.empty() && prog.switch_admin.back() == '/')
+        prog.switch_admin.pop_back();
+    }
     prog.daemon_spread = command_line::get_arg(args, opts.daemon_spread);
     prog.status_only = command_line::get_arg(args, opts.status);
 
@@ -726,6 +774,71 @@ namespace
     return out.str();
   }
 
+  /*! \return True when the shadow has everything the live database has and
+      has scanned up to the chain.
+
+      The same conditions `/switch_db` enforces server-side. Checked here too so
+      the rebuild only asks when the answer should be yes - the daemon remains
+      the authority and will refuse if anything has changed in between. */
+  bool rebuild_ready(const account_set& live, const account_set& shadow, std::uint64_t target)
+  {
+    const std::uint64_t lag =
+      target > shadow.scanned_low ? target - shadow.scanned_low : 0;
+    return lag <= 1 &&
+      shadow.accounts.size() >= live.accounts.size() &&
+      shadow.requests.size() >= live.requests.size();
+  }
+
+  /*! Ask the running daemon to switch onto the shadow.
+
+      The swap has to happen inside the daemon: it is a different process, and
+      only it can change which database its own request handlers and scanner
+      read from. This binary cannot reach into it, so "the rebuild does the
+      switch" means the rebuild CALLS the switch - the daemon still does it, and
+      still applies every safety check (accounts present, chain caught up,
+      mandatory backup of the outgoing database) before it does.
+
+      \return True if the daemon reported a successful switch. */
+  bool request_switch(const program& prog, std::string& detail)
+  {
+    nlohmann::json params;
+    params["path"] = prog.shadow_path;
+    if (!prog.switch_backup_path.empty())
+      params["backup_path"] = prog.switch_backup_path;
+
+    nlohmann::json body;
+    body["auth"] = prog.switch_key;
+    body["params"] = params;
+
+    const std::string url = prog.switch_admin + "/switch_db";
+    MGINFO("requesting cutover from " << url);
+
+    auto response = cpr::Post(
+      cpr::Url{url},
+      cpr::Body{body.dump()},
+      cpr::Header{{"Content-Type", "application/json"}},
+      cpr::Timeout{10 * 60 * 1000} // the daemon backs up the live DB first
+    );
+
+    if (response.status_code == 0)
+    {
+      detail = "could not reach " + url + " (" + response.error.message + ")";
+      return false;
+    }
+    if (response.status_code != 200)
+    {
+      /* The daemon refused. That is a safety check doing its job, not a
+         transport failure - its log says exactly which one. */
+      detail = "daemon refused the switch (HTTP " +
+        std::to_string(response.status_code) +
+        "); see the daemon's log for the reason";
+      return false;
+    }
+
+    detail = response.text;
+    return true;
+  }
+
   //! Print how far the rebuild has got, then return.
   int report_status(const program& prog)
   {
@@ -943,6 +1056,7 @@ namespace
     /* Progress is reported on its own cadence, independent of the account
        poll: an operator wants to see life every few seconds, but re-reading
        the live account list that often is wasted work on a large server. */
+    bool switch_now = false;
     auto last_progress = std::chrono::steady_clock::now();
     auto last_sync = last_progress;
     std::uint64_t previous_low = read_accounts(shadow).scanned_low;
@@ -1009,6 +1123,14 @@ namespace
             seed_requests(shadow, current.requests, existing.requests);
           if (mirrored)
             MGINFO("sync: mirrored " << mirrored << " pending request(s) to the shadow");
+
+          if (prog.switch_when_ready &&
+              rebuild_ready(current, existing, target_height))
+          {
+            MGINFO("shadow has caught up - beginning cutover");
+            switch_now = true;
+            break; // leave the loop; the scan is stopped before switching
+          }
         }
         catch (const std::exception& e)
         {
@@ -1027,11 +1149,33 @@ namespace
       const account_set final_state = read_accounts(shadow);
       MGINFO("stopped at height " << with_commas(final_state.scanned_low)
              << " of " << with_commas(std::max(target_height, final_state.scanned_low))
-             << "; re-run the same command to resume from here");
+             << (switch_now ? "" : "; re-run the same command to resume from here"));
     }
     catch (const std::exception& e)
     {
       MWARNING("could not read final progress: " << e.what());
+    }
+
+    if (switch_now)
+    {
+      /* Deliberately after the scan threads are stopped and joined. The daemon
+         starts scanning this database the moment it switches, and two scanners
+         writing the same database would fight over the single writer lock and
+         repeatedly discard each other's batches. */
+      std::string detail;
+      if (!request_switch(prog, detail))
+      {
+        MERROR("cutover failed: " << detail);
+        MERROR("nothing was changed - the daemon is still serving its original "
+               "database, and this shadow is intact. Re-run the same command to "
+               "resume and try again.");
+        return 1;
+      }
+
+      MGINFO("cutover complete: " << detail);
+      MGINFO("the daemon is now serving " << prog.shadow_path
+             << "; its previous database was backed up and left in place");
+      return 0;
     }
     MGINFO("rebuild stopped; shadow left intact at " << prog.shadow_path);
     return 0;
