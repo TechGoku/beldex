@@ -6,6 +6,7 @@
 #include <boost/range/adaptor/filtered.hpp>
 #include <cassert>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
@@ -84,17 +85,35 @@ namespace
 
     options()
       : lws::options()
-      , show_sensitive{"show-sensitive", "Show view keys", false}
+      , show_sensitive{"show-sensitive", "Include secret view keys", false}
       , command{"command", "Admin command to execute", ""}
       , arguments{"arguments", "Arguments to command"}
     {}
 
+    //! Options as they should appear in `--help`.
     void prepare(boost::program_options::options_description& description) const
     {
       lws::options::prepare(description);
-      command_line::add_arg(description, show_sensitive);
-      command_line::add_arg(description, command);
-      command_line::add_arg(description, arguments);
+
+      boost::program_options::options_description output{"Output"};
+      command_line::add_arg(output, show_sensitive);
+      description.add(output);
+    }
+
+    /*! As `prepare`, plus the positional arguments.
+
+        `command` and `arguments` are positional - they are written as
+        `beldex-lws-admin list_accounts`, never as `--command list_accounts` -
+        so the parser has to know about them but `--help` should not list them
+        as if they were flags. */
+    void prepare_parser(boost::program_options::options_description& description) const
+    {
+      prepare(description);
+
+      boost::program_options::options_description positional{};
+      command_line::add_arg(positional, command);
+      command_line::add_arg(positional, arguments);
+      description.add(positional);
     }
   };
 
@@ -696,6 +715,8 @@ namespace
     char const* const name;
     void (*const handler)(program, std::ostream&);
     char const* const parameters;
+    //! One line saying what the command is for; shown in `--help`.
+    char const* const summary;
     /*! True if the command only reads.
 
         These open the database `MDB_RDONLY`, which never takes the single LMDB
@@ -707,23 +728,53 @@ namespace
 
   static constexpr const command commands[] =
   {
-    {"accept_requests",       &accept_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]...", false},
-    {"add_account",           &add_account,     "\t\t<base58 address> <view key hex>", false},
+    {"accept_requests",       &accept_requests,
+     "<type> <address>...",
+     "Approve create|import requests", false},
+    {"add_account",           &add_account,
+     "<address> <view key hex>",
+     "Register an account directly", false},
     // mdb_env_copy2 snapshots under an internal read txn; no writer lock needed.
-    {"compact",               &compact,         "\t\t<destination path>", true},
-    {"create_admin",          &create_admin,    "", false},
-    {"debug_database",        &debug_database,  "", true},
-    {"export_accounts",       &export_accounts, "\t<output file>  (address+view key+heights; file contains SECRETS)", true},
-    {"import_accounts",       &import_accounts, "\t<input file> [rescan height]", false},
-    {"list_accounts",         &list_accounts,   "", true},
-    {"list_admin",            &list_admin,      "", true},
-    {"list_requests",         &list_requests,   "", true},
-    {"modify_account_status", &modify_account,  "\t<\"active\"|\"inactive\"|\"hidden\"> <base58 address> [base 58 address]...", false},
-    {"reject_requests",       &reject_requests, "\t<\"create\"|\"import\"> <base58 address> [base 58 address]...", false},
-    {"rescan",                &rescan,          "\t\t<height> <base58 address> [base 58 address]...", false},
+    {"compact",               &compact,
+     "<destination path>",
+     "Compacted copy of the database", true},
+    {"create_admin",          &create_admin,
+     "",
+     "Make an admin account", false},
+    {"debug_database",        &debug_database,
+     "",
+     "Dump the database as JSON", true},
+    {"export_accounts",       &export_accounts,
+     "<output file>",
+     "Export keys+heights (SECRETS)", true},
+    {"import_accounts",       &import_accounts,
+     "<input file> [height]",
+     "Import from an export or list", false},
+    {"list_accounts",         &list_accounts,
+     "",
+     "Accounts and scan heights", true},
+    {"list_admin",            &list_admin,
+     "",
+     "Admin accounts", true},
+    {"list_requests",         &list_requests,
+     "",
+     "Requests awaiting approval", true},
+    {"modify_account_status", &modify_account,
+     "<status> <address>...",
+     "active | inactive | hidden", false},
+    {"reject_requests",       &reject_requests,
+     "<type> <address>...",
+     "Discard create|import requests", false},
+    {"rescan",                &rescan,
+     "<height> <address>...",
+     "Reset accounts to a height", false},
     // Never opens --db-path for writing; it deletes a DIFFERENT directory.
-    {"retire_db",             &retire_db,       "\t\t<path> confirm  (PERMANENTLY deletes that database)", true},
-    {"rollback",              &rollback,        "\t\t<height>", false}
+    {"retire_db",             &retire_db,
+     "<path> confirm",
+     "PERMANENTLY delete a database", true},
+    {"rollback",              &rollback,
+     "<height>",
+     "Drop blocks above a height", false}
   };
 
   //! \return The command called `name`, or `nullptr`.
@@ -737,17 +788,53 @@ namespace
 
   void print_help(std::ostream& out)
   {
-    boost::program_options::options_description description{"Options"};
+    boost::program_options::options_description description{};
     options{}.prepare(description);
 
-    out << "Usage: [options] [command] [arguments]" << std::endl;
-    out << description << std::endl;
-    out << "Commands (*  = read-only, safe against a running daemon's DB):" << std::endl;
-    for (command cmd : commands)
+    out <<
+      "beldex-lws-admin - inspect and administer a light wallet server database\n"
+      "\n"
+      "Usage:\n"
+      "  beldex-lws-admin [options] <command> [arguments]\n"
+      "\n"
+      "Acts on the database at --db-path directly. Commands marked * open it\n"
+      "read-only and are safe against a running daemon; the rest take the LMDB\n"
+      "writer lock and stall that daemon's scanner while they run.\n"
+      << description <<
+      "\nCommands:\n";
+
+    /* Align the summaries on the command NAME and put any arguments on their
+       own indented line. Aligning on "name <arguments>" instead pushed the
+       summaries past 120 columns for the longer commands and wrapped them in a
+       normal terminal. */
+    std::size_t width = 0;
+    for (const command& cmd : commands)
     {
-      out << (cmd.read_only ? " * " : "   ")
-          << cmd.name << "\t\t" << cmd.parameters << std::endl;
+      std::size_t len = std::strlen(cmd.name);
+      if (*cmd.parameters)
+        len += 1 + std::strlen(cmd.parameters);
+      width = std::max(width, len);
     }
+
+    for (const command& cmd : commands)
+    {
+      std::string usage = cmd.name;
+      if (*cmd.parameters)
+        usage += std::string{" "} + cmd.parameters;
+
+      out << (cmd.read_only ? "  * " : "    ")
+          << std::left << std::setw(int(width) + 2) << usage
+          << cmd.summary << '\n';
+    }
+
+    out <<
+      "\n"
+      "  * safe against a running daemon's database\n"
+      "\n"
+      "To rescan or roll back without downtime use beldex-lws-rebuild; the\n"
+      "rescan and rollback commands here act on the live database directly.\n"
+      "\n"
+      "Setup, examples and procedures: src/lws/lightwallet_server.md\n";
   }
 
   boost::optional<std::pair<std::string, program>> get_program(int argc, char** argv)
@@ -757,8 +844,8 @@ namespace
     const options opts{};
     po::variables_map args{};
     {
-      po::options_description description{"Options"};
-      opts.prepare(description);
+      po::options_description description{};
+      opts.prepare_parser(description);
 
       po::positional_options_description positional{};
       positional.add(opts.command.name, 1);

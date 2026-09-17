@@ -52,19 +52,22 @@ namespace
 
     options()
       : lws::options()
-      , backup_path{"backup-path", "Directory to write backups into (required)", ""}
+      , backup_path{"backup-path", "Where to write backups (required)", ""}
       , interval_hours{"interval-hours", "Hours between backups", 24}
-      , keep{"keep", "Number of backups to retain; 0 keeps every backup", 7}
-      , once{"once", "Take a single backup and exit (for cron/systemd timers)", false}
+      , keep{"keep", "How many to keep; 0 deletes nothing", 7}
+      , once{"once", "Take one backup and exit", false}
     {}
 
     void prepare(boost::program_options::options_description& description) const
     {
       lws::options::prepare(description);
-      command_line::add_arg(description, backup_path);
-      command_line::add_arg(description, interval_hours);
-      command_line::add_arg(description, keep);
-      command_line::add_arg(description, once);
+
+      boost::program_options::options_description backup{"Backup"};
+      command_line::add_arg(backup, backup_path);
+      command_line::add_arg(backup, once);
+      command_line::add_arg(backup, interval_hours);
+      command_line::add_arg(backup, keep);
+      description.add(backup);
     }
   };
 
@@ -79,16 +82,24 @@ namespace
 
   void print_help(std::ostream& out)
   {
-    boost::program_options::options_description description{"Options"};
+    boost::program_options::options_description description{};
     options{}.prepare(description);
 
-    out << "Usage: [options]" << std::endl;
-    out << std::endl;
-    out << "Takes consistent backups of a live LWS database without stopping it."
-        << std::endl;
-    out << "The output is a normal LWS database: recover with --db-path <backup dir>."
-        << std::endl;
-    out << description;
+    out <<
+      "beldex-lws-backup - hot backups of a live light wallet server database\n"
+      "\n"
+      "Usage:\n"
+      "  beldex-lws-backup --db-path <live db> --backup-path <dir> [options]\n"
+      "\n"
+      "Copies the database while the server keeps running. The source is opened\n"
+      "read-only, so it never takes the writer lock. Each copy is verified\n"
+      "before it counts as a backup.\n"
+      << description <<
+      "\n"
+      "The result is an ordinary LWS database: recover with --db-path <backup>.\n"
+      "--keep only deletes once a NEW backup has been verified.\n"
+      "\n"
+      "Setup, examples and procedures: src/lws/lightwallet_server.md\n";
   }
 
   program get_program(int argc, char** argv)
@@ -96,7 +107,7 @@ namespace
     const options opts{};
     boost::program_options::variables_map args{};
     {
-      boost::program_options::options_description description{"Options"};
+      boost::program_options::options_description description{};
       opts.prepare(description);
 
       boost::program_options::store(

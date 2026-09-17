@@ -71,32 +71,32 @@ namespace
 
     options()
       : lws::options()
-      , daemon_rpc{"daemon", "[(https|http)://<address>:]<port> for daemon connections", get_default_zmq()}
-      , daemon_sub{"sub", "tcp://address:port or ipc://path of a beldexd OMQ Pub", ""}
-      , daemon_backup{"daemon-backup", "Comma-separated additional beldexd HTTP endpoints to fail over to, e.g. http://host2:19091,http://host3:19091", ""}
-      , rest_cache_bytes{"rest-cache-bytes", "Memory ceiling for EACH per-account REST response cache, in bytes", 256 * 1024 * 1024}
-      , daemon_spread{"daemon-spread", "Fan scan threads across every --daemon/--daemon-backup endpoint instead of using one at a time. Helps only when accounts sit at different heights (bulk rescan, staggered catch-up); in steady state the threads request the same blocks and the shared fetch cache already dedupes them", false}
-      , rest_servers{"rest-server", "[(https|http)://<address>:]<port>[/<prefix>] for incoming connections, multiple declarations allowed"}
-      , admin_rest_servers{"admin-rest-server", "[(https|http])://<address>:]<port>[/<prefix>] for incoming admin connections, multiple declarations allowed"}      , rest_ssl_key{"rest-ssl-key", "<path> to PEM formatted SSL key for https REST server", ""}
-      , rest_ssl_cert{"rest-ssl-certificate", "<path> to PEM formatted SSL certificate (chains supported) for https REST server", ""}
+      , daemon_rpc{"daemon", "beldexd JSON-RPC to scan against", get_default_zmq()}
+      , daemon_sub{"sub", "beldexd OMQ publisher for block notices", ""}
+      , daemon_backup{"daemon-backup", "More beldexd endpoints, comma-separated", ""}
+      , rest_cache_bytes{"rest-cache-bytes", "Per-account response cache ceiling", 256 * 1024 * 1024}
+      , daemon_spread{"daemon-spread", "Spread scan threads over all endpoints", false}
+      , rest_servers{"rest-server", "Wallet-facing address; repeatable"}
+      , admin_rest_servers{"admin-rest-server", "Admin address; repeatable"}      , rest_ssl_key{"rest-ssl-key", "PEM key for https", ""}
+      , rest_ssl_cert{"rest-ssl-certificate", "PEM certificate for https", ""}
       /* Was 1. With a single REST thread every request is serialised behind
          whichever one is running, so one large get_address_txs stalls every
          other wallet on the server - the opposite of the "thousands of
          concurrent users" target. Capped rather than set to the full core count
          because the intended deployment runs several of these processes on one
          host, and each would otherwise size itself as if it owned the box. */
-      , rest_threads{"rest-threads", "Number of threads to process REST connections",
+      , rest_threads{"rest-threads", "Threads serving REST",
                      std::min<unsigned>(8, std::max<unsigned>(2, boost::thread::hardware_concurrency()))}
-      , scan_threads{"scan-threads", "Maximum number of threads for account scanning", boost::thread::hardware_concurrency()}
-      , access_controls{"access-control-origin", "Specify a whitelisted HTTP control origin domain"}
-      , external_bind{"confirm-external-bind", "Allow listening for external connections", false}
-      , create_queue_max{"create-queue-max", "Set pending create account requests maximum", 10000}
-      , rates_interval{"exchange-rate-interval", "Retrieve exchange rates in minute intervals from cryptocompare.com if greater than 0", 0}
-      , log_level{"log-level", "Log level [0-4]", 1}
-      , config_file{"config-file", "Specify any option in a config file; <name>=<value> on separate lines"}
-      , db_map_size{"db-map-size", "Initial LMDB memory-map size in bytes; 0 keeps the built-in default sizing", 0}
-      , db_max_readers{"db-max-readers", "Maximum concurrent LMDB reader slots", 1024}
-      , max_response_bytes{"rest-max-response-bytes", "Refuse REST responses larger than this many bytes; 0 (default) is unlimited", 0}
+      , scan_threads{"scan-threads", "Threads scanning the chain", boost::thread::hardware_concurrency()}
+      , access_controls{"access-control-origin", "Allowed CORS origin; repeatable"}
+      , external_bind{"confirm-external-bind", "Needed to bind non-loopback over http", false}
+      , create_queue_max{"create-queue-max", "Max requests awaiting approval", 10000}
+      , rates_interval{"exchange-rate-interval", "Minutes between rate fetches; 0 off", 0}
+      , log_level{"log-level", "0-4", 1}
+      , config_file{"config-file", "Read options from a file"}
+      , db_map_size{"db-map-size", "Initial LMDB map size; 0 = default", 0}
+      , db_max_readers{"db-max-readers", "Max LMDB reader slots", 1024}
+      , max_response_bytes{"rest-max-response-bytes", "Response size cap; 0 = unlimited", 0}
     {}
 
     void prepare(boost::program_options::options_description& description) const
@@ -104,26 +104,41 @@ namespace
       static constexpr const char rest_default[] = "https://0.0.0.0:8443";
 
       lws::options::prepare(description);
-      command_line::add_arg(description, daemon_rpc);
-      command_line::add_arg(description, daemon_sub);
-      command_line::add_arg(description, daemon_backup);
-      command_line::add_arg(description, rest_cache_bytes);
-      command_line::add_arg(description, daemon_spread);
-      description.add_options()(rest_servers.name, boost::program_options::value<std::vector<std::string>>()->default_value({rest_default}, rest_default), rest_servers.description);
-      command_line::add_arg(description, admin_rest_servers);
-      command_line::add_arg(description, rest_ssl_key);
-      command_line::add_arg(description, rest_ssl_cert);
-      command_line::add_arg(description, rest_threads);
-      command_line::add_arg(description, scan_threads);
-      command_line::add_arg(description, access_controls);
-      command_line::add_arg(description, external_bind);
-      command_line::add_arg(description, create_queue_max);
-      command_line::add_arg(description, rates_interval);
-      command_line::add_arg(description, log_level);
-      command_line::add_arg(description, config_file);
-      command_line::add_arg(description, db_map_size);
-      command_line::add_arg(description, db_max_readers);
-      command_line::add_arg(description, max_response_bytes);
+
+      boost::program_options::options_description general{"Logging and configuration"};
+      command_line::add_arg(general, log_level);
+      command_line::add_arg(general, config_file);
+      description.add(general);
+
+      boost::program_options::options_description daemon{"Beldexd connection"};
+      command_line::add_arg(daemon, daemon_rpc);
+      command_line::add_arg(daemon, daemon_backup);
+      command_line::add_arg(daemon, daemon_spread);
+      command_line::add_arg(daemon, daemon_sub);
+      description.add(daemon);
+
+      boost::program_options::options_description rest{"REST server"};
+      rest.add_options()(rest_servers.name, boost::program_options::value<std::vector<std::string>>()->default_value({rest_default}, rest_default), rest_servers.description);
+      command_line::add_arg(rest, admin_rest_servers);
+      command_line::add_arg(rest, rest_ssl_key);
+      command_line::add_arg(rest, rest_ssl_cert);
+      command_line::add_arg(rest, rest_threads);
+      command_line::add_arg(rest, access_controls);
+      command_line::add_arg(rest, external_bind);
+      command_line::add_arg(rest, max_response_bytes);
+      command_line::add_arg(rest, rest_cache_bytes);
+      description.add(rest);
+
+      boost::program_options::options_description scanning{"Scanning and accounts"};
+      command_line::add_arg(scanning, scan_threads);
+      command_line::add_arg(scanning, create_queue_max);
+      command_line::add_arg(scanning, rates_interval);
+      description.add(scanning);
+
+      boost::program_options::options_description storage{"Storage tuning"};
+      command_line::add_arg(storage, db_map_size);
+      command_line::add_arg(storage, db_max_readers);
+      description.add(storage);
     }
   };
  struct program
@@ -150,11 +165,20 @@ namespace
 
   void print_help(std::ostream& out)
   {
-    boost::program_options::options_description description{"Options"};
+    boost::program_options::options_description description{};
     options{}.prepare(description);
 
-    out << "Usage: [options]" << std::endl;
-    out << description;
+    out <<
+      "beldex-lws-daemon - light wallet server for Beldex\n"
+      "\n"
+      "Usage:\n"
+      "  beldex-lws-daemon --daemon <beldexd url> --rest-server <url> [options]\n"
+      << description <<
+      "\n"
+      "--rest-server defaults to https and needs --rest-ssl-key/-certificate.\n"
+      "--admin-rest-server is off unless given; bind it to loopback only.\n"
+      "\n"
+      "Setup, examples and procedures: src/lws/lightwallet_server.md\n";
   }
 
  boost::optional<program> get_program(int argc, char **argv)

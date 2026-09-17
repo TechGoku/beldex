@@ -104,13 +104,13 @@ namespace
 
     options()
       : lws::options()
-      , shadow_path{"shadow-path", "Directory for the rebuilt database (required)", ""}
-      , rescan_height{"rescan-height", "Height every account is rebuilt from; 0 rebuilds from the start of each account", 0}
-      , daemon_rpc{"daemon", "[(https|http)://<address>:]<port> of the beldexd this rebuild scans against", ""}
-      , daemon_backup{"daemon-backup", "Comma-separated additional beldexd endpoints to fail over to", ""}
-      , daemon_spread{"daemon-spread", "Fan scan threads across every endpoint. Worth enabling here: during a rebuild accounts genuinely sit at different heights", false}
-      , scan_threads{"scan-threads", "Threads for the rebuild scan; independent of the live server's", boost::thread::hardware_concurrency()}
-      , sync_interval{"sync-interval", "Seconds between polls of the live DB for newly registered accounts", 30}
+      , shadow_path{"shadow-path", "Directory for the rebuilt DB (required)", ""}
+      , rescan_height{"rescan-height", "Rebuild from this height; 0 = genesis", 0}
+      , daemon_rpc{"daemon", "beldexd JSON-RPC to scan (required)", ""}
+      , daemon_backup{"daemon-backup", "More beldexd endpoints, comma-separated", ""}
+      , daemon_spread{"daemon-spread", "Spread scan threads over all endpoints", false}
+      , scan_threads{"scan-threads", "Threads for this rebuild's scan", boost::thread::hardware_concurrency()}
+      , sync_interval{"sync-interval", "Seconds between new-account checks", 30}
       /* Deliberately far higher than the daemon's 30s. Adding an account
          restarts the scan threads, and a restart reloads every account whose
          scan height moved - during a rebuild, all of them. A server that
@@ -118,34 +118,49 @@ namespace
          here means restarting and reloading continuously instead of scanning.
          New accounts still arrive well before the switch, which is the only
          deadline that matters: `/switch_db` refuses if any is missing. */
-      , restart_coalesce{"restart-coalesce", "Seconds to batch newly seeded accounts before restarting the rebuild scan threads", 900}
+      , restart_coalesce{"restart-coalesce", "Seconds to batch new accounts", 900}
       , progress_interval{"progress-interval", "Seconds between progress lines", 30}
-      , log_level{"log-level", "Log level 0-4; progress is always printed", 0}
-      , switch_admin{"switch-admin", "Admin REST endpoint of the running beldex-lws-daemon, e.g. http://127.0.0.1:28091", ""}
-      , switch_key_file{"switch-admin-key-file", "File holding the admin account's view key (kept out of the process list)", ""}
-      , switch_backup_path{"switch-backup-path", "Where the daemon writes its mandatory pre-switch backup", ""}
-      , switch_when_ready{"switch-when-ready", "Once the shadow has caught up, tell the daemon to switch onto it and exit", false}
-      , status{"status", "Print rebuild progress and exit", false}
+      , log_level{"log-level", "0-4; progress always prints", 0}
+      , switch_admin{"switch-admin", "Daemon's --admin-rest-server address", ""}
+      , switch_key_file{"switch-admin-key-file", "File holding an admin view key", ""}
+      , switch_backup_path{"switch-backup-path", "Where the daemon backs up before switching", ""}
+      , switch_when_ready{"switch-when-ready", "Switch the daemon over, then exit", false}
+      , status{"status", "Print progress and exit", false}
     {}
 
     void prepare(boost::program_options::options_description& description) const
     {
       lws::options::prepare(description);
-      command_line::add_arg(description, shadow_path);
-      command_line::add_arg(description, rescan_height);
-      command_line::add_arg(description, daemon_rpc);
-      command_line::add_arg(description, daemon_backup);
-      command_line::add_arg(description, daemon_spread);
-      command_line::add_arg(description, scan_threads);
-      command_line::add_arg(description, sync_interval);
-      command_line::add_arg(description, restart_coalesce);
-      command_line::add_arg(description, progress_interval);
-      command_line::add_arg(description, log_level);
-      command_line::add_arg(description, switch_admin);
-      command_line::add_arg(description, switch_key_file);
-      command_line::add_arg(description, switch_backup_path);
-      command_line::add_arg(description, switch_when_ready);
-      command_line::add_arg(description, status);
+
+      boost::program_options::options_description rebuild{"Rebuild"};
+      command_line::add_arg(rebuild, shadow_path);
+      command_line::add_arg(rebuild, rescan_height);
+      command_line::add_arg(rebuild, status);
+      description.add(rebuild);
+
+      boost::program_options::options_description daemon{"Beldexd connection"};
+      command_line::add_arg(daemon, daemon_rpc);
+      command_line::add_arg(daemon, daemon_backup);
+      command_line::add_arg(daemon, daemon_spread);
+      description.add(daemon);
+
+      boost::program_options::options_description tuning{"Tuning"};
+      command_line::add_arg(tuning, scan_threads);
+      command_line::add_arg(tuning, sync_interval);
+      command_line::add_arg(tuning, restart_coalesce);
+      description.add(tuning);
+
+      boost::program_options::options_description output{"Output"};
+      command_line::add_arg(output, progress_interval);
+      command_line::add_arg(output, log_level);
+      description.add(output);
+
+      boost::program_options::options_description cutover{"Cutover (optional)"};
+      command_line::add_arg(cutover, switch_when_ready);
+      command_line::add_arg(cutover, switch_admin);
+      command_line::add_arg(cutover, switch_key_file);
+      command_line::add_arg(cutover, switch_backup_path);
+      description.add(cutover);
     }
   };
 
@@ -170,18 +185,27 @@ namespace
 
   void print_help(std::ostream& out)
   {
-    boost::program_options::options_description description{"Options"};
+    boost::program_options::options_description description{};
     options{}.prepare(description);
 
-    out << "Usage: [options]" << std::endl;
-    out << std::endl;
-    out << "Rebuilds the LWS database from chain into --shadow-path while the live" << std::endl;
-    out << "server at --db-path keeps running and serving. The live database is" << std::endl;
-    out << "opened read-only and is never modified." << std::endl;
-    out << std::endl;
-    out << "When the shadow has caught up, switch the running daemon onto it with" << std::endl;
-    out << "the admin /switch_db endpoint. Nothing is ever deleted by this tool." << std::endl;
-    out << description;
+    out <<
+      "beldex-lws-rebuild - rescan every account into a new database, no downtime\n"
+      "\n"
+      "Usage:\n"
+      "  beldex-lws-rebuild --shadow-path <new db> --daemon <url> [options]\n"
+      "  beldex-lws-rebuild --shadow-path <new db> --status\n"
+      "\n"
+      "Builds a second database while the live server keeps serving. The live\n"
+      "database is opened read-only and never modified. A rollback is the same\n"
+      "command with a lower --rescan-height.\n"
+      << description <<
+      "\n"
+      "Stopping is safe: every batch is committed, re-running resumes, and\n"
+      "nothing is ever deleted. Cutover needs a daemon started with\n"
+      "--admin-rest-server; the daemon performs the switch, backs up what it\n"
+      "leaves, and refuses if the shadow is missing anything.\n"
+      "\n"
+      "Setup, examples and procedures: src/lws/lightwallet_server.md\n";
   }
 
   /*! Normalise one daemon endpoint exactly as beldex-lws-daemon does.
@@ -237,7 +261,7 @@ namespace
     const options opts{};
     boost::program_options::variables_map args{};
     {
-      boost::program_options::options_description description{"Options"};
+      boost::program_options::options_description description{};
       opts.prepare(description);
 
       boost::program_options::store(

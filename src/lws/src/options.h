@@ -35,16 +35,39 @@ namespace lws
     const command_line::arg_descriptor<std::string> network;
 
     options()
-       : db_path{"db-path", "Folder for LMDB files", default_db_dir + default_db_subdir}
-      , network{"network", "<\"main\"|\"dev\"|\"test\"> -Blockchain net type", "main"}
+       : db_path{"db-path", "LMDB database directory", default_db_dir + default_db_subdir}
+      , network{"network", "main, dev or test", "main"}
     {}
 
+    /*! \return The options every LWS tool understands, as a captioned group.
+
+        Returned as a group rather than added to one flat list so each tool's
+        `--help` can present related options together. `options_description::add`
+        keeps the caption when the parent is printed. */
+    boost::program_options::options_description database_group() const
+    {
+      boost::program_options::options_description group{"Database and network"};
+      command_line::add_arg(group, db_path);
+      command_line::add_arg(group, network);
+      return group;
+    }
+
+    //! \return Options every tool shares that are not about the database.
+    static boost::program_options::options_description general_group()
+    {
+      boost::program_options::options_description group{"General"};
+      command_line::add_arg(group, command_line::arg_help);
+      return group;
+    }
+
+    /*! Add every shared option to `description`.
+
+        Tools call this first and then add their own groups, so the shared
+        options appear first and in the same order everywhere. */
     void prepare(boost::program_options::options_description& description) const
     {
-
-      command_line::add_arg(description, db_path);
-      command_line::add_arg(description, network);
-      command_line::add_arg(description, command_line::arg_help);
+      description.add(general_group());
+      description.add(database_group());
     }
 
     void set_network(boost::program_options::variables_map const& args) const
