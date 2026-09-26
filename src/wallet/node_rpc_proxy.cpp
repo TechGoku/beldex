@@ -110,6 +110,7 @@ bool NodeRPCProxy::get_info() const
       // Parse into temporary variables first
       uint64_t height = res.at("height").get<uint64_t>();
       uint64_t target_height = res.at("target_height").get<uint64_t>();
+      uint64_t immutable_height = 0;
 
       uint64_t block_weight_limit;
       auto it_block_weight_limit = res.find("block_weight_limit");
@@ -118,8 +119,6 @@ bool NodeRPCProxy::get_info() const
         block_weight_limit = it_block_weight_limit->get<uint64_t>();
       else
         block_weight_limit = res.at("block_size_limit").get<uint64_t>();
-
-      uint64_t immutable_height = 0;
       auto it_immutable_height = res.find("immutable_height");
 
       if (it_immutable_height != res.end())

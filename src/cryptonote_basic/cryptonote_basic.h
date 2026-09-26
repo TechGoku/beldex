@@ -92,10 +92,10 @@ namespace cryptonote
     crypto::public_key key;
   };
 
-  // Private token output (HF21+).
+  // Privacy token output (HF21+).
   // Carries a blinded token ID and a Pedersen amount commitment; the plaintext
   // amount and token identity are only recoverable by the recipient.
-  struct tx_out_zarcanum
+  struct tx_out_zyphora
   {
     crypto::public_key stealth_address   = crypto::null_pkey; // one-time stealth address
     crypto::public_key amount_commitment = crypto::null_pkey; // C = amount*T + mask*G (T = blinded_token_id)
@@ -167,10 +167,10 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
-  // Private-token/ZC input scaffold. This variant is introduced so tx construction and
+  // Privacy-token/ZY input scaffold. This variant is introduced so tx construction and
   // verification code can progressively adopt PT-specific signing/proof logic without changing
   // legacy txin_to_key semantics.
-  struct txin_zc_input
+  struct txin_zy_input
   {
     std::vector<uint64_t> key_offsets;
     crypto::key_image k_image;
@@ -182,9 +182,9 @@ namespace cryptonote
   };
 
 
-  using txin_v = std::variant<txin_gen, txin_to_script, txin_to_scripthash, txin_to_key, txin_zc_input>;
+  using txin_v = std::variant<txin_gen, txin_to_script, txin_to_scripthash, txin_to_key, txin_zy_input>;
 
-  using txout_target_v = std::variant<txout_to_script, txout_to_scripthash, txout_to_key, tx_out_zarcanum>;
+  using txout_target_v = std::variant<txout_to_script, txout_to_scripthash, txout_to_key, tx_out_zyphora>;
 
   //typedef std::pair<uint64_t, txout> out_t;
   struct tx_out
@@ -219,7 +219,7 @@ namespace cryptonote
     txversion version;
     txtype type;
 
-    bool is_transfer() const { return type == txtype::standard || type == txtype::stake || type == txtype::beldex_name_system || type == txtype::coin_burn || type == txtype::register_private_token || type == txtype::mint_token || type == txtype::update_token || type == txtype::burn_token; }
+    bool is_transfer() const { return type == txtype::standard || type == txtype::stake || type == txtype::beldex_name_system || type == txtype::coin_burn || type == txtype::register_privacy_token || type == txtype::mint_token || type == txtype::update_token || type == txtype::burn_token; }
 
     // not used after version 2, but remains for compatibility
     uint64_t unlock_time;  //number of block (or time), used as a limitation like: spend this tx not early then block/time
@@ -281,17 +281,17 @@ namespace cryptonote
     std::vector<std::vector<crypto::signature>> signatures; //count signatures  always the same as inputs count
     rct::rctSig rct_signatures;
 
-    // Private token input signatures (HF21+): one entry per confidential
-    // (zarcanum) input being spent, in tx.vin order. Each is a signature_v (a
-    // variant currently holding only ZC_sig), so it serializes as
-    // { "ZC_sig": {...} } inside the tx "signatures" array -- matching Zano,
-    // where ZC_sig is a signature_v rather than a proof_v. NOT in token_proofs.
-    std::vector<rct::signature_v> zc_sig;
+    // Privacy token input signatures (HF21+): one entry per confidential
+    // (zyphora) input being spent, in tx.vin order. Each is a signature_v (a
+    // variant currently holding only ZY_sig), so it serializes as
+    // { "ZY_sig": {...} } inside the tx "signatures" array -- matching Zano,
+    // where ZY_sig is a signature_v rather than a proof_v. NOT in token_proofs.
+    std::vector<rct::signature_v> zy_sig;
 
-    // Private token proofs (HF21+). Empty for non-token transactions.
-    // Contains: zc_token_surjection_proof, zc_balance_proof,
+    // Privacy token proofs (HF21+). Empty for non-token transactions.
+    // Contains: zy_token_surjection_proof, zy_balance_proof,
     //           token_operation_proof, token_operation_ownership_proof,
-    //           zc_outs_range_proof.
+    //           zy_outs_range_proof.
     std::vector<rct::token_proof_v> token_proofs;
 
     // hash cache
@@ -303,19 +303,19 @@ namespace cryptonote
     std::atomic<unsigned int> unprunable_size;
     std::atomic<unsigned int> prefix_size;
 
-    // Returns true if any output is a tx_out_zarcanum (private token).
-    bool has_zarcanum_outputs() const {
+    // Returns true if any output is a tx_out_zyphora (privacy token).
+    bool has_zyphora_outputs() const {
       return std::any_of(vout.begin(), vout.end(),
-        [](const tx_out& o){ return std::holds_alternative<tx_out_zarcanum>(o.target); });
+        [](const tx_out& o){ return std::holds_alternative<tx_out_zyphora>(o.target); });
     }
 
-    // Returns true if any input is a txin_zc_input (private token spend).
-    // Prefix-derivable, so it decides whether the tx carries a zc_sig
+    // Returns true if any input is a txin_zy_input (privacy token spend).
+    // Prefix-derivable, so it decides whether the tx carries a zy_sig
     // ("signatures") section on the wire -- for well-formed txs this equals
-    // !zc_sig.empty() (one ZC_sig per zc input).
-    bool has_zarcanum_inputs() const {
+    // !zy_sig.empty() (one ZY_sig per zy input).
+    bool has_zyphora_inputs() const {
       return std::any_of(vin.begin(), vin.end(),
-        [](const txin_v& i){ return std::holds_alternative<txin_zc_input>(i); });
+        [](const txin_v& i){ return std::holds_alternative<txin_zy_input>(i); });
     }
 
     transaction() { set_null(); }
@@ -384,13 +384,13 @@ namespace cryptonote
       {
         if (!vin.empty())
         {
-          // HF21: zarcanum (tx_out_zarcanum) outputs carry their own
+          // HF21: zyphora (tx_out_zyphora) outputs carry their own
           // commitments/range proofs in token_proofs, not in the native rct
           // ecdhInfo/outPk/bulletproof arrays -- those are sized to the
-          // non-zarcanum output count (mirrors expand_transaction_1).
+          // non-zyphora output count (mirrors expand_transaction_1).
           size_t native_outputs = 0;
           for (const auto& o : vout)
-            if (!std::holds_alternative<tx_out_zarcanum>(o.target))
+            if (!std::holds_alternative<tx_out_zyphora>(o.target))
               ++native_outputs;
           {
             ar.tag("rct_signatures");
@@ -410,11 +410,11 @@ namespace cryptonote
             {
               if (std::holds_alternative<txin_to_key>(vin[0]))
                 mixin = var::get<txin_to_key>(vin[0]).key_offsets.size() - 1;
-              else if (std::holds_alternative<txin_zc_input>(vin[0]))
-                mixin = var::get<txin_zc_input>(vin[0]).key_offsets.size() - 1;
+              else if (std::holds_alternative<txin_zy_input>(vin[0]))
+                mixin = var::get<txin_zy_input>(vin[0]).key_offsets.size() - 1;
             }
-            // HF21: zarcanum (txin_zc_input) inputs are proven via their own
-            // ZC_sig in token_proofs, not via the native CLSAGs/pseudoOuts
+            // HF21: zyphora (txin_zy_input) inputs are proven via their own
+            // ZY_sig in token_proofs, not via the native CLSAGs/pseudoOuts
             // arrays here -- those are sized to the native-only input count.
             size_t native_inputs = 0;
             for (const auto& in : vin)
@@ -423,28 +423,28 @@ namespace cryptonote
             rct_signatures.p.serialize_rctsig_prunable(ar, rct_signatures.type, native_inputs, native_outputs, mixin);
           }
 
-          // HF21: private token input signatures. Emitted first, under the
-          // "signatures" tag, as a signature_v vector (each a { "ZC_sig": {...} })
-          // -- keeping ZC_sig with the tx's signatures rather than lumped into
+          // HF21: privacy token input signatures. Emitted first, under the
+          // "signatures" tag, as a signature_v vector (each a { "ZY_sig": {...} })
+          // -- keeping ZY_sig with the tx's signatures rather than lumped into
           // the token proofs, as Zano does. Present only when the tx spends a
-          // zarcanum input; the gate is prefix-derivable (has_zarcanum_inputs)
+          // zyphora input; the gate is prefix-derivable (has_zyphora_inputs)
           // so the deserializer knows whether to read the field, and a tx with
-          // no zc inputs (e.g. register_private_token) omits it entirely rather than
+          // no zy inputs (e.g. register_privacy_token) omits it entirely rather than
           // serializing an empty array. This gate and order must stay identical
           // in calculate_transaction_prunable_hash or the prunable hash won't
           // reproduce.
-          if (has_zarcanum_inputs())
+          if (has_zyphora_inputs())
           {
             ar.tag("signatures");
-            serialization::value(ar, zc_sig);
+            serialization::value(ar, zy_sig);
           }
 
-          // HF21: private token proofs (present when has_zarcanum_outputs()
+          // HF21: privacy token proofs (present when has_zyphora_outputs()
           // or for update_token/burn_token txs). Burn-all transactions can
           // consume confidential inputs without producing any confidential
           // outputs, so the tx type must participate in the deserialization
           // gate or the trailing proof bytes will be left unread.
-          if (!token_proofs.empty() || has_zarcanum_outputs() || type == txtype::update_token || type == txtype::burn_token)
+          if (!token_proofs.empty() || has_zyphora_outputs() || type == txtype::update_token || type == txtype::burn_token)
           {
             ar.tag("token_proofs");
             serialization::value(ar, token_proofs);
@@ -464,11 +464,11 @@ namespace cryptonote
       {
         if (!vin.empty())
         {
-          // HF21: native rct arrays are sized to non-zarcanum outputs only
+          // HF21: native rct arrays are sized to non-zyphora outputs only
           // (see note in the main serializer above).
           size_t native_outputs = 0;
           for (const auto& o : vout)
-            if (!std::holds_alternative<tx_out_zarcanum>(o.target))
+            if (!std::holds_alternative<tx_out_zyphora>(o.target))
               ++native_outputs;
           ar.tag("rct_signatures");
           auto obj = ar.begin_object();
@@ -653,7 +653,7 @@ namespace cryptonote
   constexpr txtype transaction_prefix::get_max_type_for_hf(hf hf_version)
   {
     txtype result = txtype::standard;
-    if      (hf_version >= feature::PRIVATE_TOKENS) result = txtype::burn_token;
+    if      (hf_version >= feature::PRIVACY_TOKENS) result = txtype::burn_token;
     else if (hf_version >= hf::hf18_bns)              result = txtype::coin_burn;
     else if (hf_version >= hf::hf16)                  result = txtype::beldex_name_system;
     else if (hf_version >= hf::hf15_flash)            result = txtype::stake;
@@ -685,7 +685,7 @@ namespace cryptonote
       case txtype::stake:                   return "stake";
       case txtype::beldex_name_system:      return "beldex_name_system";
       case txtype::coin_burn:               return "coin_burn";
-      case txtype::register_private_token:  return "register_private_token";
+      case txtype::register_privacy_token:  return "register_privacy_token";
       case txtype::mint_token:              return "mint_token";
       case txtype::update_token:            return "update_token";
       case txtype::burn_token:              return "burn_token";
@@ -736,10 +736,10 @@ VARIANT_TAG(cryptonote::txin_gen, "gen", 0xff);
 VARIANT_TAG(cryptonote::txin_to_script, "script", 0x0);
 VARIANT_TAG(cryptonote::txin_to_scripthash, "scripthash", 0x1);
 VARIANT_TAG(cryptonote::txin_to_key, "key", 0x2);
-VARIANT_TAG(cryptonote::txin_zc_input, "zc_input", 0x3);
+VARIANT_TAG(cryptonote::txin_zy_input, "zy_input", 0x3);
 VARIANT_TAG(cryptonote::txout_to_script, "script", 0x0);
 VARIANT_TAG(cryptonote::txout_to_scripthash, "scripthash", 0x1);
 VARIANT_TAG(cryptonote::txout_to_key, "key", 0x2);
-VARIANT_TAG(cryptonote::tx_out_zarcanum, "zarcanum", 0x3);
+VARIANT_TAG(cryptonote::tx_out_zyphora, "zyphora", 0x3);
 VARIANT_TAG(cryptonote::transaction, "tx", 0xcc);
 VARIANT_TAG(cryptonote::block, "block", 0xbb);

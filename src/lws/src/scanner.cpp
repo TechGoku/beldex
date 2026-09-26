@@ -240,8 +240,8 @@ namespace lws
               }
             }
           }
-          else if (cryptonote::txin_zc_input const* const zc_data =
-                     std::get_if<cryptonote::txin_zc_input>(std::addressof(in)))
+          else if (cryptonote::txin_zy_input const* const zc_data =
+                     std::get_if<cryptonote::txin_zy_input>(std::addressof(in)))
           {
             /* HF22: the input side of a privacy-token spend - a burn, a mint, or
                a token transfer. Without this branch the spend is silently not
@@ -252,7 +252,7 @@ namespace lws
 
                Token outputs are stored under amount 0 (see the storing side
                below), so the lookup uses 0 rather than an input amount - which
-               txin_zc_input does not carry, the value being hidden in the
+               txin_zy_input does not carry, the value being hidden in the
                commitment. */
             mixin = boost::numeric_cast<std::uint32_t>(
               std::max(std::size_t(1), zc_data->key_offsets.size()) - 1
@@ -286,7 +286,7 @@ namespace lws
 
         std::size_t index = -1;
         // HF22: rct_signatures.outPk / ecdhInfo cover only the NATIVE outputs,
-        // while `index` walks every vout. A token tx interleaves zarcanum
+        // while `index` walks every vout. A token tx interleaves zyphora
         // outputs with native ones (fee change, registration collateral), so
         // indexing those vectors by vout position runs off the end -- a 12
         // output registration has just 2 entries. Track the native ordinal
@@ -298,19 +298,19 @@ namespace lws
           // std::cout << "entered in vout " << std::endl;
           ++index;
           const bool is_native_out =
-              std::get_if<cryptonote::tx_out_zarcanum>(std::addressof(out.target)) == nullptr;
+              std::get_if<cryptonote::tx_out_zyphora>(std::addressof(out.target)) == nullptr;
           const std::size_t this_native_index = native_index;
           if (is_native_out)
             ++native_index;
 
           cryptonote::txout_to_key const* const out_data =
               std::get_if<cryptonote::txout_to_key>(std::addressof(out.target));
-          // HF22: a private-token output is a tx_out_zarcanum, which carries its
+          // HF22: a private-token output is a tx_out_zyphora, which carries its
           // one-time key as `stealth_address` rather than `key`. Ownership is
           // decided identically from there. Before this, the get_if above
           // returned null for these and every token output was silently skipped.
-          cryptonote::tx_out_zarcanum const* const zout_data =
-              std::get_if<cryptonote::tx_out_zarcanum>(std::addressof(out.target));
+          cryptonote::tx_out_zyphora const* const zout_data =
+              std::get_if<cryptonote::tx_out_zyphora>(std::addressof(out.target));
           if (!out_data && !zout_data)
             continue; // to next output
 
@@ -338,7 +338,7 @@ namespace lws
           if (zout_data)
           {
             // HF22: recover the plaintext token id and amount. `acc` is unused
-            // by decode_zarcanum_output -- everything it needs comes from the
+            // by decode_zyphora_output -- everything it needs comes from the
             // derivation and the output itself -- which is what lets a
             // view-only server decode these at all. It re-derives the amount
             // commitment and returns false on mismatch, so a corrupt or
@@ -346,7 +346,7 @@ namespace lws
             const cryptonote::account_keys view_only{};
             rct::key amount_mask{};
             rct::key token_blinding_mask{};
-            if (!cryptonote::decode_zarcanum_output(
+            if (!cryptonote::decode_zyphora_output(
                   view_only, *zout_data, derived, index,
                   amount, token_id, amount_mask, token_blinding_mask))
             {

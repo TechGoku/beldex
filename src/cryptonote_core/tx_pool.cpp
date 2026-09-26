@@ -30,12 +30,16 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #include <algorithm>
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "common/util.h"
 #include "tx_pool.h"
 #include "cryptonote_tx_utils.h"
+#include "beldex_economy.h"
+#include "cryptonote_basic/token_descriptor_operation_utils.h"
 #include "cryptonote_basic/cryptonote_boost_serialization.h"
 #include "cryptonote_core/master_node_list.h"
 #include "cryptonote_config.h"
@@ -217,9 +221,49 @@ namespace cryptonote
         }
       }
     }
+    else if (tx.type == txtype::mint_token)
+    {
+      // At most one mint_token tx per token_id may sit in the pool at a time:
+      // two mints of the same token can each individually validate against
+      // committed DB state (check_tx_inputs never sees the other), but if
+      // both land in the same block the second one can push current_supply
+      // over total_max_supply -- a check that only runs cumulatively at
+      // block-add time (Blockchain::handle_block_to_main_chain), so the
+      // whole block would be built then rejected. Same rationale as the BNS
+      // buy check above; see also token_ops_this_block in fill_block_template
+      // for the (reorg-proof) check that fully closes this at block-build time.
+      cryptonote::tx_extra_token_descriptor_operation data{};
+      if (!cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, data))
+      {
+        MERROR("Could not get token descriptor operation from tx: " << get_transaction_hash(tx) << ", tx to add is possibly invalid, rejecting");
+        return true;
+      }
+      const crypto::token_id token_id = cryptonote::get_or_calculate_token_id(data);
+
+      std::vector<transaction> pool_txs;
+      get_transactions(pool_txs);
+      for (const transaction& pool_tx : pool_txs)
+      {
+        if (pool_tx.type != tx.type)
+          continue;
+
+        cryptonote::tx_extra_token_descriptor_operation pool_data{};
+        if (!cryptonote::get_token_descriptor_operation_from_tx_extra(pool_tx.extra, pool_data))
+        {
+          LOG_PRINT_L1("Could not get token descriptor operation from tx: " << get_transaction_hash(tx) << ", possibly corrupt tx in the pool");
+          return true;
+        }
+
+        if (token_id == cryptonote::get_or_calculate_token_id(pool_data))
+        {
+          LOG_PRINT_L1("New TX: " << get_transaction_hash(tx) << ", has TX: " << get_transaction_hash(pool_tx) << " from the pool that is already minting the same token_id.");
+          return true;
+        }
+      }
+    }
     else
     {
-      if (tx.type != txtype::standard && tx.type != txtype::stake && tx.type != txtype::coin_burn && tx.type != txtype::register_private_token && tx.type != txtype::mint_token && tx.type != txtype::update_token && tx.type != txtype::burn_token)
+      if (tx.type != txtype::standard && tx.type != txtype::stake && tx.type != txtype::coin_burn && tx.type != txtype::register_privacy_token && tx.type != txtype::mint_token && tx.type != txtype::update_token && tx.type != txtype::burn_token)
       {
         // NOTE(beldex): This is a developer error. If we come across this in production, be conservative and just reject
         MERROR("Unrecognised transaction type: " << tx.type << " for tx: " << get_transaction_hash(tx));
@@ -263,17 +307,19 @@ namespace cryptonote
 
     if(tx.type == txtype::key_image_unlock)
     {
-      if(hf_version  >= hf::hf18_bns)
+      if(!opts.kept_by_block && hf_version  >= hf::hf18_bns)
       {
         crypto::public_key mnode_key;
         if (!cryptonote::get_master_node_pubkey_from_tx_extra(tx.extra, mnode_key))
           return false;
-      
+
         cryptonote::tx_extra_tx_key_image_unlock unlock;
         if (!cryptonote::get_field_from_tx_extra(tx.extra, unlock))
           return false;
-      
+
         uint64_t block_height = m_blockchain.get_current_blockchain_height();
+        if (!m_blockchain.get_master_node_list().is_master_node(mnode_key, /*require_active=*/false))
+          return false;
         const master_nodes::master_node_info &node_info = m_blockchain.get_master_node_list().get_master_node_details(mnode_key);
 
         for (const auto &contributor : node_info.contributors)
@@ -295,7 +341,7 @@ namespace cryptonote
               return false;
             }
           }
-        }      
+        }
       }
     }
 
@@ -756,6 +802,29 @@ namespace cryptonote
     const auto it = stc_it ? *stc_it : find_tx_in_sorted_container(txid);
     if (it == m_txs_by_fee_and_receive_time.end())
     {
+      if (!stc_it)
+      {
+        // Not in the sorted container. Usually fully removed, but a tx can be sorted-erased while
+        // still present in the backing store (DB row, key images, counted weight). Check the backend
+        // before returning success so we don't leave orphaned key images behind.
+        txpool_tx_meta_t orphan_meta;
+        if (!m_blockchain.get_txpool_tx_meta(txid, orphan_meta))
+        {
+          MWARNING("remove_tx: tx " << txid << " not in sorted container or backend, treating as already-removed");
+          return true;
+        }
+        cryptonote::blobdata orphan_blob = m_blockchain.get_txpool_tx_blob(txid);
+        cryptonote::transaction_prefix orphan_tx;
+        if (!parse_and_validate_tx_prefix_from_blob(orphan_blob, orphan_tx))
+        {
+          MERROR("remove_tx: tx " << txid << " present in backend but unparseable; leaving for manual cleanup");
+          return false;
+        }
+        m_blockchain.remove_txpool_tx(txid);
+        m_txpool_weight -= orphan_meta.weight;
+        remove_transaction_keyimages(orphan_tx, txid);
+        return true;
+      }
       MERROR("Failed to find tx in txpool sorted list");
       return false;
     }
@@ -785,7 +854,9 @@ namespace cryptonote
     MINFO("Removing tx " << txid << " from txpool: weight: " << meta->weight << ", fee/byte: " << tx_fee);
     m_blockchain.remove_txpool_tx(txid);
     m_txpool_weight -= meta->weight;
-    remove_transaction_keyimages(tx, txid);
+    if (!remove_transaction_keyimages(tx, txid))
+      MERROR("Failed to remove key images for tx " << txid << " being removed from the txpool; "
+             "the spent key image map may be inconsistent until restart");
     m_txs_by_fee_and_receive_time.erase(it);
 
     return true;
@@ -865,48 +936,77 @@ namespace cryptonote
   //---------------------------------------------------------------------------------
   bool tx_memory_pool::insert_key_images(const transaction_prefix &tx, const crypto::hash &id, bool kept_by_block)
   {
+    std::vector<crypto::key_image> key_images_to_insert;
+    key_images_to_insert.reserve(tx.vin.size());
+
+    std::unordered_set<crypto::key_image> seen_key_images;
+    seen_key_images.reserve(tx.vin.size());
+
     for(const auto& in: tx.vin)
     {
-      const crypto::key_image& ki = get_input_key_image(in);
-      std::unordered_set<crypto::hash>& kei_image_set = m_spent_key_images[ki];
-      CHECK_AND_ASSERT_MES(kept_by_block || kei_image_set.size() == 0, false, "internal error: kept_by_block=" << kept_by_block
-                                          << ",  kei_image_set.size()=" << kei_image_set.size() << "\ntxin.k_image=" << ki
-                                          << "\ntx_id=" << id );
-      auto ins_res = kei_image_set.insert(id);
-      CHECK_AND_ASSERT_MES(ins_res.second, false, "internal error: try to insert duplicate iterator in key_image set");
+      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, txin, false);
+      CHECK_AND_ASSERT_MES(seen_key_images.insert(txin.k_image).second,
+          false,
+          "duplicate key image in transaction: " << txin.k_image
+          << "\ntx_id=" << id);
+      auto it = m_spent_key_images.find(txin.k_image);
+      if (it != m_spent_key_images.end())
+      {
+        const std::unordered_set<crypto::hash>& kei_image_set = it->second;
+        CHECK_AND_ASSERT_MES(kept_by_block || kei_image_set.size() == 0, false, "internal error: kept_by_block=" << kept_by_block
+                                            << ",  kei_image_set.size()=" << kei_image_set.size() << "\ntxin.k_image=" << txin.k_image
+                                            << "\ntx_id=" << id );
+        CHECK_AND_ASSERT_MES(kei_image_set.count(id) == 0, false, "internal error: try to insert duplicate iterator in key_image set");
+      }
+      key_images_to_insert.push_back(txin.k_image);
     }
+
+    for (const crypto::key_image &k_image : key_images_to_insert)
+      m_spent_key_images[k_image].insert(id);
+
     ++m_cookie;
     return true;
   }
   //---------------------------------------------------------------------------------
-  //FIXME: Can return early before removal of all of the key images.
-  //       At the least, need to make sure that a false return here
-  //       is treated properly.  Should probably not return early, however.
   bool tx_memory_pool::remove_transaction_keyimages(const transaction_prefix& tx, const crypto::hash &actual_hash)
   {
     auto locks = tools::unique_locks(m_transactions_lock, m_blockchain);
 
-    // ND: Speedup
+    std::vector<crypto::key_image> key_images_to_erase;
+    key_images_to_erase.reserve(tx.vin.size());
+
+    std::unordered_set<crypto::key_image> seen_key_images;
+    seen_key_images.reserve(tx.vin.size());
+
     for(const txin_v& vi: tx.vin)
     {
-      const crypto::key_image& ki = get_input_key_image(vi);
-      auto it = m_spent_key_images.find(ki);
-      CHECK_AND_ASSERT_MES(it != m_spent_key_images.end(), false, "failed to find transaction input in key images. img=" << ki
+      CHECKED_GET_SPECIFIC_VARIANT(vi, txin_to_key, txin, false);
+
+      CHECK_AND_ASSERT_MES(seen_key_images.insert(txin.k_image).second, false, "duplicate key image in transaction: "
+                                    << txin.k_image << "\ntransaction id = " << actual_hash);
+
+      auto it = m_spent_key_images.find(txin.k_image);
+      CHECK_AND_ASSERT_MES(it != m_spent_key_images.end(), false, "failed to find transaction input in key images. img=" << txin.k_image
                                     << "\ntransaction id = " << actual_hash);
-      std::unordered_set<crypto::hash>& key_image_set =  it->second;
-      CHECK_AND_ASSERT_MES(key_image_set.size(), false, "empty key_image set, img=" << ki
+      const std::unordered_set<crypto::hash>& key_image_set = it->second;
+      CHECK_AND_ASSERT_MES(key_image_set.size(), false, "empty key_image set, img=" << txin.k_image
         << "\ntransaction id = " << actual_hash);
 
-      auto it_in_set = key_image_set.find(actual_hash);
-      CHECK_AND_ASSERT_MES(it_in_set != key_image_set.end(), false, "transaction id not found in key_image set, img=" << ki
+      CHECK_AND_ASSERT_MES(key_image_set.count(actual_hash), false, "transaction id not found in key_image set, img=" << txin.k_image
         << "\ntransaction id = " << actual_hash);
-      key_image_set.erase(it_in_set);
-      if(!key_image_set.size())
+      key_images_to_erase.push_back(txin.k_image);
+    }
+
+    for (const crypto::key_image &k_image : key_images_to_erase)
+    {
+      auto it = m_spent_key_images.find(k_image);
+      if (it == m_spent_key_images.end())
+        continue;
+      it->second.erase(actual_hash);
+      if (it->second.empty())
       {
-        //it is now empty hash container for this key_image
         m_spent_key_images.erase(it);
       }
-
     }
     ++m_cookie;
     return true;
@@ -959,7 +1059,9 @@ namespace cryptonote
       // remove first, in case this throws, so key images aren't removed
       m_blockchain.remove_txpool_tx(id);
       m_txpool_weight -= tx_weight;
-      remove_transaction_keyimages(tx, id);
+      if (!remove_transaction_keyimages(tx, id))
+        MERROR("Failed to remove key images for tx " << id << " taken from the txpool; "
+               "the spent key image map may be inconsistent until restart");
       lock.commit();
     }
     catch (const std::exception &e)
@@ -1043,7 +1145,9 @@ namespace cryptonote
             // remove first, so we only remove key images if the tx removal succeeds
             m_blockchain.remove_txpool_tx(txid);
             m_txpool_weight -= entry.second;
-            remove_transaction_keyimages(tx, txid);
+            if (!remove_transaction_keyimages(tx, txid))
+              MERROR("Failed to remove key images for stuck tx " << txid << "; "
+                     "the spent key image map may be inconsistent until restart");
           }
         }
         catch (const std::exception &e)
@@ -1290,7 +1394,6 @@ namespace cryptonote
         h.second += i2->second.second;
       }
     }
-    
     return stats;
   }
   //---------------------------------------------------------------------------------
@@ -1449,6 +1552,7 @@ namespace cryptonote
     auto locks = tools::unique_locks(m_transactions_lock, m_blockchain);
 
     bool ret = false;
+    std::unordered_set<crypto::hash> seen;
     for(const auto& in: tx.vin)
     {
       auto it = m_spent_key_images.find(get_input_key_image(in));
@@ -1457,7 +1561,9 @@ namespace cryptonote
         if (!conflicting)
           return true;
         ret = true;
-        conflicting->insert(conflicting->end(), it->second.begin(), it->second.end());
+        for (const auto &h : it->second)
+          if (seen.insert(h).second)
+            conflicting->push_back(h);
       }
     }
     return ret;
@@ -1716,12 +1822,13 @@ end:
   }
   //---------------------------------------------------------------------------------
   //TODO: investigate whether boolean return is appropriate
-  bool tx_memory_pool::fill_block_template(block &bl, size_t median_weight, uint64_t already_generated_coins, size_t &total_weight, uint64_t &raw_fee, uint64_t &expected_reward, hf version, uint64_t height)
+  bool tx_memory_pool::fill_block_template(block &bl, size_t median_weight, uint64_t already_generated_coins, size_t &total_weight, uint64_t &raw_fee, uint64_t &expected_reward, hf version, uint64_t height, uint64_t &registration_governance_fee, bool exclude_token_registrations)
   {
     auto locks = tools::unique_locks(m_transactions_lock, m_blockchain);
 
     total_weight         = 0;
     raw_fee              = 0;
+    registration_governance_fee = 0;
     uint64_t best_reward = 0;
     {
       // NOTE: Calculate base line empty block reward
@@ -1745,6 +1852,16 @@ end:
     // (otherwise the *block* will fail but validation won't, because validation here won't see the
     // earlier tx has having taken effect, but the block addition will).
     std::unordered_set<crypto::hash> bns_buys;
+    // Same problem, same fix, for token descriptor operations: at most one
+    // register/mint/update/burn op per token_id can go into a single block,
+    // because Blockchain::handle_block_to_main_chain applies them cumulatively
+    // (pending_token_states) and a second op on the same token_id would see
+    // state the per-tx check_tx_inputs validation never saw (e.g. two mints
+    // that individually validate against committed DB state but together
+    // exceed total_max_supply). Deliberately keyed on token_id only, not on
+    // op type, since ANY second op on the same token_id in one block hits the
+    // same cumulative-state gap.
+    std::unordered_set<crypto::token_id> token_ops_this_block;
   
     LOG_PRINT_L2("Filling block template, median weight " << median_weight << ", " << m_txs_by_fee_and_receive_time.size() << " txes in the pool");
 
@@ -1762,6 +1879,8 @@ end:
         continue;
       }
       LOG_PRINT_L2("Considering " << sorted_it.second << ", weight " << meta.weight << ", current block weight " << total_weight << "/" << max_total_weight << ", current reward " << print_money(best_reward));
+      std::optional<crypto::hash> pending_bns_buy;
+      std::vector<crypto::token_id> pending_token_ids;
 
       // Can not exceed maximum block weight
       if (max_total_weight < total_weight + meta.weight)
@@ -1770,38 +1889,10 @@ end:
         continue;
       }
 
-      // NOTE: Calculate the next block reward for the block producer
-      beldex_block_reward_context next_block_reward_context = {};
-      next_block_reward_context.height                    = height;
-      next_block_reward_context.fee                       = raw_fee + meta.fee;
-
-      block_reward_parts next_reward_parts           = {};
-      if(!get_beldex_block_reward(median_weight, total_weight + meta.weight, already_generated_coins, version, next_reward_parts, next_block_reward_context))
-      {
-        LOG_PRINT_L2("Block reward calculation bug");
-        return false;
-      }
-
-      // NOTE: Use the net fee for comparison (after penalty is applied).
-      // After HF16, penalty is applied on the miner fee. Before, penalty is
-      // applied on the base reward.
-      if (version >= hf::hf17_POS)
-      {
-        next_reward = next_reward_parts.miner_fee;
-      }
-      else
-      {
-        next_reward = next_reward_parts.base_miner + next_reward_parts.miner_fee;
-        assert(next_reward_parts.miner_fee == raw_fee + meta.fee);
-      }
-
-      // If we're getting lower reward tx, don't include this TX
-      if (next_reward < best_reward)
-      {
-        LOG_PRINT_L2("  would decrease reward to " << print_money(next_reward));
-        continue;
-      }
-
+      // NOTE: the transaction has to be fetched and parsed BEFORE the block reward is
+      // computed: from HF21 a register_privacy_token tx diverts part of the block's miner fee
+      // to governance, so the reward calculation is wrong unless we already know whether this
+      // candidate is one.
       cryptonote::blobdata txblob = m_blockchain.get_txpool_tx_blob(sorted_it.second);
       cryptonote::transaction tx;
 
@@ -1852,17 +1943,93 @@ end:
         // (one of the two will just get delayed for a block), and perfectly figuring out
         // whether two might conflict is complicated enough that it's not worth doing here.
         cryptonote::tx_extra_beldex_name_system bns;
-        if (cryptonote::get_field_from_tx_extra(tx.extra, bns) && bns.is_buying() &&
-          !bns_buys.emplace(bns.name_hash).second) {
+        if (cryptonote::get_field_from_tx_extra(tx.extra, bns) && bns.is_buying()) {
+          if (bns_buys.count(bns.name_hash)) {
+            LOG_PRINT_L2("  conflicting BNS buy in mempool");
+            continue;
+          }
+          pending_bns_buy = bns.name_hash;
+        }
+      }
+      const bool is_token_registration =
+          tx.type == txtype::register_privacy_token && version >= feature::PRIVACY_TOKENS;
+      if (is_token_registration && exclude_token_registrations)
+      {
+        LOG_PRINT_L2("  token registrations excluded from this template");
+        continue;
+      }
 
-          LOG_PRINT_L2("  conflicting BNS buy in mempool");
+      const bool is_token_tx =
+          version >= feature::PRIVACY_TOKENS &&
+          (is_token_registration || tx.type == txtype::mint_token ||
+           tx.type == txtype::update_token || tx.type == txtype::burn_token);
+
+      if (is_token_tx)
+      {
+        cryptonote::tx_extra_token_descriptor_operation tdo{};
+        size_t tdo_index = 0;
+        bool conflicting = false;
+        while (cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, tdo_index++))
+        {
+          const crypto::token_id tid = cryptonote::get_or_calculate_token_id(tdo);
+          if (token_ops_this_block.count(tid))
+          {
+            conflicting = true;
+            break;
+          }
+          pending_token_ids.push_back(tid);
+        }
+        if (conflicting)
+        {
+          LOG_PRINT_L2("  conflicting token operation (same token_id already in this block) in mempool");
           continue;
         }
+      }
+
+      // NOTE: Calculate the next block reward for the block producer
+      beldex_block_reward_context next_block_reward_context = {};
+      next_block_reward_context.height                    = height;
+      next_block_reward_context.fee                       = raw_fee + meta.fee;
+      const uint64_t candidate_registration_governance_fee =
+          registration_governance_fee +
+          (is_token_registration ? tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT : 0);
+      next_block_reward_context.registration_governance_fee = candidate_registration_governance_fee;
+      const size_t reward_weight = total_weight + meta.weight +
+          (candidate_registration_governance_fee ? COINBASE_BLOB_RESERVED_SIZE : 0);
+
+      block_reward_parts next_reward_parts           = {};
+      if(!get_beldex_block_reward(median_weight, reward_weight, already_generated_coins, version, next_reward_parts, next_block_reward_context))
+      {
+        LOG_PRINT_L2("  block reward calculation rejected this tx (insufficient fee for the "
+                     "governance carve-out, or block reward calculation bug); skipping");
+        continue;
+      }
+
+      if (version >= hf::hf17_POS)
+      {
+        next_reward = next_reward_parts.miner_fee;
+      }
+      else
+      {
+        next_reward = next_reward_parts.base_miner + next_reward_parts.miner_fee;
+        assert(next_reward_parts.miner_fee == raw_fee + meta.fee);
+      }
+
+      // If we're getting lower reward tx, don't include this TX
+      if (next_reward < best_reward)
+      {
+        LOG_PRINT_L2("  would decrease reward to " << print_money(next_reward));
+        continue;
       }
 
       bl.tx_hashes.push_back(sorted_it.second);
       total_weight += meta.weight;
       raw_fee      += meta.fee;
+      registration_governance_fee = candidate_registration_governance_fee;
+      if (pending_bns_buy)
+        bns_buys.insert(*pending_bns_buy);
+      for (const auto &tid : pending_token_ids)
+        token_ops_this_block.insert(tid);
       net_fee       = next_reward_parts.miner_fee;
       best_reward   = next_reward;
       append_key_images(k_images, tx);
@@ -1916,7 +2083,9 @@ end:
           // remove tx from db first
           m_blockchain.remove_txpool_tx(txid);
           m_txpool_weight -= get_transaction_weight(tx, txblob.size());
-          remove_transaction_keyimages(tx, txid);
+          if (!remove_transaction_keyimages(tx, txid))
+            MERROR("Failed to remove key images for tx " << txid << "; "
+                   "the spent key image map may be inconsistent until restart");
           auto sorted_it = find_tx_in_sorted_container(txid);
           if (sorted_it == m_txs_by_fee_and_receive_time.end())
           {

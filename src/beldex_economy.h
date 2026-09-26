@@ -154,6 +154,10 @@ namespace tokens
 {
 inline constexpr uint64_t REGISTRATION_COLLATERAL_AMOUNT = 10'000 * beldex::COIN;
 inline constexpr uint64_t REGISTRATION_COLLATERAL_LOCK_BLOCKS = 2880 * 30 * 6;
+inline constexpr uint64_t REGISTRATION_COLLATERAL_LOCK_TOLERANCE_BLOCKS = 60;
+inline constexpr uint64_t REGISTRATION_FEE_AMOUNT            = 1'000 * beldex::COIN;
+inline constexpr uint64_t REGISTRATION_FEE_BURN_AMOUNT       = REGISTRATION_FEE_AMOUNT / 2;
+inline constexpr uint64_t REGISTRATION_FEE_GOVERNANCE_AMOUNT = REGISTRATION_FEE_AMOUNT - REGISTRATION_FEE_BURN_AMOUNT;
 
 // Headroom added to a registration's collateral unlock height by the wallet.
 //
@@ -174,8 +178,8 @@ constexpr uint64_t burn_needed(cryptonote::hf hf_version, cryptonote::token_desc
 
   switch (static_cast<uint8_t>(op_type))
   {
-    case 1: // register_token (register_private_token)
-      return 0; // Registration uses locked collateral instead of burning BDX.
+    case 1: // register_token (register_privacy_token)
+      return REGISTRATION_FEE_BURN_AMOUNT;
     case 2: // mint_token
       return basic_fee / 2;  // Slightly low (e.g. 50 BDX)
     case 3: // update_token

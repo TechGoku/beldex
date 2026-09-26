@@ -238,6 +238,10 @@ bool verify_schnorr_sig(const rct::key&      msg,
                         const rct::key&      P,
                         const schnorr_sig_s& sig)
 {
+  try {
+    // Reject non-canonical response/challenge scalars (malleability guard).
+    if (sc_check(sig.y.bytes) != 0 || sc_check(sig.c.bytes) != 0) return false;
+
     // R' = y*G + c*P
     rct::key yG  = rct::scalarmultBase(sig.y);
     rct::key cP  = scalarmult(P, sig.c);
@@ -247,6 +251,8 @@ bool verify_schnorr_sig(const rct::key&      msg,
     // c' = H(msg || P || R')
     rct::key c_prime = hash_to_scalar_varargs({&msg, &P, &R_prime});
     return c_prime == sig.c;
+  }
+  catch (...) { return false; }   // invalid point encodings throw; treat as invalid proof
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +276,9 @@ bool verify_schnorr_sig_X(const rct::key&      msg,
                           const rct::key&      P,
                           const schnorr_sig_s& sig)
 {
+  try {
+    if (sc_check(sig.y.bytes) != 0 || sc_check(sig.c.bytes) != 0) return false;
+
     // R' = y*X + c*P
     rct::key yX     = rct::scalarmultX(sig.y);
     rct::key cP     = scalarmult(P, sig.c);
@@ -278,6 +287,8 @@ bool verify_schnorr_sig_X(const rct::key&      msg,
 
     rct::key c_prime = hash_to_scalar_varargs({&msg, &P, &R_prime});
     return c_prime == sig.c;
+  }
+  catch (...) { return false; }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +322,10 @@ bool verify_linear_composition_proof(const rct::key&                   msg,
                                      const rct::key&                   P,
                                      const linear_composition_proof_s& sig)
 {
+  try {
+    if (sc_check(sig.y0.bytes) != 0 || sc_check(sig.y1.bytes) != 0 || sc_check(sig.c.bytes) != 0)
+      return false;
+
     // R' = y0*G + y1*X + c*P
     rct::key y0G = rct::scalarmultBase(sig.y0);
     rct::key y1X = rct::scalarmultX(sig.y1);
@@ -322,6 +337,8 @@ bool verify_linear_composition_proof(const rct::key&                   msg,
 
     rct::key c_prime = hash_to_scalar_varargs({&msg, &P, &R_prime});
     return c_prime == sig.c;
+  }
+  catch (...) { return false; }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +372,10 @@ bool verify_double_schnorr_sig(const rct::key&              msg,
                                const rct::key&              P1,
                                const double_schnorr_sig_s&  sig)
 {
+  try {
+    if (sc_check(sig.y0.bytes) != 0 || sc_check(sig.y1.bytes) != 0 || sc_check(sig.c.bytes) != 0)
+      return false;
+
     // R0' = y0*X + c*P0,  R1' = y1*G + c*P1
     rct::key y0X = rct::scalarmultX(sig.y0);
     rct::key cP0 = scalarmult(P0, sig.c);
@@ -368,6 +389,8 @@ bool verify_double_schnorr_sig(const rct::key&              msg,
 
     rct::key c_prime = hash_to_scalar_varargs({&msg, &P0, &P1, &R0_prime, &R1_prime});
     return c_prime == sig.c;
+  }
+  catch (...) { return false; }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,20 +402,24 @@ bool verify_double_schnorr_sig(const rct::key&              msg,
 //   - Uses rct::key instead of Zano's scalar_t / point_t
 //   - Uses Beldex's ge_* low-level ops for point arithmetic
 //   - Hash via keccak / hash_to_scalar_varargs instead of Zano's hash_helper_t
-//   - Zarcanum's c_point_X replaced with rct::scalarmultX()
+//   - Zyphora's c_point_X replaced with rct::scalarmultX()
 //   - Premultiplication by 1/8 for on-chain storage (Beldex convention)
 
-// Compute the BGE challenge from context + ring + commitments
+// Bind the BGE challenge to the protocol, public statement, and commitments.
 static rct::key bge_challenge(const rct::key&  context_hash,
                                const rct::keyV& ring,
+                               const rct::key&  T,
                                const rct::key&  A,
                                const rct::key&  B,
                                const rct::keyV& Pk)
 {
-    // Concatenate: context_hash || ring[0..n-1] || A || B || Pk[0..m-1]
+    // Concatenate the fixed domain tag (without NUL), context_hash, ring, T,
+    // A, B, and Pk. All keys use their 32-byte encodings.
+    static constexpr char domain[] = "BELDEX_BGE_V1";
     std::vector<uint8_t> buf;
-    const size_t total = 1 + ring.size() + 2 + Pk.size();
-    buf.reserve(total * 32);
+    const size_t total = 1 + ring.size() + 1 + 2 + Pk.size();
+    buf.reserve(sizeof(domain) - 1 + total * 32);
+    buf.insert(buf.end(), domain, domain + sizeof(domain) - 1);
 
     auto push = [&](const rct::key& k){
         buf.insert(buf.end(), k.bytes, k.bytes + 32);
@@ -400,6 +427,7 @@ static rct::key bge_challenge(const rct::key&  context_hash,
 
     push(context_hash);
     for (const auto& r : ring) push(r);
+    push(T);
     push(A);
     push(B);
     for (const auto& pk : Pk) push(pk);
@@ -594,7 +622,7 @@ bool generate_BGE_proof(const rct::key&  context_hash,
     out.B = scalarmult_inv8(B_acc);
 
     // ── Fiat-Shamir challenge ────────────────────────────────────────────────
-    rct::key x = bge_challenge(context_hash, ring, out.A, out.B, out.Pk);
+    rct::key x = bge_challenge(context_hash, ring, T, out.A, out.B, out.Pk);
 
     // ── Response scalars f[j*(n-1) + (i-1)] for i in [1, n-1] ──────────────
     out.f.resize(m * (n - 1));
@@ -660,6 +688,7 @@ bool verify_BGE_proof(const rct::key&    context_hash,
                       const rct::key&    T,
                       const BGE_proof_s& sig)
 {
+  try {
     static constexpr size_t n = BGE_N;
 
     const size_t ring_size = ring.size();
@@ -671,8 +700,13 @@ bool verify_BGE_proof(const rct::key&    context_hash,
     if (sig.Pk.size() != m)         return false;
     if (sig.f.size() != m * (n - 1)) return false;
 
+    // Reject non-canonical response scalars (malleability guard).
+    if (sc_check(sig.y.bytes) != 0 || sc_check(sig.z.bytes) != 0) return false;
+    for (const auto& fi : sig.f)
+      if (sc_check(fi.bytes) != 0) return false;
+
     // ── Recompute challenge ──────────────────────────────────────────────────
-    rct::key x = bge_challenge(context_hash, ring, sig.A, sig.B, sig.Pk);
+    rct::key x = bge_challenge(context_hash, ring, T, sig.A, sig.B, sig.Pk);
 
     // ── f0[j] = x - sum_{i=1}^{n-1} f[j,i] ─────────────────────────────────
     std::vector<rct::key> f0(m);
@@ -772,13 +806,15 @@ bool verify_BGE_proof(const rct::key&    context_hash,
     rct::key identity;
     ge_p3_tobytes(identity.bytes, &ge_p3_identity);
     return Z == identity;
+  }
+  catch (...) { return false; }   // point_add/point_sub/scalarmult throw on invalid points
 }
 
 // ---------------------------------------------------------------------------
 // Vector HG aggregation proof
 // ---------------------------------------------------------------------------
 //
-// Adapted from Zano's vector_UG_aggregation_proof (src/crypto/zarcanum.cpp).
+// Adapted from Zano's vector_UG_aggregation_proof (src/crypto/zyphora.cpp).
 // See token_proofs.h for the proof's purpose and the Beldex-specific
 // adaptations: a fixed `tags[j]` per tx instead of Zano's per-output blinded
 // token tag, and the existing rct::H (rather than a dedicated new generator)
@@ -879,12 +915,18 @@ bool verify_vector_ug_aggregation_proof(const rct::key&  context_hash,
                                         const rct::keyV& tags,
                                         const vector_ug_aggregation_proof_s& sig)
 {
+  try {
     const size_t n = real_commitments.size();
     if (n == 0)                                                return false;
     if (tags.size()                                    != n)   return false;
     if (sig.amount_commitments_for_rp_aggregation.size() != n) return false;
     if (sig.y0s.size()                                  != n)  return false;
     if (sig.y1s.size()                                  != n)  return false;
+
+    // Reject non-canonical response/challenge scalars (malleability guard).
+    if (sc_check(sig.c.bytes) != 0) return false;
+    for (const auto& s : sig.y0s) if (sc_check(s.bytes) != 0) return false;
+    for (const auto& s : sig.y1s) if (sc_check(s.bytes) != 0) return false;
 
     std::vector<uint8_t> buf;
     buf.reserve((1 + 2 * n) * 32);
@@ -922,6 +964,8 @@ bool verify_vector_ug_aggregation_proof(const rct::key&  context_hash,
     rct::key c_prime = hash_buffer_to_scalar(buf);
 
     return c_prime == sig.c;
+  }
+  catch (...) { return false; }
 }
 
 } // namespace crypto

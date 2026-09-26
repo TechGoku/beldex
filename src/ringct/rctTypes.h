@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <vector>
 #include <cstdint>
+#include <stdexcept>
 #include <sodium/crypto_verify_32.h>
 
 extern "C" {
@@ -183,7 +184,7 @@ namespace rct {
         END_SERIALIZE()
     };
 
-    // 3-layer CLSAG over (G, G, X) for spending a tx_out_zarcanum (HF21+ private tokens).
+    // 3-layer CLSAG over (G, G, X) for spending a tx_out_zyphora (HF21+ privacy tokens).
     // Layer 0 (G): stealth address ownership.
     // Layer 1 (G): amount-commitment difference vs. the pseudo-output is a commitment to 0.
     // Layer 2 (X): blinded-token-id difference vs. the pseudo-output is a commitment to 0.
@@ -203,6 +204,8 @@ namespace rct {
             // FIELD(I) - not serialized, it can be reconstructed
             FIELD(D)
             FIELD(E)
+            if (s_g.empty() || s_g.size() != s_x.size())
+              throw std::runtime_error("Bad clsag_ggx serialization");
         END_SERIALIZE()
     };
 
@@ -704,16 +707,20 @@ VARIANT_TAG(rct::BulletproofPlus, "rct_bulletproof_plus", 0xa0);
 // both rct::key (defined above) and crypto::*_proof_s (defined in token_proofs.h).
 namespace rct {
 
-    // ── Private token proof wrappers (HF21+) ────────────────────────────
+    // ── Privacy token proof wrappers (HF21+) ────────────────────────────
     // Embedded in transaction::token_proofs.
 
-    struct zc_token_surjection_proof
+    struct zy_token_surjection_proof
     {
-      std::vector<crypto::BGE_proof_s> bge_proofs; // one per ZC output
-      BEGIN_SERIALIZE_OBJECT() FIELD(bge_proofs) END_SERIALIZE()
+      std::vector<crypto::BGE_proof_s> bge_proofs; // one per ZY output
+      BEGIN_SERIALIZE_OBJECT() 
+      FIELD(bge_proofs)
+        if (bge_proofs.empty())
+          throw std::runtime_error("Bad zy_token_surjection_proof serialization");
+      END_SERIALIZE()
     };
 
-    struct zc_balance_proof
+    struct zy_balance_proof
     {
       key P{};
       // Proves P = secret_x*X (the mask/G-component is forced to exactly
@@ -749,12 +756,12 @@ namespace rct {
       BEGIN_SERIALIZE_OBJECT() FIELD(sig) END_SERIALIZE()
     };
 
-    // HF21: ring signature spending a single tx_out_zarcanum (confidential
-    // token) input. Like Zano (where ZC_sig is a signature_v, not a proof_v),
-    // this is stored under the transaction's signatures (transaction::zc_sig),
+    // HF21: ring signature spending a single tx_out_zyphora (confidential
+    // token) input. Like Zano (where ZY_sig is a signature_v, not a proof_v),
+    // this is stored under the transaction's signatures (transaction::zy_sig),
     // NOT in transaction::token_proofs -- so it is intentionally absent from
     // token_proof_v below.
-    struct ZC_sig
+    struct ZY_sig
     {
       clsag_ggx clsag_sig;
       key       pseudo_out_amount_commitment;
@@ -766,12 +773,12 @@ namespace rct {
       END_SERIALIZE()
     };
 
-    // HF21: range proof for zarcanum output amounts (prevents integer
+    // HF21: range proof for zyphora output amounts (prevents integer
     // overflow / negative-amount inflation attacks). One per transaction,
-    // covering every zarcanum output in that tx. aggregation_proof binds the
+    // covering every zyphora output in that tx. aggregation_proof binds the
     // real per-output commitments to the fixed-generator auxiliary
     // commitments that bpp (an unmodified Bulletproof+) range-proves.
-    struct zc_outs_range_proof
+    struct zy_outs_range_proof
     {
       BulletproofPlus                       bpp;
       crypto::vector_ug_aggregation_proof_s aggregation_proof;
@@ -782,29 +789,29 @@ namespace rct {
     };
 
     using token_proof_v = std::variant<
-      zc_token_surjection_proof,
-      zc_balance_proof,
+      zy_token_surjection_proof,
+      zy_balance_proof,
       token_operation_proof,
       token_operation_ownership_proof,
-      zc_outs_range_proof
+      zy_outs_range_proof
     >;
 
     // HF21: transaction signature variant, modeled on Zano's signature_v.
-    // Currently the only alternative is ZC_sig (private-token input
+    // Currently the only alternative is ZY_sig (privacy-token input
     // signatures); wrapping it in a variant makes each element serialize under
-    // its own "ZC_sig" tag inside the tx "signatures" array (transaction::zc_sig),
-    // matching Zano's `"signatures": [ { "ZC_sig": {...} } ]` shape. Add further
+    // its own "ZY_sig" tag inside the tx "signatures" array (transaction::zy_sig),
+    // matching Zano's `"signatures": [ { "ZY_sig": {...} } ]` shape. Add further
     // signature kinds here as alternatives if/when needed.
-    using signature_v = std::variant<ZC_sig>;
+    using signature_v = std::variant<ZY_sig>;
 
 } // namespace rct (continued)
 
 // Variant tag registration for binary serialization of token_proof_v
-VARIANT_TAG(rct::zc_token_surjection_proof,       "zc_surjection", 0xb0);
-VARIANT_TAG(rct::zc_balance_proof,                "zc_balance",    0xb1);
+VARIANT_TAG(rct::zy_token_surjection_proof,       "zy_surjection", 0xb0);
+VARIANT_TAG(rct::zy_balance_proof,                "zy_balance",    0xb1);
 VARIANT_TAG(rct::token_operation_proof,           "token_op_proof",0xb2);
 VARIANT_TAG(rct::token_operation_ownership_proof, "token_owner",   0xb3);
-// ZC_sig is a signature_v alternative (transaction::zc_sig), not an
-// token_proof_v member; its tag lets it serialize as { "ZC_sig": {...} }.
-VARIANT_TAG(rct::ZC_sig,                          "ZC_sig",        0xb4);
-VARIANT_TAG(rct::zc_outs_range_proof,             "zc_range_proof",0xb5);
+// ZY_sig is a signature_v alternative (transaction::zy_sig), not an
+// token_proof_v member; its tag lets it serialize as { "ZY_sig": {...} }.
+VARIANT_TAG(rct::ZY_sig,                          "ZY_sig",        0xb4);
+VARIANT_TAG(rct::zy_outs_range_proof,             "zy_range_proof",0xb5);

@@ -258,7 +258,7 @@ namespace cryptonote
     // so by the time this runs the reader is positioned on the bare key.
     wire::read_bytes(source, self.key);
   }
-  static void read_bytes(wire::json_reader& source, tx_out_zarcanum& self)
+  static void read_bytes(wire::json_reader& source, tx_out_zyphora& self)
   {
     wire::object(source,
       wire::field("stealth_address", std::ref(self.stealth_address)),
@@ -272,12 +272,12 @@ namespace cryptonote
   static void read_bytes(wire::json_reader& source, txout_target_v& self)
   {
     // "target" holds a single-key object naming the output type -- the same
-    // shape txin_v uses. HF22 adds "zarcanum"; without it every block carrying
+    // shape txin_v uses. HF22 adds "zyphora"; without it every block carrying
     // a privacy-token output fails to parse and kills the scanner.
     wire::object(source,
       wire::variant_field("transaction output variant", std::ref(self),
         wire::option<txout_to_key>{"key"},
-        wire::option<tx_out_zarcanum>{"zarcanum"},
+        wire::option<tx_out_zyphora>{"zyphora"},
         wire::option<txout_to_script>{"to_script"},
         wire::option<txout_to_scripthash>{"to_scripthash"}
       )
@@ -309,7 +309,7 @@ namespace cryptonote
   }
   /* HF22: the input side of a privacy-token spend.
 
-     Mirrors tx_out_zarcanum on the output side. A token output is consumed by
+     Mirrors tx_out_zyphora on the output side. A token output is consumed by
      this variant rather than txin_to_key, so any transaction that SPENDS a
      token - a burn, a mint, a transfer - carries one. Without it the reader
      throws "Schema expected object" on the whole get_blocks_fast reply and the
@@ -318,7 +318,7 @@ namespace cryptonote
 
      The shape is txin_to_key's minus `amount` - a token amount is hidden in the
      commitment and is not on the input. */
-  static void read_bytes(wire::json_reader& source, txin_zc_input& self)
+  static void read_bytes(wire::json_reader& source, txin_zy_input& self)
   {
     wire::object(source,
       WIRE_FIELD(key_offsets),
@@ -331,7 +331,7 @@ namespace cryptonote
       wire::variant_field("transaction input variant", std::ref(self),
         wire::option<txin_to_key>{"key"},
         wire::option<txin_gen>{"gen"},
-        wire::option<txin_zc_input>{"zc_input"},
+        wire::option<txin_zy_input>{"zy_input"},
         wire::option<txin_to_script>{"to_script"},
         wire::option<txin_to_scripthash>{"to_scripthash"}
       )

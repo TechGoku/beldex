@@ -28,10 +28,11 @@ void store_token_history(BlockchainDB& db, const crypto::token_id& token_id, con
 bool append_tokens_from_transactions(BlockchainDB& db, const std::vector<transaction>& txs, std::string* reason = nullptr);
 bool rewind_tokens_from_transactions(BlockchainDB& db, const std::vector<transaction>& txs, std::string* reason = nullptr);
 bool validate_token_descriptor_operation(const tx_extra_token_descriptor_operation& op, std::string& reason);
-bool apply_token_operation_to_state(const crypto::token_id& token_id, const tx_extra_token_descriptor_operation& op, token_consensus_state& state, std::string& reason);
+bool apply_token_operation_to_state(const crypto::token_id& token_id, const tx_extra_token_descriptor_operation& op,
+                                    token_consensus_state& state, std::string& reason);
 bool load_token_state_from_history(BlockchainDB& db, const crypto::token_id& token_id, token_consensus_state& state, std::string& reason);
 // hf_version gates the HF21 fan-out rule (deploy/mint must produce
-// >= MIN_TOKEN_MINT_OUTPUTS tx_out_zarcanum outputs).
+// >= MIN_TOKEN_MINT_OUTPUTS tx_out_zyphora outputs).
 bool validate_tx_token_operations_against_db(BlockchainDB& db, const transaction& tx,
                                               std::string& reason, hf hf_version = hf::none);
 

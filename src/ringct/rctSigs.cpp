@@ -890,11 +890,11 @@ namespace rct {
       append_u64(tx.vin.size());
       for (size_t i = 0; i < tx.vin.size(); ++i)
       {
-        if (std::holds_alternative<cryptonote::txin_zc_input>(tx.vin[i]))
+        if (std::holds_alternative<cryptonote::txin_zy_input>(tx.vin[i]))
         {
           append_u8(1);
-          const auto& zc = std::get<cryptonote::txin_zc_input>(tx.vin[i]);
-          append(&zc.k_image, sizeof(zc.k_image));
+          const auto& zy = std::get<cryptonote::txin_zy_input>(tx.vin[i]);
+          append(&zy.k_image, sizeof(zy.k_image));
         }
         else
         {
@@ -913,16 +913,16 @@ namespace rct {
         }
       }
 
-      size_t zc_outs = 0;
+      size_t zy_outs = 0;
       for (const auto& out : tx.vout)
-        if (std::holds_alternative<cryptonote::tx_out_zarcanum>(out.target))
-          ++zc_outs;
-      append_u64(zc_outs);
+        if (std::holds_alternative<cryptonote::tx_out_zyphora>(out.target))
+          ++zy_outs;
+      append_u64(zy_outs);
       for (const auto& out : tx.vout)
       {
-        if (!std::holds_alternative<cryptonote::tx_out_zarcanum>(out.target))
+        if (!std::holds_alternative<cryptonote::tx_out_zyphora>(out.target))
           continue;
-        const auto& zout = std::get<cryptonote::tx_out_zarcanum>(out.target);
+        const auto& zout = std::get<cryptonote::tx_out_zyphora>(out.target);
         append(&zout.stealth_address, sizeof(zout.stealth_address));
         append(&zout.amount_commitment, sizeof(zout.amount_commitment));
         append(&zout.blinded_token_id, sizeof(zout.blinded_token_id));
@@ -1281,7 +1281,7 @@ namespace rct {
     //RCT simple    
     //for post-rct only
     rctSig genRctSimple(const key &message, const ctkeyV & inSk, const keyV & destinations, const std::vector<xmr_amount> &inamounts, const std::vector<xmr_amount> &outamounts, xmr_amount txnFee, const ctkeyM & mixRing, const keyV &amount_keys, const std::vector<multisig_kLRki> *kLRki, multisig_out *msout, const std::vector<unsigned int> & index, ctkeyV &outSk, const RCTConfig &rct_config, hw::device &hwdev, bool hash_bulletproof_plus) {
-        LOG_PRINT_L0("genRctSimple called with " << inSk.size() << " inputs, " << amount_keys.size() << " amount_keys, " << destinations.size() << " outputs, mixin " << mixRing.size() << ", index[0] " << (index.empty() ? 0 : index[0]) << ", kLRki " << (kLRki ? kLRki->size() : 0) << ", msout " << (msout ? 1 : 0));
+        MTRACE("genRctSimple called with " << inSk.size() << " inputs, " << amount_keys.size() << " amount_keys, " << destinations.size() << " outputs, mixin " << mixRing.size() << ", kLRki " << (kLRki ? kLRki->size() : 0) << ", msout " << (msout ? 1 : 0));
         const bool bulletproof_or_plus = rct_config.range_proof_type > RangeProofType::Borromean;
         CHECK_AND_ASSERT_THROW_MES(inamounts.size() > 0, "Empty inamounts");
         CHECK_AND_ASSERT_THROW_MES(inamounts.size() == inSk.size(), "Different number of inamounts/inSk");
@@ -1834,6 +1834,7 @@ namespace rct {
         CHECK_AND_ASSERT_MES(k.size() == rv.p.MGs.size(), false, "Mismatched k/MGs size");
         CHECK_AND_ASSERT_MES(k.size() == msout.c.size(), false, "Mismatched k/msout.c size");
         CHECK_AND_ASSERT_MES(rv.p.CLSAGs.empty(), false, "CLSAGs not empty for MLSAGs");
+        CHECK_AND_ASSERT_MES(sc_check(secret_key.bytes) == 0, false, "Invalid secret key scalar");
         if (rv.type == RCTType::Full)
         {
           CHECK_AND_ASSERT_MES(rv.p.MGs.size() == 1, false, "MGs not a single element");
@@ -1841,6 +1842,9 @@ namespace rct {
         for (size_t n = 0; n < indices.size(); ++n) {
             CHECK_AND_ASSERT_MES(indices[n] < rv.p.MGs[n].ss.size(), false, "Index out of range");
             CHECK_AND_ASSERT_MES(!rv.p.MGs[n].ss[indices[n]].empty(), false, "empty ss line");
+            CHECK_AND_ASSERT_MES(sc_check(k[n].bytes) == 0, false, "Invalid k scalar");
+            CHECK_AND_ASSERT_MES(sc_check(msout.c[n].bytes) == 0, false, "Invalid msout.c scalar");
+            CHECK_AND_ASSERT_MES(sc_isnonzero(msout.c[n].bytes) != 0, false, "msout.c scalar is zero");
         }
 
         // MLSAG: each player contributes a share to the secret-index ss: k - cc*secret_key_share
@@ -1860,12 +1864,17 @@ namespace rct {
         CHECK_AND_ASSERT_MES(k.size() == msout.c.size(), false, "Mismatched k/msout.c size");
         CHECK_AND_ASSERT_MES(rv.p.MGs.empty(), false, "MGs not empty for CLSAGs");
         CHECK_AND_ASSERT_MES(msout.c.size() == msout.mu_p.size(), false, "Bad mu_p size");
+        CHECK_AND_ASSERT_MES(sc_check(secret_key.bytes) == 0, false, "Invalid secret key scalar");
         for (size_t n = 0; n < indices.size(); ++n) {
             CHECK_AND_ASSERT_MES(indices[n] < rv.p.CLSAGs[n].s.size(), false, "Index out of range");
+            CHECK_AND_ASSERT_MES(sc_check(k[n].bytes) == 0, false, "Invalid k scalar");
+            CHECK_AND_ASSERT_MES(sc_check(msout.c[n].bytes) == 0, false, "Invalid msout.c scalar");
+            CHECK_AND_ASSERT_MES(sc_isnonzero(msout.c[n].bytes) != 0, false, "msout.c scalar is zero");
+            CHECK_AND_ASSERT_MES(sc_check(msout.mu_p[n].bytes) == 0, false, "Invalid msout.mu_p scalar");
         }
 
         // CLSAG: each player contributes a share to the secret-index ss: k - cc*mu_p*secret_key_share
-        // cc: msout.c[n], mu_p, msout.mu_p[n], secret_key_share: secret_key
+        // cc: msout.c[n], mu_p: msout.mu_p[n], secret_key_share: secret_key
         for (size_t n = 0; n < indices.size(); ++n) {
             rct::key diff, sk;
             sc_mul(sk.bytes, msout.mu_p[n].bytes, secret_key.bytes);
@@ -1889,6 +1898,7 @@ namespace rct {
                         const std::vector<rct::keyV>& token_id_rings,
                         std::string& reason)
     {
+      try {
         // ── 0. Prevalidate the proof set is well-formed ──────────────────────
         // token_proofs is a self-describing serialized vector, so serialization
         // constrains neither WHICH proofs appear nor how many. Reject duplicates
@@ -1902,43 +1912,43 @@ namespace rct {
                    n_token_op = 0, n_ownership = 0;
             for (const auto& proof : tx.token_proofs)
             {
-                if      (std::holds_alternative<rct::zc_token_surjection_proof>(proof))       ++n_surjection;
-                else if (std::holds_alternative<rct::zc_balance_proof>(proof))                ++n_balance;
-                else if (std::holds_alternative<rct::zc_outs_range_proof>(proof))             ++n_range;
+                if      (std::holds_alternative<rct::zy_token_surjection_proof>(proof))       ++n_surjection;
+                else if (std::holds_alternative<rct::zy_balance_proof>(proof))                ++n_balance;
+                else if (std::holds_alternative<rct::zy_outs_range_proof>(proof))             ++n_range;
                 else if (std::holds_alternative<rct::token_operation_proof>(proof))           ++n_token_op;
                 else if (std::holds_alternative<rct::token_operation_ownership_proof>(proof)) ++n_ownership;
                 else { reason = "unknown token proof type"; return false; }
             }
-            // ZC_sigs live under the tx's signatures (tx.zc_sig), not token_proofs.
-            const size_t n_zc_sig = tx.zc_sig.size();
+            // ZY_sigs live under the tx's signatures (tx.zy_sig), not token_proofs.
+            const size_t n_zy_sig = tx.zy_sig.size();
 
             // Singleton proofs: at most one of each.
-            if (n_surjection > 1) { reason = "multiple zc_token_surjection_proof entries"; return false; }
-            if (n_balance    > 1) { reason = "multiple zc_balance_proof entries"; return false; }
-            if (n_range      > 1) { reason = "multiple zc_outs_range_proof entries"; return false; }
+            if (n_surjection > 1) { reason = "multiple zy_token_surjection_proof entries"; return false; }
+            if (n_balance    > 1) { reason = "multiple zy_balance_proof entries"; return false; }
+            if (n_range      > 1) { reason = "multiple zy_outs_range_proof entries"; return false; }
             if (n_token_op   > 1) { reason = "multiple token_operation_proof entries"; return false; }
             if (n_ownership  > 1) { reason = "multiple token_operation_ownership_proof entries"; return false; }
 
-            // ZC_sig: exactly one per confidential (zarcanum) input.
-            size_t zc_input_count = 0;
+            // ZY_sig: exactly one per confidential (zyphora) input.
+            size_t zy_input_count = 0;
             for (const auto& in : tx.vin)
-                if (std::holds_alternative<cryptonote::txin_zc_input>(in))
-                    ++zc_input_count;
-            if (n_zc_sig != zc_input_count)
+                if (std::holds_alternative<cryptonote::txin_zy_input>(in))
+                    ++zy_input_count;
+            if (n_zy_sig != zy_input_count)
             {
-                reason = "ZC_sig count (" + std::to_string(n_zc_sig)
-                       + ") != confidential input count (" + std::to_string(zc_input_count) + ")";
+                reason = "ZY_sig count (" + std::to_string(n_zy_sig)
+                       + ") != confidential input count (" + std::to_string(zy_input_count) + ")";
                 return false;
             }
 
             // Token-operation proofs only belong to their originating tx kinds:
-            //   token_operation_proof          -> register_private_token / mint_token / burn_token
+            //   token_operation_proof          -> register_privacy_token / mint_token / burn_token
             //   token_operation_ownership_proof -> mint_token / update_token
             // (see construct_tx_with_tx_key.) burn_token also carries an
             // amount-commitment composition_proof: it binds the publicly-declared
-            // burned amount to the TDO commitment that the zc_balance_proof then
+            // burned amount to the TDO commitment that the zy_balance_proof then
             // subtracts from the spend equation.
-            const bool aop_allowed       = tx.type == cryptonote::txtype::register_private_token
+            const bool aop_allowed       = tx.type == cryptonote::txtype::register_privacy_token
                                         || tx.type == cryptonote::txtype::mint_token
                                         || tx.type == cryptonote::txtype::burn_token;
             const bool ownership_allowed = tx.type == cryptonote::txtype::mint_token
@@ -1953,41 +1963,68 @@ namespace rct {
                 reason = "token_operation_ownership_proof present on a tx that is not mint/update";
                 return false;
             }
+
+            {
+                cryptonote::tx_extra_token_descriptor_operation tdo{};
+                if (cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, 0))
+                {
+                    cryptonote::tx_extra_token_descriptor_operation tdo2{};
+                    if (cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo2, 1))
+                    {
+                        reason = "a token transaction must carry exactly one token descriptor operation";
+                        return false;
+                    }
+                    bool type_matches = false;
+                    switch (tdo.operation_type)
+                    {
+                        case cryptonote::token_descriptor_operation_type::register_token: type_matches = (tx.type == cryptonote::txtype::register_privacy_token); break;
+                        case cryptonote::token_descriptor_operation_type::mint_token:     type_matches = (tx.type == cryptonote::txtype::mint_token);             break;
+                        case cryptonote::token_descriptor_operation_type::update_token:   type_matches = (tx.type == cryptonote::txtype::update_token);           break;
+                        case cryptonote::token_descriptor_operation_type::burn_token:     type_matches = (tx.type == cryptonote::txtype::burn_token);             break;
+                        default:                                                          type_matches = false;                                                   break;
+                    }
+                    if (!type_matches)
+                    {
+                        reason = "tx.type does not match the token descriptor operation_type (cross-typed token operation rejected)";
+                        return false;
+                    }
+                }
+            }
         }
 
-        // ── 1. Verify ZC_sig for each ZC input ───────────────────────────────
-        // Count ZC inputs and match them to the tx's ZC_sig signatures (one per
-        // zc input, in tx.vin order). pubkeys[i] / token_id_rings[i] is the ring
-        // for input i (built by check_tx_inputs / check_tx_input_zc);
+        // ── 1. Verify ZY_sig for each ZY input ───────────────────────────────
+        // Count ZY inputs and match them to the tx's ZY_sig signatures (one per
+        // zy input, in tx.vin order). pubkeys[i] / token_id_rings[i] is the ring
+        // for input i (built by check_tx_inputs / check_tx_input_zy);
         // token_id_rings is only populated for indices where tx.vin[i] is a
-        // txin_zc_input.
-        size_t zc_sig_idx = 0;
+        // txin_zy_input.
+        size_t zy_sig_idx = 0;
         const key tx_prefix_hash = get_hf21_token_proof_message(tx, pubkeys, hw::get_device("default"));
 
-        std::vector<const rct::ZC_sig*> zc_sigs;
-        zc_sigs.reserve(tx.zc_sig.size());
-        for (const auto& sig : tx.zc_sig)
+        std::vector<const rct::ZY_sig*> zy_sigs;
+        zy_sigs.reserve(tx.zy_sig.size());
+        for (const auto& sig : tx.zy_sig)
         {
-            const auto* zs = std::get_if<rct::ZC_sig>(&sig);
-            if (!zs) { reason = "unknown signature type in tx.zc_sig"; return false; }
-            zc_sigs.push_back(zs);
+            const auto* zs = std::get_if<rct::ZY_sig>(&sig);
+            if (!zs) { reason = "unknown signature type in tx.zy_sig"; return false; }
+            zy_sigs.push_back(zs);
         }
 
-        // Collect ring pubkeys for ZC inputs (subset of all inputs)
-        size_t zc_input_count = 0;
+        // Collect ring pubkeys for ZY inputs (subset of all inputs)
+        size_t zy_input_count = 0;
         for (size_t i = 0; i < tx.vin.size(); ++i)
         {
-            if (!std::holds_alternative<cryptonote::txin_zc_input>(tx.vin[i]))
+            if (!std::holds_alternative<cryptonote::txin_zy_input>(tx.vin[i]))
                 continue;
-            const auto& txin = std::get<cryptonote::txin_zc_input>(tx.vin[i]);
-            if (zc_sig_idx >= zc_sigs.size())
-                continue;  // more inputs than ZC_sigs → not a ZC input
+            const auto& txin = std::get<cryptonote::txin_zy_input>(tx.vin[i]);
+            if (zy_sig_idx >= zy_sigs.size())
+                continue;  // more inputs than ZY_sigs → not a ZY input
 
-            const rct::ZC_sig& zc_sig = *zc_sigs[zc_sig_idx];
+            const rct::ZY_sig& zy_sig = *zy_sigs[zy_sig_idx];
 
             // Extract ring stealth addresses and amount commitments for this
             // input from pubkeys[i]; the blinded-token-id ring comes from
-            // token_id_rings[i] (threaded through by check_tx_input_zc).
+            // token_id_rings[i] (threaded through by check_tx_input_zy).
             rct::keyV ring_dest, ring_amount;
             ring_dest.reserve(pubkeys[i].size());
             ring_amount.reserve(pubkeys[i].size());
@@ -2004,9 +2041,9 @@ namespace rct {
                 return false;
             }
 
-            // The ZC_sig is now the single source of truth for this input's
+            // The ZY_sig is now the single source of truth for this input's
             // pseudo-out amount commitment and blinded token id -- the balance
-            // proof and surjection proof both read the same zc_sig.pseudo_out_*
+            // proof and surjection proof both read the same zy_sig.pseudo_out_*
             // values verified here, so there is no separate txin declaration to
             // cross-check against (and thus no decoupling risk to guard).
 
@@ -2016,49 +2053,49 @@ namespace rct {
             // arithmetic must be explicitly forced into the prime-order subgroup
             // here. Both pseudo-outs are freshly chosen by the prover in THIS tx
             // and are reused raw by the BGE surjection ring (verify_BGE_proof)
-            // and the zc_balance_proof sum -- a small-order component there could
+            // and the zy_balance_proof sum -- a small-order component there could
             // grant the prover extra Z_8 freedom those proofs can't otherwise
             // catch. (Chain-resolved ring members are already subgroup-checked at
             // output-creation time in check_tx_outputs, so they need no recheck.)
-            if (!rct::isInMainSubgroup(zc_sig.pseudo_out_amount_commitment) ||
-                !rct::isInMainSubgroup(zc_sig.pseudo_out_blinded_token_id))
+            if (!rct::isInMainSubgroup(zy_sig.pseudo_out_amount_commitment) ||
+                !rct::isInMainSubgroup(zy_sig.pseudo_out_blinded_token_id))
             {
-                reason = "ZC_sig pseudo-out point not in main subgroup for input " + std::to_string(i);
+                reason = "ZY_sig pseudo-out point not in main subgroup for input " + std::to_string(i);
                 return false;
             }
 
-            if (!verZCSig(tx_prefix_hash, zc_sig, ring_dest, ring_amount, ring_token_id,
-                          zc_sig.pseudo_out_amount_commitment, zc_sig.pseudo_out_blinded_token_id))
+            if (!verZYSig(tx_prefix_hash, zy_sig, ring_dest, ring_amount, ring_token_id,
+                          zy_sig.pseudo_out_amount_commitment, zy_sig.pseudo_out_blinded_token_id))
             {
-                reason = "ZC_sig verification failed for input " + std::to_string(i);
+                reason = "ZY_sig verification failed for input " + std::to_string(i);
                 return false;
             }
 
-            // Key image in ZC_sig must match txin.k_image
-            if (memcmp(&zc_sig.clsag_sig.I, &txin.k_image, sizeof(crypto::key_image)) != 0)
+            // Key image in ZY_sig must match txin.k_image
+            if (memcmp(&zy_sig.clsag_sig.I, &txin.k_image, sizeof(crypto::key_image)) != 0)
             {
-                reason = "ZC_sig key_image mismatch for input " + std::to_string(i);
+                reason = "ZY_sig key_image mismatch for input " + std::to_string(i);
                 return false;
             }
 
-            ++zc_sig_idx;
-            ++zc_input_count;
+            ++zy_sig_idx;
+            ++zy_input_count;
         }
 
-        if (zc_sig_idx != zc_sigs.size())
+        if (zy_sig_idx != zy_sigs.size())
         {
-            reason = "ZC_sig count mismatch: have " + std::to_string(zc_sigs.size()) +
-                     ", matched " + std::to_string(zc_sig_idx);
+            reason = "ZY_sig count mismatch: have " + std::to_string(zy_sigs.size()) +
+                     ", matched " + std::to_string(zy_sig_idx);
             return false;
         }
 
         // ── 2. Verify token surjection proof (BGE) ────────────────────────────
-        // For each tx_out_zarcanum output, verify its blinded_token_id is a
+        // For each tx_out_zyphora output, verify its blinded_token_id is a
         // valid blinding of one of the tx's legitimate token sources, without
         // revealing which one. Ring members (must match construct_tx_with_tx_key's
         // surjection block bit-for-bit, in the same order):
-        //   - every spent zc input's pseudo-blinded token id (zc_sigs, step 1), and
-        //   - for register_private_token/mint_token, the token-descriptor-operation's
+        //   - every spent zy input's pseudo-blinded token id (zy_sigs, step 1), and
+        //   - for register_privacy_token/mint_token, the token-descriptor-operation's
         //     own token id H_tdo, appended LAST (mirrors Zano's "token emission"
         //     ring member, generate_token_surjection_proof_hf6). This is what
         //     binds EACH mint output to the declared token: the TDO
@@ -2068,19 +2105,19 @@ namespace rct {
         //     output#1 to a large amount of a DIFFERENT existing token B and
         //     output#2 to a compensating garbage token -- inflating token B.
         //
-        // Native coin never carries an token id (is_zarcanum() == token_id !=
+        // Native coin never carries an token id (is_zyphora() == token_id !=
         // null_tid), so native fee/change inputs never need a ring slot here.
-        bool any_zc_outputs = false;
+        bool any_zy_outputs = false;
         for (const auto& out : tx.vout)
-            if (std::holds_alternative<cryptonote::tx_out_zarcanum>(out.target)) { any_zc_outputs = true; break; }
+            if (std::holds_alternative<cryptonote::tx_out_zyphora>(out.target)) { any_zy_outputs = true; break; }
 
         // Build the surjection ring shared by every output's BGE proof.
         rct::keyV surjection_ring;
-        surjection_ring.reserve(zc_sigs.size() + 1);
-        for (const auto* zs : zc_sigs)
+        surjection_ring.reserve(zy_sigs.size() + 1);
+        for (const auto* zs : zy_sigs)
             surjection_ring.push_back(zs->pseudo_out_blinded_token_id);
 
-        if (tx.type == cryptonote::txtype::register_private_token || tx.type == cryptonote::txtype::mint_token)
+        if (tx.type == cryptonote::txtype::register_privacy_token || tx.type == cryptonote::txtype::mint_token)
         {
             cryptonote::tx_extra_token_descriptor_operation tdo{};
             if (!cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo))
@@ -2088,7 +2125,7 @@ namespace rct {
                 reason = "mint tx is missing its token_descriptor_operation in tx.extra";
                 return false;
             }
-            const crypto::token_id token_id = (tx.type == cryptonote::txtype::register_private_token)
+            const crypto::token_id token_id = (tx.type == cryptonote::txtype::register_privacy_token)
                 ? cryptonote::get_or_calculate_token_id(tdo)
                 : tdo.token_id;
             if (token_id == crypto::null_tid)
@@ -2102,27 +2139,27 @@ namespace rct {
         bool found_surjection_proof = false;
         for (const auto& proof : tx.token_proofs)
         {
-            if (const auto* sp = std::get_if<rct::zc_token_surjection_proof>(&proof))
+            if (const auto* sp = std::get_if<rct::zy_token_surjection_proof>(&proof))
             {
                 found_surjection_proof = true;
                 if (surjection_ring.empty())
                 {
-                    reason = "surjection proof present but tx has no token source (no zc inputs and not a mint)";
+                    reason = "surjection proof present but tx has no token source (no zy inputs and not a mint)";
                     return false;
                 }
 
                 size_t out_idx = 0;
                 for (size_t k = 0; k < tx.vout.size(); ++k)
                 {
-                    if (!std::holds_alternative<cryptonote::tx_out_zarcanum>(tx.vout[k].target))
+                    if (!std::holds_alternative<cryptonote::tx_out_zyphora>(tx.vout[k].target))
                         continue;
                     if (out_idx >= sp->bge_proofs.size())
                     {
-                        reason = "surjection proof has fewer entries than ZC outputs";
+                        reason = "surjection proof has fewer entries than ZY outputs";
                         return false;
                     }
 
-                    const auto& zout = std::get<cryptonote::tx_out_zarcanum>(tx.vout[k].target);
+                    const auto& zout = std::get<cryptonote::tx_out_zyphora>(tx.vout[k].target);
                     const rct::key T = rct::tid2rct(zout.blinded_token_id);
 
                     if (!crypto::verify_BGE_proof(tx_prefix_hash, surjection_ring, T, sp->bge_proofs[out_idx]))
@@ -2135,20 +2172,20 @@ namespace rct {
 
                 if (out_idx != sp->bge_proofs.size())
                 {
-                    reason = "surjection proof has more entries than ZC outputs";
+                    reason = "surjection proof has more entries than ZY outputs";
                     return false;
                 }
                 break;
             }
         }
 
-        // Any tx that produces zarcanum outputs must carry a surjection proof
-        // binding each output's token id to a legitimate source (a spent zc
+        // Any tx that produces zyphora outputs must carry a surjection proof
+        // binding each output's token id to a legitimate source (a spent zy
         // input, or -- for deploy/mint -- the mint TDO). This covers both spends
         // and mints; without it a tx could claim any token id for its outputs.
-        if (any_zc_outputs && !found_surjection_proof)
+        if (any_zy_outputs && !found_surjection_proof)
         {
-            reason = "zarcanum outputs present without an token surjection proof";
+            reason = "zyphora outputs present without an token surjection proof";
             return false;
         }
 
@@ -2172,39 +2209,39 @@ namespace rct {
         }
 
         // ── 4. Verify HF21 PT balance proof (token conservation statement) ───
-        const rct::zc_balance_proof* bal = nullptr;
+        const rct::zy_balance_proof* bal = nullptr;
         for (const auto& proof : tx.token_proofs)
         {
-            if (const auto* bp = std::get_if<rct::zc_balance_proof>(&proof))
+            if (const auto* bp = std::get_if<rct::zy_balance_proof>(&proof))
             {
                 if (bal != nullptr)
                 {
-                    reason = "multiple zc_balance_proof entries";
+                    reason = "multiple zy_balance_proof entries";
                     return false;
                 }
                 bal = bp;
             }
         }
-        if (zc_input_count > 0)
+        if (zy_input_count > 0)
         {
             if (bal == nullptr)
             {
-                reason = "missing zc_balance_proof for PT spend";
+                reason = "missing zy_balance_proof for PT spend";
                 return false;
             }
 
-            // Pseudo-out amount commitments live in the ZC_sigs (one per zc
+            // Pseudo-out amount commitments live in the ZY_sigs (one per zy
             // input, collected in input order in step 1), not on the inputs.
             rct::key sum_in_C = rct::zero();
-            for (const auto* zs : zc_sigs)
+            for (const auto* zs : zy_sigs)
                 rct::addKeys(sum_in_C, sum_in_C, zs->pseudo_out_amount_commitment);
 
             rct::key sum_out_C = rct::zero();
             for (const auto& out : tx.vout)
             {
-                if (!std::holds_alternative<cryptonote::tx_out_zarcanum>(out.target))
+                if (!std::holds_alternative<cryptonote::tx_out_zyphora>(out.target))
                     continue;
-                const auto& zout = std::get<cryptonote::tx_out_zarcanum>(out.target);
+                const auto& zout = std::get<cryptonote::tx_out_zyphora>(out.target);
                 rct::addKeys(sum_out_C, sum_out_C, rct::pk2rct(zout.amount_commitment));
             }
 
@@ -2227,53 +2264,53 @@ namespace rct {
             }
             if (bal->P != expected_P)
             {
-                reason = "zc_balance_proof statement mismatch";
+                reason = "zy_balance_proof statement mismatch";
                 return false;
             }
             const rct::key tx_pub_key_rct = rct::pk2rct(cryptonote::get_tx_pub_key_from_extra(tx));
             if (!crypto::verify_double_schnorr_sig(tx_prefix_hash, bal->P, tx_pub_key_rct, bal->dss))
             {
-                reason = "zc_balance_proof verification failed";
+                reason = "zy_balance_proof verification failed";
                 return false;
             }
         }
 
         // ── 5. Verify HF21 token outputs range proof (overflow/inflation guard) ─
-        // Confirms every zarcanum output's amount is in [0, 2^64), preventing a
+        // Confirms every zyphora output's amount is in [0, 2^64), preventing a
         // wraparound-based inflation attack that the balance proof alone can't
         // catch (it only checks conservation, not range).
         {
-            const rct::zc_outs_range_proof* rp = nullptr;
+            const rct::zy_outs_range_proof* rp = nullptr;
             for (const auto& proof : tx.token_proofs)
             {
-                if (const auto* p = std::get_if<rct::zc_outs_range_proof>(&proof))
+                if (const auto* p = std::get_if<rct::zy_outs_range_proof>(&proof))
                 {
                     if (rp != nullptr)
                     {
-                        reason = "multiple zc_outs_range_proof entries";
+                        reason = "multiple zy_outs_range_proof entries";
                         return false;
                     }
                     rp = p;
                 }
             }
 
-            if (any_zc_outputs)
+            if (any_zy_outputs)
             {
                 if (rp == nullptr)
                 {
-                    reason = "zarcanum outputs present without an outputs range proof";
+                    reason = "zyphora outputs present without an outputs range proof";
                     return false;
                 }
 
-                // Zarcanum outputs need *some* source pinning their token id to
-                // exist at all: either spent zc inputs (whose hidden token ids
-                // need not agree -- multiple distinct private tokens are
+                // Zyphora outputs need *some* source pinning their token id to
+                // exist at all: either spent zy inputs (whose hidden token ids
+                // need not agree -- multiple distinct privacy tokens are
                 // allowed in one tx, see construct_tx_with_tx_key) or, for mints
-                // with no zc input (register_private_token/mint_token), the token
+                // with no zy input (register_privacy_token/mint_token), the token
                 // descriptor operation's own (plaintext, public) token_id.
                 //
-                // Note: zc inputs no longer declare any plaintext token id (it
-                // stays hidden behind the ZC_sig's pseudo_out_blinded_token_id).
+                // Note: zy inputs no longer declare any plaintext token id (it
+                // stays hidden behind the ZY_sig's pseudo_out_blinded_token_id).
                 // It doesn't need to be revealed: each output's real token basis
                 // is independently pinned down by verify_BGE_proof (ties the
                 // output's blinded id back to a real spent input's) and the
@@ -2281,8 +2318,8 @@ namespace rct {
                 // its own blinded id as tag) -- both require finding a discrete-
                 // log relation between two independently hash-derived token
                 // points, which is assumed infeasible.
-                bool tag_set = zc_input_count > 0;
-                if (!tag_set && (tx.type == cryptonote::txtype::register_private_token || tx.type == cryptonote::txtype::mint_token))
+                bool tag_set = zy_input_count > 0;
+                if (!tag_set && (tx.type == cryptonote::txtype::register_privacy_token || tx.type == cryptonote::txtype::mint_token))
                 {
                     cryptonote::tx_extra_token_descriptor_operation tdo{};
                     if (!cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo))
@@ -2290,7 +2327,7 @@ namespace rct {
                         reason = "mint tx is missing its token_descriptor_operation in tx.extra";
                         return false;
                     }
-                    const crypto::token_id token_id = (tx.type == cryptonote::txtype::register_private_token)
+                    const crypto::token_id token_id = (tx.type == cryptonote::txtype::register_privacy_token)
                         ? cryptonote::get_or_calculate_token_id(tdo)
                         : tdo.token_id;
                     if (token_id == crypto::null_tid)
@@ -2303,16 +2340,16 @@ namespace rct {
 
                 if (!tag_set)
                 {
-                    reason = "zarcanum outputs present without any source to declare the token id";
+                    reason = "zyphora outputs present without any source to declare the token id";
                     return false;
                 }
 
                 rct::keyV real_commitments, tags;
                 for (const auto& out : tx.vout)
                 {
-                    if (!std::holds_alternative<cryptonote::tx_out_zarcanum>(out.target))
+                    if (!std::holds_alternative<cryptonote::tx_out_zyphora>(out.target))
                         continue;
-                    const auto& zout = std::get<cryptonote::tx_out_zarcanum>(out.target);
+                    const auto& zout = std::get<cryptonote::tx_out_zyphora>(out.target);
                     real_commitments.push_back(rct::pk2rct(zout.amount_commitment));
                     // tags[j] must be this output's OWN blinded token id T_j
                     // (not the shared plaintext-derived `tag`) -- it's the
@@ -2324,7 +2361,7 @@ namespace rct {
 
                 if (!crypto::verify_vector_ug_aggregation_proof(tx_prefix_hash, real_commitments, tags, rp->aggregation_proof))
                 {
-                    reason = "zc_outs_range_proof aggregation proof verification failed";
+                    reason = "zy_outs_range_proof aggregation proof verification failed";
                     return false;
                 }
 
@@ -2334,18 +2371,29 @@ namespace rct {
                     bpp.V[i] = rp->aggregation_proof.amount_commitments_for_rp_aggregation[i];
                 if (!rct::verBulletproofPlus(bpp))
                 {
-                    reason = "zc_outs_range_proof Bulletproof+ verification failed";
+                    reason = "zy_outs_range_proof Bulletproof+ verification failed";
                     return false;
                 }
             }
             else if (rp != nullptr)
             {
-                reason = "zc_outs_range_proof present without any zarcanum outputs";
+                reason = "zy_outs_range_proof present without any zyphora outputs";
                 return false;
             }
         }
 
         return true;
+      }
+      catch (const std::exception& e)
+      {
+        reason = std::string("token proof verification threw: ") + e.what();
+        return false;
+      }
+      catch (...)
+      {
+        reason = "token proof verification threw an unknown exception";
+        return false;
+      }
     }
 
     // ── HF21: CLSAG-GGX (3-layer CLSAG over G, G, X) ──────────────────────────
@@ -2503,7 +2551,7 @@ namespace rct {
         sc_mulsub(sig.s_g[l].bytes, w_sec_g.bytes, c.bytes, alpha_g.bytes); // s_g[l] = alpha_g - c*w_sec_g
         sc_mulsub(sig.s_x[l].bytes, w_sec_x.bytes, c.bytes, alpha_x.bytes); // s_x[l] = alpha_x - c*w_sec_x
 
-        MWARNING("CLSAG_GGX_Gen: n=" << n << " l=" << l << " message=" << message
+        MTRACE("CLSAG_GGX_Gen: n=" << n << " message=" << message
                  << " mu_P=" << mu_P << " mu_A=" << mu_A << " mu_T=" << mu_T
                  << " I=" << sig.I << " D=" << sig.D << " E=" << sig.E << " c1=" << sig.c1);
 
@@ -2616,13 +2664,13 @@ namespace rct {
         catch (...) { return false; }
     }
 
-    // ── HF21: ZC_sig generation and verification ─────────────────────────────
+    // ── HF21: ZY_sig generation and verification ─────────────────────────────
     //
-    // ZC_sig wraps CLSAG_GGX: a 3-layer ring signature proving stealth-address
+    // ZY_sig wraps CLSAG_GGX: a 3-layer ring signature proving stealth-address
     // ownership, amount-commitment balance and token-id balance for one input
-    // spending a tx_out_zarcanum, in a single linked proof.
+    // spending a tx_out_zyphora, in a single linked proof.
 
-    ZC_sig genZCSig(const key& message,
+    ZY_sig genZYSig(const key& message,
                     const keyV& ring_stealth_addrs,
                     const keyV& ring_amount_commitments,
                     const keyV& ring_blinded_token_ids,
@@ -2633,10 +2681,10 @@ namespace rct {
                     const key& pseudo_out_blinded_token_id,
                     unsigned int real_index)
     {
-        CHECK_AND_ASSERT_THROW_MES(!ring_stealth_addrs.empty(), "Empty ring for ZC_sig");
+        CHECK_AND_ASSERT_THROW_MES(!ring_stealth_addrs.empty(), "Empty ring for ZY_sig");
         CHECK_AND_ASSERT_THROW_MES(real_index < ring_stealth_addrs.size(), "Invalid real_index");
 
-        ZC_sig result;
+        ZY_sig result;
         result.clsag_sig = CLSAG_GGX_Gen(message, ring_stealth_addrs, ring_amount_commitments, ring_blinded_token_ids,
                                          spend_secret, real_amount_mask_diff, real_token_mask_diff,
                                          pseudo_out_amount_commitment, pseudo_out_blinded_token_id, real_index);
@@ -2644,12 +2692,12 @@ namespace rct {
         result.pseudo_out_blinded_token_id  = pseudo_out_blinded_token_id;
         CHECK_AND_ASSERT_THROW_MES(verify_CLSAG_GGX(message, ring_stealth_addrs, ring_amount_commitments, ring_blinded_token_ids,
                                                     pseudo_out_amount_commitment, pseudo_out_blinded_token_id, result.clsag_sig),
-                                   "Generated ZC_sig failed local verification");
+                                   "Generated ZY_sig failed local verification");
         return result;
     }
 
-    bool verZCSig(const key& message,
-                  const ZC_sig& sig,
+    bool verZYSig(const key& message,
+                  const ZY_sig& sig,
                   const keyV& ring_stealth_addrs,
                   const keyV& ring_amount_commitments,
                   const keyV& ring_blinded_token_ids,

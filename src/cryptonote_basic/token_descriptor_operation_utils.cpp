@@ -21,7 +21,7 @@ namespace cryptonote
       seed.append(reinterpret_cast<const char*>(&tdo.token_id_salt), sizeof(tdo.token_id_salt));
 
     // HF21: derive the token id as a hash-TO-POINT, not hash-to-scalar*G.
-    // The HF21 private-token balance proof (rct::zc_balance_proof) relies
+    // The HF21 privacy-token balance proof (rct::zy_balance_proof) relies
     // on token_id having no known discrete-log relation to G or X. Deriving it
     // as k*G (with k publicly computable from the descriptor, as the previous
     // hash_to_scalar+secret_key_to_public_key construction did) would let

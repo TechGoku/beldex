@@ -50,7 +50,7 @@
 // advance which version they will stop working with
 // Don't go over 32767 for any of these
 #define WALLET_RPC_VERSION_MAJOR 1
-#define WALLET_RPC_VERSION_MINOR 17
+#define WALLET_RPC_VERSION_MINOR 18
 #define MAKE_WALLET_RPC_VERSION(major,minor) (((major)<<16)|(minor))
 #define WALLET_RPC_VERSION MAKE_WALLET_RPC_VERSION(WALLET_RPC_VERSION_MAJOR, WALLET_RPC_VERSION_MINOR)
 
@@ -84,7 +84,6 @@ namespace tools::wallet_rpc {
       return {std::string_view{names, N-1}...};
     }
   }
-
 
   BELDEX_RPC_DOC_INTROSPECT
   // Return the wallet's balance.
@@ -138,7 +137,7 @@ namespace tools::wallet_rpc {
       std::vector<per_subaddress_info> per_subaddress; // Balance information for each subaddress in an account.
       uint64_t blocks_to_unlock;                       // The number of blocks remaining for the balance to unlock
       uint64_t   time_to_unlock;                       // Timestamp of expected unlock
-      // HF21: per-token balances (empty for wallets with no private token outputs)
+      // HF21: per-token balances (empty for wallets with no privacy token outputs)
       std::vector<token_balance_entry> token_balances;
 
       KV_MAP_SERIALIZABLE
@@ -1392,7 +1391,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Export transfers to csv
-  struct EXPORT_TRANSFERS : RPC_COMMAND
+  struct EXPORT_TRANSFERS : RESTRICTED
   {
     static constexpr auto names() { return NAMES("export_transfers"); }
 
@@ -1446,7 +1445,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Export a signed set of key images.
-  struct EXPORT_KEY_IMAGES : RPC_COMMAND
+  struct EXPORT_KEY_IMAGES : RESTRICTED
   {
     static constexpr auto names() { return NAMES("export_key_images"); }
 
@@ -1695,7 +1694,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Start mining in the beldex daemon.
-  struct START_MINING : RPC_COMMAND
+  struct START_MINING : RESTRICTED
   {
     static constexpr auto names() { return NAMES("start_mining"); }
 
@@ -1711,7 +1710,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Stop mining in the beldex daemon.
-  struct STOP_MINING : RPC_COMMAND
+  struct STOP_MINING : RESTRICTED
   {
     static constexpr auto names() { return NAMES("stop_mining"); }
 
@@ -1780,7 +1779,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Close the currently opened wallet, after trying to save it.
-  struct CLOSE_WALLET : RPC_COMMAND
+  struct CLOSE_WALLET : RESTRICTED
   {
     static constexpr auto names() { return NAMES("close_wallet"); }
 
@@ -2611,13 +2610,12 @@ This command is only required if the open wallet is one of the owners of a BNS r
       KV_MAP_SERIALIZABLE
     };
   };
-
-  // HF21: Register a new private token on-chain.
-  struct REGISTER_PRIVATE_TOKEN : RESTRICTED
+  // HF21: Register a new privacy token on-chain.
+  struct REGISTER_PRIVACY_TOKEN : RESTRICTED
   {
-    static constexpr auto names() { return NAMES("register_private_token"); }
+    static constexpr auto names() { return NAMES("register_privacy_token"); }
     static constexpr const char* description =
-        "Register a new private token. Pass a JSON descriptor containing: "
+        "Register a new privacy token. Pass a JSON descriptor containing: "
         "ticker, full_name, total_max_supply, current_supply, decimal_point, meta_info.";
 
     struct request
@@ -2642,7 +2640,26 @@ This command is only required if the open wallet is one of the owners of a BNS r
       std::string ticker;         // Confirmed ticker from descriptor
       std::string full_name;      // Full name from descriptor
       uint64_t tx_fee = 0;        // Fee paid in this transaction
+      KV_MAP_SERIALIZABLE
+    };
+  };
 
+  BELDEX_RPC_DOC_INTROSPECT
+  struct SETUP_BACKGROUND_SYNC : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("setup_background_sync"); }
+
+    struct request
+    {
+      std::string background_sync_type;
+      std::string wallet_password;
+      std::string background_cache_password;
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
       KV_MAP_SERIALIZABLE
     };
   };
@@ -2676,7 +2693,23 @@ This command is only required if the open wallet is one of the owners of a BNS r
     };
   };
 
-  // HF21: Mint additional tokens for an existing private token.
+  BELDEX_RPC_DOC_INTROSPECT
+  struct START_BACKGROUND_SYNC : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("start_background_sync"); }
+
+    struct request
+    {
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  // HF21: Mint additional tokens for an existing privacy token.
   struct MINT_TOKEN : RESTRICTED
   {
     static constexpr auto names() { return NAMES("mint_token"); }
@@ -2707,7 +2740,27 @@ This command is only required if the open wallet is one of the owners of a BNS r
     };
   };
 
-  // HF21: Burn supply from an existing private token.
+  BELDEX_RPC_DOC_INTROSPECT
+  struct STOP_BACKGROUND_SYNC : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("stop_background_sync"); }
+
+    struct request
+    {
+      std::string wallet_password;
+      std::string seed;
+      std::string seed_offset;
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  // HF21: Burn supply from an existing privacy token.
   struct BURN_TOKEN : RESTRICTED
   {
     static constexpr auto names() { return NAMES("burn_token"); }
@@ -2738,7 +2791,7 @@ This command is only required if the open wallet is one of the owners of a BNS r
     };
   };
 
-  // HF21: Update an existing private token metadata.
+  // HF21: Update an existing privacy token metadata.
   struct UPDATE_TOKEN : RESTRICTED
   {
     static constexpr auto names() { return NAMES("update_token"); }
@@ -2865,6 +2918,9 @@ This command is only required if the open wallet is one of the owners of a BNS r
     SET_DAEMON,
     SET_LOG_LEVEL,
     SET_LOG_CATEGORIES,
+    SETUP_BACKGROUND_SYNC,
+    START_BACKGROUND_SYNC,
+    STOP_BACKGROUND_SYNC,
     BNS_BUY_MAPPING,
     BNS_UPDATE_MAPPING,
     BNS_RENEW_MAPPING,
@@ -2875,7 +2931,7 @@ This command is only required if the open wallet is one of the owners of a BNS r
     BNS_DECRYPT_VALUE,
     BNS_ENCRYPT_VALUE,
     COIN_BURN,
-    REGISTER_PRIVATE_TOKEN,
+    REGISTER_PRIVACY_TOKEN,
     GET_OWNED_TOKENS,
     MINT_TOKEN,
     BURN_TOKEN,

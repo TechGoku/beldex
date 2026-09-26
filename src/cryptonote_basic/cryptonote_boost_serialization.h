@@ -114,9 +114,9 @@ namespace boost
     a & x.hash;
   }
 
-  // HF21: private token output
+  // HF21: privacy token output
   template <class Archive>
-  inline void serialize(Archive &a, cryptonote::tx_out_zarcanum &x, const boost::serialization::version_type ver)
+  inline void serialize(Archive &a, cryptonote::tx_out_zyphora &x, const boost::serialization::version_type ver)
   {
     a & x.stealth_address;
     a & x.amount_commitment;
@@ -158,7 +158,7 @@ namespace boost
   }
 
   template <class Archive>
-  inline void serialize(Archive &a, cryptonote::txin_zc_input &x, const boost::serialization::version_type ver)
+  inline void serialize(Archive &a, cryptonote::txin_zy_input &x, const boost::serialization::version_type ver)
   {
     a & x.key_offsets;
     a & x.k_image;
@@ -485,12 +485,12 @@ namespace boost
     a & x.E;
   }
   template <class Archive>
-  inline void serialize(Archive &a, rct::zc_token_surjection_proof &x, const boost::serialization::version_type ver)
+  inline void serialize(Archive &a, rct::zy_token_surjection_proof &x, const boost::serialization::version_type ver)
   {
     a & x.bge_proofs;
   }
   template <class Archive>
-  inline void serialize(Archive &a, rct::zc_balance_proof &x, const boost::serialization::version_type ver)
+  inline void serialize(Archive &a, rct::zy_balance_proof &x, const boost::serialization::version_type ver)
   {
     a & x.P;
     a & x.dss;
@@ -508,14 +508,14 @@ namespace boost
     a & x.sig;
   }
   template <class Archive>
-  inline void serialize(Archive &a, rct::ZC_sig &x, const boost::serialization::version_type ver)
+  inline void serialize(Archive &a, rct::ZY_sig &x, const boost::serialization::version_type ver)
   {
     a & x.clsag_sig;
     a & x.pseudo_out_amount_commitment;
     a & x.pseudo_out_blinded_token_id;
   }
   template <class Archive>
-  inline void serialize(Archive &a, rct::zc_outs_range_proof &x, const boost::serialization::version_type ver)
+  inline void serialize(Archive &a, rct::zy_outs_range_proof &x, const boost::serialization::version_type ver)
   {
     a & x.bpp;
     a & x.aggregation_proof;

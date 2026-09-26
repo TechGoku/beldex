@@ -47,7 +47,7 @@ extern "C" {
 
 #include "rctTypes.h"
 #include "rctOps.h"
-#include "cryptonote_basic/cryptonote_basic.h"  // transaction, tx_out_zarcanum (HF21)
+#include "cryptonote_basic/cryptonote_basic.h"  // transaction, tx_out_zyphora (HF21)
 
 //Define this flag when debugging to get additional info on the console
 #ifdef DBG
@@ -85,11 +85,11 @@ namespace rct {
     // reason on any failure.
     bool verTokenProofs(const cryptonote::transaction& tx,
                         const rct::ctkeyM& pubkeys,   // ring pubkeys per input
-                        const std::vector<rct::keyV>& token_id_rings, // blinded token id ring per input (only populated for txin_zc_input entries)
+                        const std::vector<rct::keyV>& token_id_rings, // blinded token id ring per input (only populated for txin_zy_input entries)
                         std::string& reason);
 
-    // HF21: 3-layer CLSAG-GGX, the ring signature used by ZC_sig to spend a
-    // tx_out_zarcanum. Proves, for one real ring index l, all of:
+    // HF21: 3-layer CLSAG-GGX, the ring signature used by ZY_sig to spend a
+    // tx_out_zyphora. Proves, for one real ring index l, all of:
     //   layer 0 (G): knowledge of the spend key for P[l]            (stealth address)
     //   layer 1 (G): A[l]*8 - pseudo_A = f*G for known f             (amount commitment)
     //   layer 2 (X): T[l]*8 - pseudo_T = t*X for known t             (blinded token id)
@@ -117,7 +117,7 @@ namespace rct {
                           const key& pseudo_T,
                           const clsag_ggx& sig);
 
-    // HF21: ZC_sig — 3-layer CLSAG-GGX signature for spending a tx_out_zarcanum.
+    // HF21: ZY_sig — 3-layer CLSAG-GGX signature for spending a tx_out_zyphora.
     // message                      : transaction prefix hash
     // ring_stealth_addrs           : stealth addresses of all ring members, size = ring_size
     // ring_amount_commitments      : amount commitments of all ring members (canonical, *8)
@@ -128,7 +128,7 @@ namespace rct {
     // pseudo_out_amount_commitment : pseudo-output amount commitment, not premultiplied by 1/8
     // pseudo_out_blinded_token_id  : pseudo-output blinded token id, not premultiplied by 1/8
     // real_index                   : index of the real output in the ring
-    ZC_sig genZCSig(const key& message,
+    ZY_sig genZYSig(const key& message,
                     const keyV& ring_stealth_addrs,
                     const keyV& ring_amount_commitments,
                     const keyV& ring_blinded_token_ids,
@@ -139,9 +139,9 @@ namespace rct {
                     const key& pseudo_out_blinded_token_id,
                     unsigned int real_index);
 
-    // Verify a ZC_sig.
-    bool verZCSig(const key& message,
-                  const ZC_sig& sig,
+    // Verify a ZY_sig.
+    bool verZYSig(const key& message,
+                  const ZY_sig& sig,
                   const keyV& ring_stealth_addrs,
                   const keyV& ring_amount_commitments,
                   const keyV& ring_blinded_token_ids,

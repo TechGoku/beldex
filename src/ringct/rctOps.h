@@ -128,7 +128,7 @@ namespace rct {
     const ge_p3& rct_get_ge_p3_X();
     // Returns the X generator as a rct::key (byte-encoded point)
     key getX();
-    // Commitment for a private token output: C = amount*T + mask*G
+    // Commitment for a privacy token output: C = amount*T + mask*G
     // where T is the blinded token id. For an output, T is its own
     // token_id + r*X; for a pseudo-output, T must be T_real (reconstructed
     // from the real spent output's blinding scalar), not a fresh blinding --

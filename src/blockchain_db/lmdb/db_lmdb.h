@@ -81,6 +81,8 @@ struct mdb_txn_cursors
   MDB_cursor *output_blacklist;
   MDB_cursor *properties;
   MDB_cursor *token_histories;
+  MDB_cursor *native_output_heights;
+  MDB_cursor *zy_output_heights;
 };
 
 struct mdb_rflags
@@ -109,6 +111,8 @@ struct mdb_rflags
   bool m_rf_master_node_proofs;
   bool m_rf_properties;
   bool m_rf_token_histories;
+  bool m_rf_native_output_heights;
+  bool m_rf_zy_output_heights;
 };
 
 struct mdb_threadinfo
@@ -475,6 +479,8 @@ private:
   MDB_dbi m_output_txs;
   MDB_dbi m_output_amounts;
   MDB_dbi m_output_blacklist;
+  MDB_dbi m_native_output_heights; // height -> amount_index, for non-token amount==0 outputs
+  MDB_dbi m_zy_output_heights;     // height -> amount_index, for tx_out_zyphora outputs
 
   MDB_dbi m_spent_keys;
 

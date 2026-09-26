@@ -385,10 +385,16 @@ namespace cryptonote
      * @param raw_fee return-by-reference the total of fees from the included transactions.  Note that this does not subtract any large block penalty fees; this is just the raw sum of fees of included txes.
      * @param expected_reward return-by-reference the total reward awarded to the block producer finding this block, including transaction fees and, if applicable, a large block reward penalty.
      * @param version hard fork version to use for consensus rules
+     * @param registration_governance_fee return-by-reference sum of REGISTRATION_FEE_GOVERNANCE_AMOUNT over the
+     * included register_privacy_token txs (HF21) -- feeds beldex_miner_tx_context::registration_governance_fee.
+     * @param exclude_token_registrations skip every register_privacy_token candidate, so
+     * registration_governance_fee is guaranteed to come back 0. Last-resort escape hatch for
+     * create_block_template_internal: a block WITHOUT the registrations is always preferable to
+     * no block at all, since failing to build a template stops the whole network.
      *
      * @return true
      */
-    bool fill_block_template(block &bl, size_t median_weight, uint64_t already_generated_coins, size_t &total_weight, uint64_t &raw_fee, uint64_t &expected_reward, hf version, uint64_t height);
+    bool fill_block_template(block &bl, size_t median_weight, uint64_t already_generated_coins, size_t &total_weight, uint64_t &raw_fee, uint64_t &expected_reward, hf version, uint64_t height, uint64_t &registration_governance_fee, bool exclude_token_registrations = false);
 
     /**
      * @brief get a list of all transactions in the pool

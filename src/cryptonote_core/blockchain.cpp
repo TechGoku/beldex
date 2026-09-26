@@ -58,6 +58,9 @@
 #include "epee/int-util.h"
 #include "epee/time_helper.h"
 #include "epee/string_tools.h"
+#include <atomic>
+#include <limits>
+
 #include "common/threadpool.h"
 #include "common/boost_serialization_helper.h"
 #include "epee/warnings.h"
@@ -293,34 +296,34 @@ bool Blockchain::scan_outputkeys_for_indexes(const txin_to_key& tx_in_to_key, vi
   return true;
 }
 //------------------------------------------------------------------
-// HF21: private token (zarcanum) analogue of scan_outputkeys_for_indexes.
-// Zarcanum outputs live in the same amount=0 bucket as native rct outputs;
+// HF21: privacy token (zyphora) analogue of scan_outputkeys_for_indexes.
+// Zyphora outputs live in the same amount=0 bucket as native rct outputs;
 // the visitor additionally receives each ring member's blinded_token_id so
-// callers can build the token-id ring needed by ZC_sig verification.
+// callers can build the token-id ring needed by ZY_sig verification.
 template <class visitor_t>
-bool Blockchain::scan_outputkeys_for_indexes(const txin_zc_input& tx_in_zc, visitor_t &vis, const crypto::hash &tx_prefix_hash, uint64_t* pmax_related_block_height) const
+bool Blockchain::scan_outputkeys_for_indexes(const txin_zy_input& tx_in_zy, visitor_t &vis, const crypto::hash &tx_prefix_hash, uint64_t* pmax_related_block_height) const
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
 
-  if(!tx_in_zc.key_offsets.size())
+  if(!tx_in_zy.key_offsets.size())
     return false;
 
-  std::vector<uint64_t> absolute_offsets = relative_output_offsets_to_absolute(tx_in_zc.key_offsets);
+  std::vector<uint64_t> absolute_offsets = relative_output_offsets_to_absolute(tx_in_zy.key_offsets);
   std::vector<output_data_t> outputs;
 
   try
   {
-    static constexpr uint64_t zc_amount = 0; // zarcanum outputs share the amount=0 rct bucket
-    m_db->get_output_key(epee::span<const uint64_t>(&zc_amount, 1), absolute_offsets, outputs, true);
+    static constexpr uint64_t zy_amount = 0; // zyphora outputs share the amount=0 rct bucket
+    m_db->get_output_key(epee::span<const uint64_t>(&zy_amount, 1), absolute_offsets, outputs, true);
     if (absolute_offsets.size() != outputs.size())
     {
-      MERROR_VER("Output does not exist! (zarcanum input)");
+      MERROR_VER("Output does not exist! (zyphora input)");
       return false;
     }
   }
   catch (...)
   {
-    MERROR_VER("Output does not exist! (zarcanum input)");
+    MERROR_VER("Output does not exist! (zyphora input)");
     return false;
   }
 
@@ -332,7 +335,7 @@ bool Blockchain::scan_outputkeys_for_indexes(const txin_zc_input& tx_in_zc, visi
       const output_data_t &output_index = outputs.at(count);
       if (!vis.handle_output(output_index.unlock_time, output_index.pubkey, output_index.commitment, output_index.blinded_token_id))
       {
-        MERROR_VER("Failed to handle_output for zarcanum output no = " << count << ", with absolute offset " << i);
+        MERROR_VER("Failed to handle_output for zyphora output no = " << count << ", with absolute offset " << i);
         return false;
       }
 
@@ -372,6 +375,11 @@ uint64_t Blockchain::get_current_blockchain_height(bool lock) const
 //------------------------------------------------------------------
 bool Blockchain::load_missing_blocks_into_beldex_subsystems()
 {
+  // Held for the whole scan: the tx deserialisation below runs on the thread pool and uses the
+  // non-locking _get_transactions, which requires that nothing mutates the chain meanwhile.
+  // m_blockchain_lock is recursive, so this is safe when a caller already holds it.
+  std::unique_lock lock{*this};
+
   uint64_t const mnl_height   = std::max(hard_fork_begins(m_nettype, hf::hf9_master_nodes).value_or(0), m_master_node_list.height() + 1);
   uint64_t const bns_height   = std::max(hard_fork_begins(m_nettype, hf::hf18_bns).value_or(0), m_bns_db.height() + 1);
   uint64_t const end_height   = m_db->height();
@@ -384,10 +392,13 @@ bool Blockchain::load_missing_blocks_into_beldex_subsystems()
 
   using clock                   = std::chrono::steady_clock;
   using dseconds                = std::chrono::duration<double>;
-  int64_t constexpr BLOCK_COUNT = 1000;
+  // Chunk size for the rescan. Since the transactions of a whole chunk are now parsed up front and
+  // held at once (rather than one block at a time), this bounds the peak allocation of the scan --
+  // it matters on memory-capped nodes. oxen-core uses 50 for the same reason.
+  int64_t constexpr BLOCK_COUNT = 200;
   auto work_start               = clock::now();
   auto scan_start               = work_start;
-  dseconds bns_duration{}, mnl_duration{}, bns_iteration_duration{}, mnl_iteration_duration{};
+  dseconds bns_duration{}, mnl_duration{}, bns_iteration_duration{}, mnl_iteration_duration{}, tx_load_duration{}, tx_load_total{};
 
   for (int64_t block_count = total_blocks,
                index       = 0;
@@ -398,11 +409,12 @@ bool Blockchain::load_missing_blocks_into_beldex_subsystems()
     if (duration >= 10s)
     {
       m_master_node_list.store();
-      MGINFO(fmt::format("... scanning height {} ({:.3f}s) (mnl: {:.3f}s, bns: {:.3f}s)",
+      MGINFO(fmt::format("... scanning height {} ({:.3f}s) (mnl: {:.3f}s, bns: {:.3f}s, txs: {:.3f}s)",
             start_height + (index * BLOCK_COUNT),
             duration.count(),
             mnl_iteration_duration.count(),
-            bns_iteration_duration.count()));
+            bns_iteration_duration.count(),
+            tx_load_duration.count()));
 #ifdef ENABLE_SYSTEMD
       // Tell systemd that we're doing something so that it should let us continue starting up
       // (giving us 120s until we have to send the next notification):
@@ -412,7 +424,7 @@ bool Blockchain::load_missing_blocks_into_beldex_subsystems()
 
       bns_duration += bns_iteration_duration;
       mnl_duration += mnl_iteration_duration;
-      bns_iteration_duration = mnl_iteration_duration = {};
+      bns_iteration_duration = mnl_iteration_duration = tx_load_duration = {};
     }
 
     std::vector<cryptonote::block> blocks;
@@ -423,16 +435,50 @@ bool Blockchain::load_missing_blocks_into_beldex_subsystems()
       return false;
     }
 
-    for (cryptonote::block const &blk : blocks)
+    // Deserialising the transactions for a chunk dominates the scan and is independent per block,
+    // so do it across the thread pool while the subsystem updates below stay strictly sequential.
+    // _get_transactions is the non-locking form: we already hold the blockchain lock for the whole
+    // scan, and LMDB hands each thread its own read transaction.
+    std::vector<std::vector<cryptonote::transaction>> chunk_txs(blocks.size());
     {
-      uint64_t block_height = get_block_height(blk);
-
-      std::vector<cryptonote::transaction> txs;
-      if (!get_transactions(blk.tx_hashes, txs))
+      auto tx_load_start = clock::now();
+      // Record which block failed, not just that one did: this aborts daemon startup, and the
+      // block identity is what tells an operator whether they are looking at a pruned or a
+      // corrupted database. Workers race to claim the slot; the lowest index wins so the message
+      // names the earliest failure rather than whichever thread finished first.
+      constexpr size_t NO_FAILURE = std::numeric_limits<size_t>::max();
+      std::atomic<size_t> failed_index{NO_FAILURE};
+      tools::threadpool& tpool = tools::threadpool::getInstance();
+      tools::threadpool::waiter waiter;
+      for (size_t blk_index = 0; blk_index < blocks.size(); blk_index++)
       {
-        MERROR("Unable to get transactions for block for updating BNS DB: " << cryptonote::get_block_hash(blk));
+        tpool.submit(&waiter, [this, blk_index, &blocks, &chunk_txs, &failed_index]() {
+          if (_get_transactions(blocks[blk_index].tx_hashes, chunk_txs[blk_index]))
+            return;
+          size_t previous = failed_index.load(std::memory_order_relaxed);
+          while (blk_index < previous &&
+                 !failed_index.compare_exchange_weak(previous, blk_index, std::memory_order_relaxed))
+            ; // retry: another worker claimed it first
+        });
+      }
+      waiter.wait(&tpool);
+      if (size_t failed = failed_index.load(); failed != NO_FAILURE)
+      {
+        cryptonote::block const &blk = blocks[failed];
+        MERROR("Unable to get transactions for block " << cryptonote::get_block_hash(blk)
+               << " at height " << get_block_height(blk) << " while updating beldex subsystems");
         return false;
       }
+      auto tx_load_elapsed = dseconds{clock::now() - tx_load_start};
+      tx_load_duration += tx_load_elapsed;
+      tx_load_total    += tx_load_elapsed;
+    }
+
+    for (size_t blk_index = 0; blk_index < blocks.size(); blk_index++)
+    {
+      cryptonote::block const &blk = blocks[blk_index];
+      uint64_t block_height = get_block_height(blk);
+      std::vector<cryptonote::transaction> &txs = chunk_txs[blk_index];
 
       if (block_height >= mnl_height)
       {
@@ -446,7 +492,7 @@ bool Blockchain::load_missing_blocks_into_beldex_subsystems()
         try {
           m_master_node_list.block_add(blk, txs, checkpoint_ptr);
         } catch (const std::exception& e) {
-          MFATAL("Unable to process block {} for updating master node list: " << e.what());
+          MFATAL("Unable to process block " << cryptonote::get_block_hash(blk) << " at height " << block_height << " for updating master node list: " << e.what());
           return false;
         }
         mnl_iteration_duration += clock::now() - mnl_start;
@@ -467,8 +513,8 @@ bool Blockchain::load_missing_blocks_into_beldex_subsystems()
 
   if (total_blocks > 1)
   {
-    MGINFO(fmt::format("Done recalculating beldex subsystems in {:.2f}s ({:.2f}s mnl; {:.2f}s bns)",
-          dseconds{clock::now() - scan_start}.count(), mnl_duration.count(), bns_duration.count()));
+    MGINFO(fmt::format("Done recalculating beldex subsystems in {:.2f}s ({:.2f}s mnl; {:.2f}s bns; {:.2f}s tx load)",
+          dseconds{clock::now() - scan_start}.count(), mnl_duration.count(), bns_duration.count(), tx_load_total.count()));
   }
 
   if (total_blocks > 0)
@@ -814,7 +860,7 @@ block Blockchain::pop_block_from_blockchain()
     throw;
   }
 
-  if (popped_hf >= feature::PRIVATE_TOKENS)
+  if (popped_hf >= feature::PRIVACY_TOKENS)
   {
     std::string rewind_reason;
     CHECK_AND_ASSERT_THROW_MES(
@@ -1369,7 +1415,7 @@ bool Blockchain::prevalidate_miner_transaction(const block& b, uint64_t height, 
 }
 //------------------------------------------------------------------
 // This function validates the miner transaction reward
-bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_block_weight, uint64_t fee, uint64_t& base_reward, uint64_t already_generated_coins, hf version)
+bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_block_weight, uint64_t fee, uint64_t& base_reward, uint64_t already_generated_coins, hf version, uint64_t registration_governance_fee)
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
   //validate reward
@@ -1396,6 +1442,7 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
   block_reward_context.fee                       = fee;
   block_reward_context.height                    = height;
   block_reward_context.testnet_override          = nettype() == network_type::TESTNET && height < 386000;
+  block_reward_context.registration_governance_fee = registration_governance_fee;
   if (!calc_batched_governance_reward(height, block_reward_context.batched_governance))
   {
     MERROR_VER("Failed to calculate batched governance reward");
@@ -1421,7 +1468,10 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
     }
   }
 
-  if (already_generated_coins != 0 && block_has_governance_output(nettype(), b))
+  const bool privacy_tokens_active = version >= feature::PRIVACY_TOKENS;
+  if (already_generated_coins != 0 &&
+      (block_has_governance_output(nettype(), b) ||
+       (privacy_tokens_active && registration_governance_fee > 0)))
   {
     if (version >= hf::hf17_POS && reward_parts.governance_paid == 0)
     {
@@ -1465,8 +1515,10 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
     return false;
   }
 
-  CHECK_AND_ASSERT_MES(money_in_use >= reward_parts.miner_fee, false, "base reward calculation bug");
-  base_reward = money_in_use - reward_parts.miner_fee;
+  uint64_t const recycled_fee =
+      reward_parts.miner_fee + (privacy_tokens_active ? registration_governance_fee : 0);
+  CHECK_AND_ASSERT_MES(money_in_use >= recycled_fee, false, "base reward calculation bug");
+  base_reward = money_in_use - recycled_fee;
 
   return true;
 }
@@ -1660,97 +1712,140 @@ bool Blockchain::create_block_template_internal(block& b, const crypto::hash *fr
   }
 
   CHECK_AND_ASSERT_MES(diffic, false, "difficulty overhead.");
-
-  size_t txs_weight;
-  uint64_t fee;
-  if (!m_tx_pool.fill_block_template(b, median_weight, already_generated_coins, txs_weight, fee, expected_reward, b.major_version, height))
+  bool built = false;
+  for (int attempt = 0; attempt < 2 && !built; ++attempt)
   {
-    return false;
-  }
-  pool_cookie = m_tx_pool.cookie();
+    const bool exclude_token_registrations = attempt == 1;
+    const bool ok = [&]() -> bool {
+      b.tx_hashes.clear();
 
-  /*
-   two-phase miner transaction generation: we don't know exact block weight until we prepare block, but we don't know reward until we know
-   block weight, so first miner transaction generated with fake amount of money, and with phase we know think we know expected block weight
-   */
-  //make blocks coin-base tx looks close to real coinbase tx to get truthful blob weight
-  auto hf_version = b.major_version;
-  auto miner_tx_context =
-      info.is_miner
-          ? beldex_miner_tx_context::miner_block(m_nettype, info.miner_address, m_master_node_list.get_block_leader())
-          : beldex_miner_tx_context::POS_block(m_nettype, info.master_node_payout, m_master_node_list.get_block_leader());
-  if (!calc_batched_governance_reward(height, miner_tx_context.batched_governance))
-  {
-    LOG_ERROR("Failed to calculate batched governance reward");
-    return false;
-  }
-
-    crypto::signature security_signature;
-    if ((hf_version >= hf::hf12_security_signature) && info.is_miner){
-        crypto::hash hash = cryptonote::make_security_hash_from(height,
-                                                                b);
-        const std::string skey_string = "1720bda28f39942427bee804dc626cf54ba80f23d82bf173c474785652ac5d0f";
-        crypto::secret_key skey;
-        tools::hex_to_type(skey_string,skey);
-        const std::string pkey_string = "7e709e81ac9c04d2b1704db8dd331db037b570f5e901f6dbc1fe3a98bf2fa9e1";
-
-        crypto::public_key pkey;
-        tools::hex_to_type(pkey_string,pkey);
-        LOG_PRINT_L1("Miner pubkey is " << tools::type_to_hex(pkey));
-
-        crypto::generate_signature(hash, pkey, skey, security_signature);
-        LOG_PRINT_L1("height: " << height << " prev_id:" << b.prev_id << " hash:" << hash << " security_signature:"
-                                << security_signature << " pkey:" << pkey << " diffic:" << diffic);
-        if (!crypto::check_signature(hash, pkey, security_signature)) {
-            LOG_PRINT_L1("wrong signature in construct_miner_tx");
-        } else {
-            LOG_PRINT_L1("correct signature in construct_miner_tx");
-        }
-    }
-
-  bool r = construct_miner_tx(height, median_weight, already_generated_coins, txs_weight, fee, b.miner_tx, miner_tx_context, ex_nonce, hf_version, security_signature);
-
-  CHECK_AND_ASSERT_MES(r, false, "Failed to construct miner tx, first chance");
-  size_t cumulative_weight = txs_weight + get_transaction_weight(b.miner_tx);
-  for (size_t try_count = 0; try_count != 10; ++try_count)
-  {
-    r = construct_miner_tx(height, median_weight, already_generated_coins, cumulative_weight, fee, b.miner_tx, miner_tx_context, ex_nonce, hf_version, security_signature);
-
-    CHECK_AND_ASSERT_MES(r, false, "Failed to construct miner tx, second chance");
-    size_t coinbase_weight = get_transaction_weight(b.miner_tx);
-    if (coinbase_weight > cumulative_weight - txs_weight)
-    {
-      cumulative_weight = txs_weight + coinbase_weight;
-      continue;
-    }
-
-    if (coinbase_weight < cumulative_weight - txs_weight)
-    {
-      size_t delta = cumulative_weight - txs_weight - coinbase_weight;
-      b.miner_tx.extra.insert(b.miner_tx.extra.end(), delta, 0);
-      //here  could be 1 byte difference, because of extra field counter is varint, and it can become from 1-byte len to 2-bytes len.
-      if (cumulative_weight != txs_weight + get_transaction_weight(b.miner_tx))
+      size_t txs_weight;
+      uint64_t fee;
+      uint64_t registration_governance_fee = 0;
+      if (!m_tx_pool.fill_block_template(b, median_weight, already_generated_coins, txs_weight, fee, expected_reward, b.major_version, height, registration_governance_fee, exclude_token_registrations))
       {
-        CHECK_AND_ASSERT_MES(cumulative_weight + 1 == txs_weight + get_transaction_weight(b.miner_tx), false, "unexpected case: cumulative_weight=" << cumulative_weight << " + 1 is not equal txs_cumulative_weight=" << txs_weight << " + get_transaction_weight(b.miner_tx)=" << get_transaction_weight(b.miner_tx));
-        b.miner_tx.extra.resize(b.miner_tx.extra.size() - 1);
-        if (cumulative_weight != txs_weight + get_transaction_weight(b.miner_tx))
+        return false;
+      }
+
+      // defence in depth: if the coinbase cannot be built while paying the registration
+      // carve-out, drop the registrations and build a block without them. Returning false here
+      // stops this node producing ANY block, and since every node runs the same code that is a
+      // network-wide halt -- always the worst available outcome.
+      const bool can_drop_registrations = !exclude_token_registrations && registration_governance_fee > 0;
+      pool_cookie = m_tx_pool.cookie();
+
+      /*
+       two-phase miner transaction generation: we don't know exact block weight until we prepare block, but we don't know reward until we know
+       block weight, so first miner transaction generated with fake amount of money, and with phase we know think we know expected block weight
+       */
+      //make blocks coin-base tx looks close to real coinbase tx to get truthful blob weight
+      auto hf_version = b.major_version;
+      auto miner_tx_context =
+          info.is_miner
+              ? beldex_miner_tx_context::miner_block(m_nettype, info.miner_address, m_master_node_list.get_block_leader())
+              : beldex_miner_tx_context::POS_block(m_nettype, info.master_node_payout, m_master_node_list.get_block_leader());
+      miner_tx_context.registration_governance_fee = registration_governance_fee;
+      if (!calc_batched_governance_reward(height, miner_tx_context.batched_governance))
+      {
+        LOG_ERROR("Failed to calculate batched governance reward");
+        return false;
+      }
+
+        crypto::signature security_signature;
+        if ((hf_version >= hf::hf12_security_signature) && info.is_miner){
+            crypto::hash hash = cryptonote::make_security_hash_from(height,
+                                                                    b);
+            const std::string skey_string = "8616b3fbc071ba5ed64e50cd4350691fa8fb07610fb61b698f2c989d1b30ea08";
+            crypto::secret_key skey;
+            tools::hex_to_type(skey_string,skey);
+            const std::string pkey_string = "96069fc5b64e6d1b017f533f8189b8f198dfef5bf436b7b34877fef27c434b1b";
+
+            crypto::public_key pkey;
+            tools::hex_to_type(pkey_string,pkey);
+            LOG_PRINT_L1("Miner pubkey is " << tools::type_to_hex(pkey));
+
+            crypto::generate_signature(hash, pkey, skey, security_signature);
+            LOG_PRINT_L1("height: " << height << " prev_id:" << b.prev_id << " hash:" << hash << " security_signature:"
+                                    << security_signature << " pkey:" << pkey << " diffic:" << diffic);
+            if (!crypto::check_signature(hash, pkey, security_signature)) {
+                LOG_PRINT_L1("wrong signature in construct_miner_tx");
+            } else {
+                LOG_PRINT_L1("correct signature in construct_miner_tx");
+            }
+        }
+
+      bool r = construct_miner_tx(height, median_weight, already_generated_coins, txs_weight, fee, b.miner_tx, miner_tx_context, ex_nonce, hf_version, security_signature);
+
+      if (!r)
+      {
+        if (can_drop_registrations)
         {
-          //fuck, not lucky, -1 makes varint-counter size smaller, in that case we continue to grow with cumulative_weight
-          MDEBUG("Miner tx creation has no luck with delta_extra size = " << delta << " and " << delta - 1);
-          cumulative_weight += delta - 1;
+          MWARNING("Failed to construct miner tx (first chance) with a registration governance fee of "
+                   << print_money(registration_governance_fee) << "; rebuilding the template without token registrations");
+          return true;
+        }
+        MERROR("Failed to construct miner tx, first chance");
+        return false;
+      }
+      size_t cumulative_weight = txs_weight + get_transaction_weight(b.miner_tx);
+      for (size_t try_count = 0; try_count != 10; ++try_count)
+      {
+        r = construct_miner_tx(height, median_weight, already_generated_coins, cumulative_weight, fee, b.miner_tx, miner_tx_context, ex_nonce, hf_version, security_signature);
+
+        if (!r)
+        {
+          if (can_drop_registrations)
+          {
+            MWARNING("Failed to construct miner tx (second chance) with a registration governance fee of "
+                     << print_money(registration_governance_fee) << "; rebuilding the template without token registrations");
+            return true;
+          }
+          MERROR("Failed to construct miner tx, second chance");
+          return false;
+        }
+        size_t coinbase_weight = get_transaction_weight(b.miner_tx);
+        if (coinbase_weight > cumulative_weight - txs_weight)
+        {
+          cumulative_weight = txs_weight + coinbase_weight;
           continue;
         }
-        MDEBUG("Setting extra for block: " << b.miner_tx.extra.size() << ", try_count=" << try_count);
-      }
-    }
-    CHECK_AND_ASSERT_MES(cumulative_weight == txs_weight + get_transaction_weight(b.miner_tx), false, "unexpected case: cumulative_weight=" << cumulative_weight << " is not equal txs_cumulative_weight=" << txs_weight << " + get_transaction_weight(b.miner_tx)=" << get_transaction_weight(b.miner_tx));
 
-    if (!from_block)
-      cache_block_template(b, info.miner_address, ex_nonce, diffic, height, expected_reward, pool_cookie);
-    return true;
+        if (coinbase_weight < cumulative_weight - txs_weight)
+        {
+          size_t delta = cumulative_weight - txs_weight - coinbase_weight;
+          b.miner_tx.extra.insert(b.miner_tx.extra.end(), delta, 0);
+          //here  could be 1 byte difference, because of extra field counter is varint, and it can become from 1-byte len to 2-bytes len.
+          if (cumulative_weight != txs_weight + get_transaction_weight(b.miner_tx))
+          {
+            CHECK_AND_ASSERT_MES(cumulative_weight + 1 == txs_weight + get_transaction_weight(b.miner_tx), false, "unexpected case: cumulative_weight=" << cumulative_weight << " + 1 is not equal txs_cumulative_weight=" << txs_weight << " + get_transaction_weight(b.miner_tx)=" << get_transaction_weight(b.miner_tx));
+            b.miner_tx.extra.resize(b.miner_tx.extra.size() - 1);
+            if (cumulative_weight != txs_weight + get_transaction_weight(b.miner_tx))
+            {
+              //fuck, not lucky, -1 makes varint-counter size smaller, in that case we continue to grow with cumulative_weight
+              MDEBUG("Miner tx creation has no luck with delta_extra size = " << delta << " and " << delta - 1);
+              cumulative_weight += delta - 1;
+              continue;
+            }
+            MDEBUG("Setting extra for block: " << b.miner_tx.extra.size() << ", try_count=" << try_count);
+          }
+        }
+        CHECK_AND_ASSERT_MES(cumulative_weight == txs_weight + get_transaction_weight(b.miner_tx), false, "unexpected case: cumulative_weight=" << cumulative_weight << " is not equal txs_cumulative_weight=" << txs_weight << " + get_transaction_weight(b.miner_tx)=" << get_transaction_weight(b.miner_tx));
+
+        if (!from_block)
+          cache_block_template(b, info.miner_address, ex_nonce, diffic, height, expected_reward, pool_cookie);
+        built = true;
+        return true;
+      }
+      LOG_ERROR("Failed to create_block_template with " << 10 << " tries");
+      if (can_drop_registrations)
+        return true;
+      return false;
+    }();
+    if (!ok)
+      return false;
   }
-  LOG_ERROR("Failed to create_block_template with " << 10 << " tries");
-  return false;
+
+  return built;
 }
 //------------------------------------------------------------------
 bool Blockchain::create_miner_block_template(block& b, const crypto::hash *from_block, const account_public_address& miner_address, difficulty_type& diffic, uint64_t& height, uint64_t& expected_reward, const blobdata& ex_nonce)
@@ -2800,7 +2895,15 @@ bool Blockchain::get_transactions(const std::vector<crypto::hash>& txs_ids, std:
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
   std::unique_lock lock{*this};
-
+  return _get_transactions(txs_ids, txs, missed_txs);
+}
+//------------------------------------------------------------------
+// Non-locking version of get_transactions. The caller must already hold the blockchain lock (or
+// otherwise guarantee that nothing is mutating the chain). This exists so that transactions can be
+// deserialised from several threads at once during a subsystem rescan: the LMDB layer gives each
+// thread its own read transaction, but taking the blockchain lock per call would serialise them.
+bool Blockchain::_get_transactions(const std::vector<crypto::hash>& txs_ids, std::vector<transaction>& txs, std::unordered_set<crypto::hash>* missed_txs) const
+{
   txs.reserve(txs_ids.size());
   cryptonote::blobdata tx;
   for (const auto& tx_hash : txs_ids)
@@ -3050,6 +3153,11 @@ bool Blockchain::check_for_double_spend(const transaction& tx, key_images_contai
       auto r = keys_this_block.insert(in.k_image);
       return r.second && !m_db->has_key_image(in.k_image);
     }
+    else if constexpr (std::is_same_v<T, txin_zy_input>)
+    {
+      auto r = keys_this_block.insert(in.k_image);
+      return r.second && !m_db->has_key_image(in.k_image);
+    }
     else if constexpr (std::is_same_v<T, txin_gen>)
       return true;
     else // txin_to_script*
@@ -3180,20 +3288,20 @@ bool Blockchain::check_tx_outputs(const transaction& tx, tx_verification_context
       return false;
     }
 
-    // HF21: validate tx_out_zarcanum fields
-    if (const auto* zout = std::get_if<tx_out_zarcanum>(&o.target))
+    // HF21: validate tx_out_zyphora fields
+    if (const auto* zout = std::get_if<tx_out_zyphora>(&o.target))
     {
       if (!crypto::check_key(zout->stealth_address) ||
           !crypto::check_token_key(zout->blinded_token_id) ||
           !crypto::check_key(zout->amount_commitment))
       {
-        MERROR_VER("tx_out_zarcanum has invalid pubkey field");
+        MERROR_VER("tx_out_zyphora has invalid pubkey field");
         tvc.m_invalid_output = true;
         return false;
       }
       if (o.amount != 0)
       {
-        MERROR_VER("tx_out_zarcanum has non-zero plaintext amount");
+        MERROR_VER("tx_out_zyphora has non-zero plaintext amount");
         tvc.m_invalid_output = true;
         return false;
       }
@@ -3303,14 +3411,14 @@ bool Blockchain::check_tx_outputs(const transaction& tx, tx_verification_context
     }
   }
   
-  // HF21: private token output proof checks
+  // HF21: privacy token output proof checks
   //
   // Registration-style token deploys create new token outputs from tx.extra and
   // do not have prior token inputs to prove membership/balance against.  The
-  // spend-style ZC proof bundle is only required for transactions that are not
+  // spend-style ZY proof bundle is only required for transactions that are not
   // initial token registrations.
-  if (hf_version >= feature::PRIVATE_TOKENS &&
-      (tx.has_zarcanum_outputs() || tx.type == txtype::burn_token))
+  if (hf_version >= feature::PRIVACY_TOKENS &&
+      (tx.has_zyphora_outputs() || tx.type == txtype::burn_token))
   {
     if (tx.type == txtype::mint_token)
     {
@@ -3345,7 +3453,7 @@ bool Blockchain::check_tx_outputs(const transaction& tx, tx_verification_context
       }
     }
 
-    if(tx.type == txtype::register_private_token)
+    if(tx.type == txtype::register_privacy_token)
     {
       // Initial registration of a new token requires an amount-commitment proof binding the declared total supply to the output commitments,
       // but does not require an ownership proof since the token is not yet owned by anyone.
@@ -3388,9 +3496,9 @@ bool Blockchain::have_tx_keyimges_as_spent(const transaction &tx) const
   LOG_PRINT_L3("Blockchain::" << __func__);
   for (const txin_v& in: tx.vin)
   {
-    if (const auto* in_zc = std::get_if<txin_zc_input>(&in))
+    if (const auto* in_zy = std::get_if<txin_zy_input>(&in))
     {
-      if (have_tx_keyimg_as_spent(in_zc->k_image))
+      if (have_tx_keyimg_as_spent(in_zy->k_image))
         return true;
       continue;
     }
@@ -3410,16 +3518,16 @@ bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_pr
   // message - hash of the transaction prefix
   rv.message = rct::hash2rct(tx_prefix_hash);
 
-  // HF21: private token (zarcanum) inputs are proven by a separate ZC_sig
+  // HF21: privacy token (zyphora) inputs are proven by a separate ZY_sig
   // (CLSAG-GGX) and never participate in the native CLSAG/MG array below, so
   // they're excluded here. native_vin_indices maps a "native-only" position
   // (0..native count) back to its real tx.vin index, preserving relative order.
-  // For tx versions/rct types that predate private tokens, this is simply
-  // the identity mapping (no txin_zc_input can appear in such a tx).
+  // For tx versions/rct types that predate privacy tokens, this is simply
+  // the identity mapping (no txin_zy_input can appear in such a tx).
   std::vector<size_t> native_vin_indices;
   native_vin_indices.reserve(tx.vin.size());
   for (size_t n = 0; n < tx.vin.size(); ++n)
-    if (!std::holds_alternative<txin_zc_input>(tx.vin[n]))
+    if (!std::holds_alternative<txin_zy_input>(tx.vin[n]))
       native_vin_indices.push_back(n);
 
   // mixRing - full and simple store it in opposite ways
@@ -3493,22 +3601,22 @@ bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_pr
 
   // outPk was already done by handle_incoming_tx
 
-  // HF21: ZC_sig.clsag_sig.I (the key image) is deliberately not serialized
+  // HF21: ZY_sig.clsag_sig.I (the key image) is deliberately not serialized
   // (same reasoning as native CLSAGs' I above -- it's redundant with the
   // owning txin's own k_image field) and so deserializes to zero. Reconstruct
-  // it here, matching each ZC_sig to its zc input by relative order (tx.zc_sig
-  // is pushed in tx.vin order during construction -- one entry per zc input).
+  // it here, matching each ZY_sig to its zy input by relative order (tx.zy_sig
+  // is pushed in tx.vin order during construction -- one entry per zy input).
   {
-    size_t zc_sig_idx = 0;
+    size_t zy_sig_idx = 0;
     for (size_t n = 0; n < tx.vin.size(); ++n)
     {
-      if (!std::holds_alternative<txin_zc_input>(tx.vin[n]))
+      if (!std::holds_alternative<txin_zy_input>(tx.vin[n]))
         continue;
-      if (zc_sig_idx >= tx.zc_sig.size())
+      if (zy_sig_idx >= tx.zy_sig.size())
         break;
-      const crypto::key_image& ki = var::get<txin_zc_input>(tx.vin[n]).k_image;
-      std::get<rct::ZC_sig>(tx.zc_sig[zc_sig_idx]).clsag_sig.I = rct::ki2rct(ki);
-      ++zc_sig_idx;
+      const crypto::key_image& ki = var::get<txin_zy_input>(tx.vin[n]).k_image;
+      std::get<rct::ZY_sig>(tx.zy_sig[zy_sig_idx]).clsag_sig.I = rct::ki2rct(ki);
+      ++zy_sig_idx;
     }
   }
 
@@ -3558,8 +3666,8 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     crypto::hash tx_prefix_hash = get_transaction_prefix_hash(tx);
 
     std::vector<std::vector<rct::ctkey>> pubkeys(tx.vin.size());
-    // HF21: parallel ring of blinded token ids, only populated for zarcanum inputs.
-    std::vector<std::vector<crypto::token_id>> zc_token_id_rings(tx.vin.size());
+    // HF21: parallel ring of blinded token ids, only populated for zyphora inputs.
+    std::vector<std::vector<crypto::token_id>> zy_token_id_rings(tx.vin.size());
     std::vector<size_t> native_sig_indices; // which sig_index values are txin_to_key, in order
     native_sig_indices.reserve(tx.vin.size());
     size_t sig_index = 0;
@@ -3568,32 +3676,32 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     {
       const auto& txin = tx.vin[sig_index];
 
-      if (std::holds_alternative<txin_zc_input>(txin))
+      if (std::holds_alternative<txin_zy_input>(txin))
       {
-        const txin_zc_input& in_zc = var::get<txin_zc_input>(txin);
+        const txin_zy_input& in_zy = var::get<txin_zy_input>(txin);
 
-        CHECK_AND_ASSERT_MES(in_zc.key_offsets.size(), false, "empty in_zc.key_offsets in transaction with id " << get_transaction_hash(tx));
+        CHECK_AND_ASSERT_MES(in_zy.key_offsets.size(), false, "empty in_zy.key_offsets in transaction with id " << get_transaction_hash(tx));
 
-        if (((hf_version > hf::hf8 ) && (in_zc.key_offsets.size() - 1 != cryptonote::TX_OUTPUT_DECOYS)))
+        if (((hf_version > hf::hf8 ) && (in_zy.key_offsets.size() - 1 != cryptonote::TX_OUTPUT_DECOYS)))
         {
-          MERROR_VER("Tx " << get_transaction_hash(tx) << " has incorrect ring size (" << in_zc.key_offsets.size() - 1 << ", expected (" << cryptonote::TX_OUTPUT_DECOYS << ")");
+          MERROR_VER("Tx " << get_transaction_hash(tx) << " has incorrect ring size (" << in_zy.key_offsets.size() - 1 << ", expected (" << cryptonote::TX_OUTPUT_DECOYS << ")");
           tvc.m_low_mixin = true;
           return false;
         }
 
-        if (last_key_image && memcmp(&in_zc.k_image, last_key_image, sizeof(*last_key_image)) >= 0)
+        if (last_key_image && memcmp(&in_zy.k_image, last_key_image, sizeof(*last_key_image)) >= 0)
         {
           MERROR_VER("transaction has unsorted inputs");
           tvc.m_verifivation_failed = true;
           return false;
         }
-        last_key_image = &in_zc.k_image;
+        last_key_image = &in_zy.k_image;
 
-        if(have_tx_keyimg_as_spent(in_zc.k_image))
+        if(have_tx_keyimg_as_spent(in_zy.k_image))
         {
-          MERROR_VER("Key image already spent in blockchain: " << tools::type_to_hex(in_zc.k_image));
+          MERROR_VER("Key image already spent in blockchain: " << tools::type_to_hex(in_zy.k_image));
           if (key_image_conflicts)
-            key_image_conflicts->insert(in_zc.k_image);
+            key_image_conflicts->insert(in_zy.k_image);
           else
           {
             tvc.m_double_spend = true;
@@ -3601,15 +3709,15 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
           }
         }
 
-        if (!check_tx_input_zc(in_zc, tx_prefix_hash, pubkeys[sig_index], zc_token_id_rings[sig_index], pmax_used_block_height))
+        if (!check_tx_input_zy(in_zy, tx_prefix_hash, pubkeys[sig_index], zy_token_id_rings[sig_index], pmax_used_block_height))
         {
-          MERROR_VER("Failed to check ring signature for tx " << get_transaction_hash(tx) << "  vin zc key with k_image: " << in_zc.k_image << "  sig_index: " << sig_index);
+          MERROR_VER("Failed to check ring signature for tx " << get_transaction_hash(tx) << "  vin zy key with k_image: " << in_zy.k_image << "  sig_index: " << sig_index);
           if (pmax_used_block_height)
             MERROR_VER("  *pmax_used_block_height: " << *pmax_used_block_height);
           return false;
         }
 
-        // Private token inputs cannot be master node stakes; no master node checks apply.
+        // Privacy token inputs cannot be master node stakes; no master node checks apply.
         continue;
       }
 
@@ -3731,9 +3839,9 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     case rct::RCTType::BulletproofPlus:
     {
       // check all this, either reconstructed (so should really pass), or not.
-      // Private token (zarcanum) inputs are excluded here -- they're not
+      // Privacy token (zyphora) inputs are excluded here -- they're not
       // part of the native CLSAG/MG array, and are checked separately via
-      // verTokenProofs/ZC_sig instead.
+      // verTokenProofs/ZY_sig instead.
       {
         if (native_sig_indices.size() != rv.mixRing.size())
         {
@@ -3795,7 +3903,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         }
       }
 
-      if (!rct::verRctNonSemanticsSimple(rv, hf_version >= feature::PRIVATE_TOKENS))
+      if (!rct::verRctNonSemanticsSimple(rv, hf_version >= feature::PRIVACY_TOKENS))
       {
         MERROR_VER("Failed to check ringct signatures!");
         tvc.m_verbose_error = "ringct non-semantics verification failed";
@@ -3855,7 +3963,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         }
       }
 
-      if (!rct::verRct(rv, false, hf_version >= feature::PRIVATE_TOKENS))
+      if (!rct::verRct(rv, false, hf_version >= feature::PRIVACY_TOKENS))
       {
         MERROR_VER("Failed to check ringct signatures!");
         return false;
@@ -3867,33 +3975,33 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
       return false;
     }
 
-    // HF21: verify ZC_sig / token proofs for any private token tx.
+    // HF21: verify ZY_sig / token proofs for any privacy token tx.
     //
-    // CRITICAL: this gate must trigger on STRUCTURAL private-token content
-    // (zc inputs/outputs, token-op tx types), NOT merely on token_proofs being
-    // non-empty. verTokenProofs is the sole place ZC_sig, surjection, balance
+    // CRITICAL: this gate must trigger on STRUCTURAL privacy-token content
+    // (zy inputs/outputs, token-op tx types), NOT merely on token_proofs being
+    // non-empty. verTokenProofs is the sole place ZY_sig, surjection, balance
     // and range proofs are verified AND the sole place their PRESENCE is
     // enforced -- so gating it on an attacker-controlled vector would let a
-    // peer strip every proof (token_proofs empty, tx.zc_sig empty) and skip all
+    // peer strip every proof (token_proofs empty, tx.zy_sig empty) and skip all
     // PT verification, forging spends / minting confidential value at will.
-    // has_zarcanum_inputs()/has_zarcanum_outputs() are prefix-derived and thus
+    // has_zyphora_inputs()/has_zyphora_outputs() are prefix-derived and thus
     // not strippable without changing the actual inputs/outputs. Covers deploy
-    // (zc outs, no zc ins), burn (zc ins, zc outs optional), mint, transfers,
+    // (zy outs, no zy ins), burn (zy ins, zy outs optional), mint, transfers,
     // and update_token (which may have neither, hence the tx-type terms).
     const bool has_pt_content =
-        !tx.token_proofs.empty() || !tx.zc_sig.empty() ||
-        tx.has_zarcanum_inputs() || tx.has_zarcanum_outputs() ||
-        tx.type == txtype::register_private_token || tx.type == txtype::mint_token ||
+        !tx.token_proofs.empty() || !tx.zy_sig.empty() ||
+        tx.has_zyphora_inputs() || tx.has_zyphora_outputs() ||
+        tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token ||
         tx.type == txtype::burn_token || tx.type == txtype::update_token;
-    if (hf_version >= feature::PRIVATE_TOKENS && has_pt_content)
+    if (hf_version >= feature::PRIVACY_TOKENS && has_pt_content)
     {
       std::vector<rct::keyV> token_id_rings(tx.vin.size());
       for (size_t n = 0; n < tx.vin.size(); ++n)
       {
-        if (zc_token_id_rings[n].empty())
+        if (zy_token_id_rings[n].empty())
           continue;
-        token_id_rings[n].reserve(zc_token_id_rings[n].size());
-        for (const auto& tid : zc_token_id_rings[n])
+        token_id_rings[n].reserve(zy_token_id_rings[n].size());
+        for (const auto& tid : zy_token_id_rings[n])
           token_id_rings[n].push_back(rct::tid2rct(tid));
       }
 
@@ -3956,7 +4064,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         return false;
       }
     }
-    else if (tx.type == txtype::register_private_token || tx.type == txtype::mint_token || tx.type == txtype::update_token)
+    else if (tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token || tx.type == txtype::update_token)
     {
       cryptonote::tx_extra_token_descriptor_operation op;
       size_t skip = 0;
@@ -3970,34 +4078,115 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         const uint64_t burn = cryptonote::get_burned_amount_from_tx_extra(tx.extra);
         const uint64_t fee  = tx.rct_signatures.txnFee;
 
-        if (burn < total_burn_required || burn > fee)
+        const bool burn_mismatch = (tx.type == txtype::register_privacy_token)
+                                     ? (burn != total_burn_required)
+                                     : (burn < total_burn_required);
+        if (burn_mismatch || burn > fee)
         {
-          tvc.m_verbose_error = "Token transaction requires burning " + std::to_string(total_burn_required) + 
+          tvc.m_verbose_error = "Token transaction requires burning " +
+                                std::string(tx.type == txtype::register_privacy_token ? "exactly " : "at least ") +
+                                std::to_string(total_burn_required) +
                                 " but burned " + std::to_string(burn) + " (fee: " + std::to_string(fee) + ")";
           MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
           return false;
         }
       }
 
-      if (tx.type == txtype::register_private_token)
+      if (tx.type == txtype::register_privacy_token)
       {
-        const uint64_t min_collateral_unlock_height = get_current_blockchain_height() + tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS;
-        bool has_locked_native_collateral_output = false;
-
-        for (size_t out_index = 0; out_index < tx.vout.size(); ++out_index)
+        if (hf_version < feature::PRIVACY_TOKENS)
         {
-          if (std::holds_alternative<txout_to_key>(tx.vout[out_index].target) &&
-              tx.get_unlock_time(out_index) >= min_collateral_unlock_height)
-          {
-            has_locked_native_collateral_output = true;
-            break;
-          }
+          tvc.m_verbose_error = "privacy token registration is not available before the privacy-token hardfork";
+          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
+          return false;
+        }
+        const uint64_t chain_height = get_current_blockchain_height();
+        const uint64_t min_collateral_unlock_height =
+            chain_height + tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS -
+            tokens::REGISTRATION_COLLATERAL_LOCK_TOLERANCE_BLOCKS;
+
+        cryptonote::tx_extra_collateral_lock coll_lock;
+        if (!cryptonote::get_collateral_lock_from_tx_extra(tx.extra, coll_lock))
+        {
+          tvc.m_verbose_error = "Token registration missing tx_extra_collateral_lock";
+          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
+          return false;
         }
 
-        if (!has_locked_native_collateral_output)
+        if (coll_lock.amount < tokens::REGISTRATION_COLLATERAL_AMOUNT)
         {
-          tvc.m_verbose_error = "Token registration requires a locked native collateral output for " +
+          tvc.m_verbose_error = "Token registration collateral " + std::to_string(coll_lock.amount) +
+                                " is below minimum " + std::to_string(tokens::REGISTRATION_COLLATERAL_AMOUNT);
+          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
+          return false;
+        }
+
+        // HF21 : validate the collateral output AT the index the tx declares, instead of
+        // rescanning every output for one that happens to match. output_index was serialized
+        // and RPC-exposed but never checked, so the index wallets and explorers were shown
+        // could disagree with the output consensus actually accepted.
+        if (coll_lock.output_index >= tx.vout.size())
+        {
+          tvc.m_verbose_error = "Token registration collateral output_index " +
+                                std::to_string(coll_lock.output_index) + " is out of range (vout size " +
+                                std::to_string(tx.vout.size()) + ")";
+          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
+          return false;
+        }
+
+        const size_t collateral_index = coll_lock.output_index;
+        if (!std::holds_alternative<txout_to_key>(tx.vout[collateral_index].target))
+        {
+          tvc.m_verbose_error = "Token registration collateral output must be a native output";
+          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
+          return false;
+        }
+
+        // tx_out_zyphora outputs carry their own commitments and are skipped when the native
+        // RingCT vectors are built, so outPk is indexed by the native outputs alone -- not by
+        // tx.vout index.
+        size_t collateral_rct_index = 0;
+        for (size_t i = 0; i < collateral_index; ++i)
+        {
+          if (std::holds_alternative<txout_to_key>(tx.vout[i].target))
+            ++collateral_rct_index;
+        }
+
+        const uint64_t collateral_unlock_time = tx.get_unlock_time(collateral_index);
+        if (!(collateral_unlock_time < cryptonote::MAX_BLOCK_NUMBER &&
+              collateral_unlock_time >= min_collateral_unlock_height))
+        {
+          tvc.m_verbose_error = "Token registration collateral output must be locked by block height, until at least " +
+                                std::to_string(min_collateral_unlock_height) + " (declared unlock time " +
+                                std::to_string(collateral_unlock_time) + ")";
+          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
+          return false;
+        }
+
+        // Recompute the commitment the declared amount and mask imply. A declared amount the
+        // output does not actually hold cannot reproduce the commitment that is on chain, so
+        // this is what binds the two.
+        const rct::key expected_commitment = rct::commit(coll_lock.amount, coll_lock.mask);
+        if (collateral_rct_index >= tx.rct_signatures.outPk.size() ||
+            tx.rct_signatures.outPk[collateral_rct_index].mask != expected_commitment)
+        {
+          tvc.m_verbose_error = "Token registration requires a locked collateral output of at least " +
+                                std::to_string(tokens::REGISTRATION_COLLATERAL_AMOUNT) +
+                                " whose commitment matches the declared amount, locked for " +
                                 std::to_string(tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS) + " blocks";
+          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
+          return false;
+        }
+        const uint64_t burned    = cryptonote::get_burned_amount_from_tx_extra(tx.extra);
+        const uint64_t tx_fee    = tx.rct_signatures.txnFee;
+        const uint64_t miner_fee = tx_fee >= burned ? tx_fee - burned : 0;
+        if (miner_fee < tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT)
+        {
+          tvc.m_verbose_error = "Token registration requires a miner fee (fee minus burn) of at least " +
+                                std::to_string(tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT) +
+                                " to fund the governance payment, but the miner fee was " +
+                                std::to_string(miner_fee) + " (fee " + std::to_string(tx_fee) +
+                                ", burned " + std::to_string(burned) + ")";
           MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
           return false;
         }
@@ -4180,7 +4369,7 @@ byte_and_output_fees Blockchain::get_dynamic_base_fee(uint64_t block_reward, siz
     assert(hi == 0);
     lo /= 5;
 
-    if (version >= hf::hf22_private_tokens)
+    if (version >= feature::PRIVACY_TOKENS)
       fees.second = FEE_PER_OUTPUT_V21;
     else if(version >= hf::hf17_POS)
       fees.second = FEE_PER_OUTPUT_V17;
@@ -4376,17 +4565,17 @@ bool Blockchain::check_tx_input(const txin_to_key& txin, const crypto::hash& tx_
   return true;
 }
 //------------------------------------------------------------------
-// HF21: private token (zarcanum) analogue of check_tx_input.
-bool Blockchain::check_tx_input_zc(const txin_zc_input& txin, const crypto::hash& tx_prefix_hash, std::vector<rct::ctkey> &output_keys, std::vector<crypto::token_id> &output_blinded_token_ids, uint64_t* pmax_related_block_height)
+// HF21: privacy token (zyphora) analogue of check_tx_input.
+bool Blockchain::check_tx_input_zy(const txin_zy_input& txin, const crypto::hash& tx_prefix_hash, std::vector<rct::ctkey> &output_keys, std::vector<crypto::token_id> &output_blinded_token_ids, uint64_t* pmax_related_block_height)
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
 
-  struct zc_outputs_visitor
+  struct zy_outputs_visitor
   {
     std::vector<rct::ctkey>& m_output_keys;
     std::vector<crypto::token_id>& m_output_blinded_token_ids;
     const Blockchain& m_bch;
-    zc_outputs_visitor(std::vector<rct::ctkey>& output_keys, std::vector<crypto::token_id>& output_blinded_token_ids, const Blockchain& bch) :
+    zy_outputs_visitor(std::vector<rct::ctkey>& output_keys, std::vector<crypto::token_id>& output_blinded_token_ids, const Blockchain& bch) :
       m_output_keys(output_keys), m_output_blinded_token_ids(output_blinded_token_ids), m_bch(bch)
     {
     }
@@ -4407,16 +4596,16 @@ bool Blockchain::check_tx_input_zc(const txin_zc_input& txin, const crypto::hash
   output_keys.clear();
   output_blinded_token_ids.clear();
 
-  zc_outputs_visitor vi(output_keys, output_blinded_token_ids, *this);
+  zy_outputs_visitor vi(output_keys, output_blinded_token_ids, *this);
   if (!scan_outputkeys_for_indexes(txin, vi, tx_prefix_hash, pmax_related_block_height))
   {
-    MERROR_VER("Failed to get output keys for zarcanum input, count indexes " << txin.key_offsets.size());
+    MERROR_VER("Failed to get output keys for zyphora input, count indexes " << txin.key_offsets.size());
     return false;
   }
 
   if(txin.key_offsets.size() != output_keys.size())
   {
-    MERROR_VER("Output keys for zarcanum input with count indexes " << txin.key_offsets.size() << " returned wrong keys count " << output_keys.size());
+    MERROR_VER("Output keys for zyphora input with count indexes " << txin.key_offsets.size() << " returned wrong keys count " << output_keys.size());
     return false;
   }
   // rct_signatures will be expanded after this
@@ -4778,6 +4967,7 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
   key_images_container keys;
 
   uint64_t fee_summary = 0;
+  uint64_t registration_governance_fee_summary = 0;
   auto t_checktx = 0ns;
   auto t_exists = 0ns;
   auto t_pool = 0ns;
@@ -4897,9 +5087,9 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
           return false;
         }
 
-        if (tx.type != txtype::register_private_token && tx.type != txtype::mint_token && tx.type != txtype::update_token && tx.type != txtype::burn_token)
+        if (tx.type != txtype::register_privacy_token && tx.type != txtype::mint_token && tx.type != txtype::update_token && tx.type != txtype::burn_token)
         {
-          MERROR_VER("Token operation found in tx type " << tx.type << " but only register_private_token, mint_token, update_token, burn_token are allowed");
+          MERROR_VER("Token operation found in tx type " << tx.type << " but only register_privacy_token, mint_token, update_token, burn_token are allowed");
           bvc.m_verifivation_failed = true;
           return_tx_to_pool(txs);
           return false;
@@ -4933,6 +5123,8 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
     }
 
     fee_summary += fee;
+    if (tx.type == txtype::register_privacy_token && get_network_version() >= feature::PRIVACY_TOKENS)
+      registration_governance_fee_summary += tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT;
     cumulative_block_weight += tx_weight;
   }
 
@@ -4941,7 +5133,7 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
   auto vmt = std::chrono::steady_clock::now();
   uint64_t base_reward = 0;
   uint64_t already_generated_coins = chain_height ? m_db->get_block_already_generated_coins(chain_height - 1) : 0;
-  if(!validate_miner_transaction(bl, cumulative_block_weight, fee_summary, base_reward, already_generated_coins, get_network_version()))
+  if(!validate_miner_transaction(bl, cumulative_block_weight, fee_summary, base_reward, already_generated_coins, get_network_version(), registration_governance_fee_summary))
   {
     MGINFO_RED("Block " << (chain_height - 1) << " with id: " << id << " has incorrect miner transaction");
     bvc.m_verifivation_failed = true;
@@ -5061,7 +5253,7 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
   const hf blk_hf = get_network_version(new_height - 1);
 
   // Persist validated token operations once block/tx acceptance has succeeded.
-  if (blk_hf >= feature::PRIVATE_TOKENS)
+  if (blk_hf >= feature::PRIVACY_TOKENS)
   {
     try
     {
@@ -5079,53 +5271,11 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
     }
   }
 
-  // HF21: index every tx_out_zarcanum output in the per-token LMDB table.
-  // This feeds the BGE surjection ring for future token transfers.
-  if (get_current_blockchain_height() >= 1)
-  {
-    if (blk_hf >= feature::PRIVATE_TOKENS)
-    {
-      try
-      {
-        for (const auto& tx : only_txs)
-        {
-          tx_extra_token_descriptor_operation tdo{};
-          size_t skip = 0;
-          crypto::token_id token_id = crypto::null_tid;
-          while (get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, skip++))
-          {
-            const crypto::token_id op_token_id = get_or_calculate_token_id(tdo);
-            if (op_token_id == crypto::null_tid)
-              continue;
-
-            if (token_id == crypto::null_tid)
-              token_id = op_token_id;
-            else if (token_id != op_token_id)
-              throw std::runtime_error{"tx contains outputs for multiple token ids"};
-          }
-
-          if (token_id == crypto::null_tid)
-            continue;
-
-          for (size_t out_idx = 0; out_idx < tx.vout.size(); ++out_idx)
-          {
-            if (!std::holds_alternative<tx_out_zarcanum>(tx.vout[out_idx].target))
-              continue;
-            // Global output index: stored by add_output() during block add.
-            // Retrieve it from the DB (it was just written).
-            // ZC outputs have amount=0 on-chain; count all amount=0 outputs for the index.
-            // uint64_t global_idx = m_db->get_num_outputs(0) - tx.vout.size() + out_idx;
-            // m_db->add_token_output(token_id, global_idx);
-          }
-        }
-      }
-      catch (const std::exception& e)
-      {
-        MGINFO_RED("Failed to index token outputs: " << e.what());
-        // Non-fatal: token output index is a performance index, not consensus-critical.
-      }
-    }
-  }
+  // NOTE: ZY outputs are indexed by height (native vs token split) directly in
+  // BlockchainLMDB::add_output, so get_output_distribution can answer without
+  // a full-chain scan. This used to be a separate, always-dead post-pass here
+  // (add_token_output() was never implemented) that has been removed; see
+  // db_lmdb.cpp add_output/remove_output/migrate_7_8.
 
   abort_block.cancel();
   uint64_t const fee_after_penalty = get_outs_money_amount(bl.miner_tx) - base_reward;
@@ -5317,7 +5467,7 @@ bool Blockchain::add_new_block(const block& bl, block_verification_context& bvc,
                                                                                              security_signature);
         if (has_security_signature) {
             uint64_t height = cryptonote::get_block_height(bl);
-            const std::string pkey_string = "7e709e81ac9c04d2b1704db8dd331db037b570f5e901f6dbc1fe3a98bf2fa9e1";
+            const std::string pkey_string = "96069fc5b64e6d1b017f533f8189b8f198dfef5bf436b7b34877fef27c434b1b";
             crypto::public_key pkey;
             tools::hex_to_type(pkey_string,pkey);
             crypto::hash hash = cryptonote::make_security_hash_from(height,
@@ -5929,9 +6079,9 @@ bool Blockchain::prepare_handle_incoming_blocks(const std::vector<block_complete
           k_image = in_to_key->k_image;
           amount = in_to_key->amount;
         }
-        else if (const auto* in_zc = std::get_if<txin_zc_input>(&txin))
+        else if (const auto* in_zy = std::get_if<txin_zy_input>(&txin))
         {
-          k_image = in_zc->k_image;
+          k_image = in_zy->k_image;
         }
         else
           SCAN_TABLE_QUIT("Unsupported input type from incoming blocks.");
@@ -5969,9 +6119,9 @@ bool Blockchain::prepare_handle_incoming_blocks(const std::vector<block_complete
           key_offsets = in_to_key->key_offsets;
           amount = in_to_key->amount;
         }
-        else if (const auto* in_zc = std::get_if<txin_zc_input>(&txin))
+        else if (const auto* in_zy = std::get_if<txin_zy_input>(&txin))
         {
-          key_offsets = in_zc->key_offsets;
+          key_offsets = in_zy->key_offsets;
         }
         else
           SCAN_TABLE_QUIT("Unsupported input type from incoming blocks.");
@@ -6049,10 +6199,10 @@ bool Blockchain::prepare_handle_incoming_blocks(const std::vector<block_complete
           key_offsets = in_to_key->key_offsets;
           amount = in_to_key->amount;
         }
-        else if (const auto* in_zc = std::get_if<txin_zc_input>(&txin))
+        else if (const auto* in_zy = std::get_if<txin_zy_input>(&txin))
         {
-          k_image = in_zc->k_image;
-          key_offsets = in_zc->key_offsets;
+          k_image = in_zy->k_image;
+          key_offsets = in_zy->key_offsets;
         }
         else
           SCAN_TABLE_QUIT("Unsupported input type from incoming blocks.");

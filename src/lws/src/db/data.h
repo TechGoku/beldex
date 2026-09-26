@@ -171,10 +171,10 @@ namespace db
 
     // ── HF22 private tokens ─────────────────────────────────────────────
     // All zero for an ordinary BDX output; `token_id != null` is what marks
-    // this as a tx_out_zarcanum. Appended at the end so the LMDB DUPSORT
+    // this as a tx_out_zyphora. Appended at the end so the LMDB DUPSORT
     // comparator, which orders on the leading `link` and `id`, is unaffected.
     //
-    // `token_id` is the plaintext id recovered by decode_zarcanum_output. The
+    // `token_id` is the plaintext id recovered by decode_zyphora_output. The
     // other three are copied verbatim off the chain because the wallet needs
     // them to rebuild the output and recover its own blinding scalar when
     // spending -- that scalar has no other source, and the server cannot

@@ -154,6 +154,7 @@ namespace cryptonote
     bool set_ignore_outputs_above(const std::vector<std::string> &args = std::vector<std::string>());
     bool set_ignore_outputs_below(const std::vector<std::string> &args = std::vector<std::string>());
     bool set_track_uses(const std::vector<std::string> &args = std::vector<std::string>());
+    bool setup_background_sync(const std::vector<std::string> &args = std::vector<std::string>());
     bool set_inactivity_lock_timeout(const std::vector<std::string> &args = std::vector<std::string>());
     bool set_device_name(const std::vector<std::string> &args = std::vector<std::string>());
     bool help(const std::vector<std::string> &args = std::vector<std::string>());
@@ -191,7 +192,7 @@ namespace cryptonote
     bool bns_lookup(std::vector<std::string> args);
 
     bool coin_burn(std::vector<std::string> args);
-    bool register_private_token(const std::vector<std::string>& args);  // HF21
+    bool register_privacy_token(const std::vector<std::string>& args);  // HF21
     bool get_token_info(const std::string& token_id_hex, nlohmann::json& info_res);
     bool tokens_by_owner(const std::vector<std::string>& args);
     bool mint_token(const std::vector<std::string>& args);        // HF21

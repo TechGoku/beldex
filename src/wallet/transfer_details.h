@@ -60,20 +60,20 @@ struct transfer_details
   std::vector<multisig_info> m_multisig_info; // one per other participant
   std::vector<std::pair<uint64_t, crypto::hash>> m_uses;
 
-  // Private token (HF21+). null_tid = native BDX (txout_to_key).
+  // Privacy token (HF21+). null_tid = native BDX (txout_to_key).
   crypto::token_id m_token_id = crypto::null_tid;
   // Amount blinding mask for the token commitment (needed to build pseudo-out when spending).
   rct::key m_token_mask = rct::zero();
 
   bool is_rct() const { return m_rct; }
-  bool is_zarcanum() const { return m_token_id != crypto::null_tid; }
+  bool is_zyphora() const { return m_token_id != crypto::null_tid; }
   uint64_t amount() const { return m_amount; }
 
   const crypto::token_id &get_token_id() const { return m_token_id; }
 
   const crypto::public_key &get_public_key() const {
-    if (std::holds_alternative<cryptonote::tx_out_zarcanum>(m_tx.vout[m_internal_output_index].target))
-      return var::get<cryptonote::tx_out_zarcanum>(m_tx.vout[m_internal_output_index].target).stealth_address;
+    if (std::holds_alternative<cryptonote::tx_out_zyphora>(m_tx.vout[m_internal_output_index].target))
+      return var::get<cryptonote::tx_out_zyphora>(m_tx.vout[m_internal_output_index].target).stealth_address;
     return var::get<cryptonote::txout_to_key>(m_tx.vout[m_internal_output_index].target).key;
   }
 };

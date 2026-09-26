@@ -1,7 +1,6 @@
 #include "token_descriptor.h"
 
 #include <algorithm>
-#include <cctype>
 #include <limits>
 
 #include <rapidjson/document.h>
@@ -14,17 +13,21 @@ namespace cryptonote
 {
 namespace
 {
+  constexpr bool ascii_digit(unsigned char c) { return c >= '0' && c <= '9'; }
+  constexpr bool ascii_alpha(unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+  constexpr bool ascii_alnum(unsigned char c) { return ascii_digit(c) || ascii_alpha(c); }
+
   bool token_ticker_ok(std::string_view ticker)
   {
-    return !ticker.empty() && ticker.size() <= 14 &&
-        std::all_of(ticker.begin(), ticker.end(), [](unsigned char c) { return std::isalnum(c); });
+    return !ticker.empty() && ticker.size() <= TOKEN_TICKER_MAX_LENGTH &&
+        std::all_of(ticker.begin(), ticker.end(), [](unsigned char c) { return ascii_alnum(c); });
   }
 
   bool token_full_name_ok(std::string_view full_name)
   {
-    return !full_name.empty() &&
+    return !full_name.empty() && full_name.size() <= TOKEN_FULL_NAME_MAX_LENGTH &&
         std::all_of(full_name.begin(), full_name.end(), [](unsigned char c) {
-          return std::isalnum(c) || c == ' ' || c == '_' || c == '-' || c == '.';
+          return ascii_alnum(c) || c == ' ' || c == '_' || c == '-' || c == '.';
         });
   }
 
@@ -55,19 +58,26 @@ namespace
 
 bool validate_token_descriptor_for_registration(const token_descriptor_base& descriptor, std::string& error)
 {
+  if (descriptor.version != TOKEN_DESCRIPTOR_VERSION)
+  {
+    error = "unsupported token descriptor version";
+    return false;
+  }
   if (!token_ticker_ok(descriptor.ticker))
   {
-    error = "ticker is invalid; expected 1-14 alphanumeric characters";
+    error = "ticker is invalid; expected 1-" + std::to_string(TOKEN_TICKER_MAX_LENGTH) +
+            " ASCII alphanumeric characters";
     return false;
   }
   if (!token_full_name_ok(descriptor.full_name))
   {
-    error = "full_name contains unsupported characters";
+    error = "full_name is invalid; expected 1-" + std::to_string(TOKEN_FULL_NAME_MAX_LENGTH) +
+            " ASCII alphanumeric, space, '_', '-' or '.' characters";
     return false;
   }
-  if (descriptor.decimal_point > 18)
+  if (descriptor.decimal_point > TOKEN_MAX_DECIMAL_POINT)
   {
-    error = "decimal_point must be <= 18";
+    error = "decimal_point must be <= " + std::to_string(TOKEN_MAX_DECIMAL_POINT);
     return false;
   }
   if (descriptor.total_max_supply == 0)
@@ -80,9 +90,9 @@ bool validate_token_descriptor_for_registration(const token_descriptor_base& des
     error = "current_supply cannot exceed total_max_supply";
     return false;
   }
-  if (descriptor.meta_info.length() > 4096)
+  if (descriptor.meta_info.length() > TOKEN_META_INFO_MAX_LENGTH)
   {
-    error = "meta_info cannot exceed 4096 characters";
+    error = "meta_info cannot exceed " + std::to_string(TOKEN_META_INFO_MAX_LENGTH) + " characters";
     return false;
   }
   return true;

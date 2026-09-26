@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "cryptonote_basic/token_descriptor_operation_utils.h"
+#include "cryptonote_basic/token_descriptor.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "cryptonote_config.h"
 #include "serialization/binary_utils.h"
@@ -29,7 +30,7 @@ namespace
 // (a 2-generator Schnorr over the tx prefix hash -- the X-component arises
 // because the minted outputs' real commitments are built on their own
 // blinded token ids T_j = token_id + r_j*X, see rct::commitToken), and that
-// the zarcanum output commitments sum to C. Adapted from Zano
+// the zyphora output commitments sum to C. Adapted from Zano
 // validate_token_operation_amount_commitment.
 bool verify_token_amount_commitment(const transaction& tx,
                                     const tx_extra_token_descriptor_operation& op,
@@ -83,36 +84,36 @@ bool verify_token_amount_commitment(const transaction& tx,
   }
 
   // For deploy/mint, tie the TDO commitment to the actual minted outputs: the
-  // sum of the zarcanum output commitments must equal the TDO
+  // sum of the zyphora output commitments must equal the TDO
   // amount_commitment. Combined with the composition_proof above (which fixes
   // C = declared_amount·token_id + sum_masks·G + secret_x·X), this forces
   // sum(output amounts) == declared_amount, so an issuer cannot declare a
   // small supply while minting outputs worth more.
   //
   // Burns intentionally destroy the declared amount rather than materializing
-  // it as outputs, so their TDO commitment is consumed by the zc_balance_proof
+  // it as outputs, so their TDO commitment is consumed by the zy_balance_proof
   // instead of being matched against sum(outputs).
-  if (op.operation_type == token_descriptor_operation_type::burn_token)
+  if (op.operation_type == token_descriptor_operation_type::burn_token && tx.type == txtype::burn_token)
     return true;
 
   rct::key sum_out = rct::identity();
-  bool saw_zc_out = false;
+  bool saw_zy_out = false;
   for (const auto& o : tx.vout)
   {
-    if (const auto* z = std::get_if<tx_out_zarcanum>(&o.target))
+    if (const auto* z = std::get_if<tx_out_zyphora>(&o.target))
     {
       rct::addKeys(sum_out, sum_out, rct::pk2rct(z->amount_commitment));
-      saw_zc_out = true;
+      saw_zy_out = true;
     }
   }
-  if (!saw_zc_out)
+  if (!saw_zy_out)
   {
-    reason = "token operation has no zarcanum outputs to back the declared amount";
+    reason = "token operation has no zyphora outputs to back the declared amount";
     return false;
   }
   if (!rct::equalKeys(sum_out, C))
   {
-    reason = "zarcanum output commitments do not sum to the declared amount commitment";
+    reason = "zyphora output commitments do not sum to the declared amount commitment";
     return false;
   }
 
@@ -124,12 +125,12 @@ void set_reason(std::string* reason, std::string value)
   if (reason) *reason = std::move(value);
 }
 
-// Count tx_out_zarcanum outputs in a transaction.
-size_t count_zarcanum_outputs(const transaction& tx)
+// Count tx_out_zyphora outputs in a transaction.
+size_t count_zyphora_outputs(const transaction& tx)
 {
   size_t n = 0;
   for (const auto& out : tx.vout)
-    if (std::holds_alternative<tx_out_zarcanum>(out.target))
+    if (std::holds_alternative<tx_out_zyphora>(out.target))
       ++n;
   return n;
 }
@@ -237,6 +238,11 @@ bool validate_token_descriptor_operation(const tx_extra_token_descriptor_operati
         reason = "register_token operation requires descriptor field";
         return false;
       }
+      if (op.field_is_set(token_field_token_id))
+      {
+        reason = "register_token must not carry an explicit token_id; it is derived from the descriptor";
+        return false;
+      }
       break;
 
     case token_descriptor_operation_type::mint_token:
@@ -295,6 +301,8 @@ bool apply_token_operation_to_state(
         return reject("register_token for existing token");
       if (!op.field_is_set(token_field_descriptor))
         return reject("register_token missing descriptor");
+      if (op.field_is_set(token_field_token_id))
+        return reject("register_token must not carry an explicit token_id; it is derived from the descriptor");
 
       const auto& d = op.descriptor;
       if (d.ticker.empty())
@@ -305,6 +313,12 @@ bool apply_token_operation_to_state(
         return reject("token owner must not be null");
       if (d.current_supply > d.total_max_supply)
         return reject("current_supply exceeds total_max_supply");
+
+      {
+        std::string descriptor_error;
+        if (!validate_token_descriptor_for_registration(d, descriptor_error))
+          return reject("register_token descriptor rejected: " + descriptor_error);
+      }
 
       state.exists = true;
       state.descriptor = d;
@@ -363,6 +377,14 @@ bool apply_token_operation_to_state(
         return reject("update_token cannot modify full_name");
       if (d.decimal_point != state.descriptor.decimal_point)
         return reject("update_token cannot modify decimal_point");
+      if (d.version != state.descriptor.version)
+        return reject("update_token cannot modify descriptor version");
+
+      {
+        std::string descriptor_error;
+        if (!validate_token_descriptor_for_registration(d, descriptor_error))
+          return reject("update_token descriptor rejected: " + descriptor_error);
+      }
 
       state.descriptor = d;
       return true;
@@ -407,7 +429,7 @@ bool validate_tx_token_operations_against_db(
     std::string& reason,
     hf hf_version)
 {
-  if (hf_version < feature::PRIVATE_TOKENS)
+  if (hf_version < feature::PRIVACY_TOKENS)
     return true;
 
   size_t op_index = 0;
@@ -416,20 +438,73 @@ bool validate_tx_token_operations_against_db(
   bool saw_token_op = false;
   crypto::token_id tx_token_id = crypto::null_tid;
 
-  // Count zarcanum outputs once — checked per mint/register op below.
-  const size_t zc_out_count = (hf_version >= feature::PRIVATE_TOKENS)
-                              ? count_zarcanum_outputs(tx)
+  // Count zyphora outputs once — checked per mint/register op below.
+  const size_t zy_out_count = (hf_version >= feature::PRIVACY_TOKENS)
+                              ? count_zyphora_outputs(tx)
                               : 0;
 
   while (get_token_descriptor_operation_from_tx_extra(tx.extra, op, op_index++))
   {
     saw_token_op = true;
 
-    if (tx.type != txtype::register_private_token && tx.type != txtype::mint_token &&
+    if (tx.type != txtype::register_privacy_token && tx.type != txtype::mint_token &&
         tx.type != txtype::update_token && tx.type != txtype::burn_token)
     {
-      reason = "token descriptor operation is only allowed in register_private_token, mint_token, update_token or burn_token transactions";
+      reason = "token descriptor operation is only allowed in register_privacy_token, mint_token, update_token or burn_token transactions";
       return false;
+    }
+
+    // ── F0 fix: tx.type and the descriptor operation_type MUST be the matching
+    // pair. Consensus rules were historically split across the two fields -- some
+    // keyed on tx.type (surjection ring membership, proof presence), others on
+    // op.operation_type (ownership, "outputs sum to commitment", supply update) --
+    // with nothing forcing them to agree. A mint_token-typed tx carrying a
+    // burn_token op could therefore gain minting power (from tx.type) while
+    // skipping the ownership and conservation checks (which the burn op waives),
+    // letting anyone mint arbitrary amounts of any token. Enforce the bijection
+    // up front so the two fields can never disagree.
+    {
+      bool type_matches = false;
+      switch (op.operation_type)
+      {
+        case token_descriptor_operation_type::register_token: type_matches = (tx.type == txtype::register_privacy_token); break;
+        case token_descriptor_operation_type::mint_token:     type_matches = (tx.type == txtype::mint_token);             break;
+        case token_descriptor_operation_type::update_token:   type_matches = (tx.type == txtype::update_token);           break;
+        case token_descriptor_operation_type::burn_token:     type_matches = (tx.type == txtype::burn_token);             break;
+        default:                                              type_matches = false;                                      break;
+      }
+      if (!type_matches)
+      {
+        reason = "tx.type does not match the token descriptor operation_type (cross-typed token operation rejected)";
+        return false;
+      }
+    }
+
+    // ── F0 fix: exactly one token descriptor operation per token transaction.
+    // verTokenProofs only ever reads the first TDO, so a second TDO could apply a
+    // state change (e.g. a second burn decrementing supply again) that no proof
+    // covers. op_index has already been incremented by the while-condition, so it
+    // equals 1 on the first operation, 2 on the second, etc.
+    if (op_index > 1)
+    {
+      reason = "a token transaction must carry exactly one token descriptor operation";
+      return false;
+    }
+
+    // ── F0 fix: a burn must actually spend token inputs. The balance-proof gate
+    // is keyed on the ZY input count, so a burn with zero ZY inputs bypasses
+    // conservation entirely; such a burn is also semantically meaningless.
+    if (op.operation_type == token_descriptor_operation_type::burn_token)
+    {
+      size_t zy_input_count = 0;
+      for (const auto& in : tx.vin)
+        if (std::holds_alternative<txin_zy_input>(in))
+          ++zy_input_count;
+      if (zy_input_count == 0)
+      {
+        reason = "burn_token transaction must spend at least one privacy-token (ZY) input";
+        return false;
+      }
     }
 
     std::string op_reason;
@@ -440,9 +515,9 @@ bool validate_tx_token_operations_against_db(
     }
 
     // ── Mandatory fan-out: deploy and mint must create >= MIN_TOKEN_MINT_OUTPUTS
-    // tx_out_zarcanum outputs so that ring members exist from the first block.
+    // tx_out_zyphora outputs so that ring members exist from the first block.
     // The wallet auto-generates self-sends to reach this minimum.
-    if (hf_version >= feature::PRIVATE_TOKENS)
+    if (hf_version >= feature::PRIVACY_TOKENS)
     {
       const bool is_deploy_with_supply =
           (op.operation_type == token_descriptor_operation_type::register_token) &&
@@ -451,12 +526,12 @@ bool validate_tx_token_operations_against_db(
 
       if (is_deploy_with_supply)
       {
-        if (zc_out_count < MIN_TOKEN_MINT_OUTPUTS)
+        if (zy_out_count < MIN_TOKEN_MINT_OUTPUTS)
         {
           reason = "deploy tx must have at least " +
                    std::to_string(MIN_TOKEN_MINT_OUTPUTS) +
-                   " tx_out_zarcanum outputs (got " +
-                   std::to_string(zc_out_count) +
+                   " tx_out_zyphora outputs (got " +
+                   std::to_string(zy_out_count) +
                    "); wallet must auto-generate self-sends to reach this minimum";
           return false;
         }
@@ -530,7 +605,7 @@ bool validate_tx_token_operations_against_db(
     }
   }
 
-  if ((tx.type == txtype::register_private_token || tx.type == txtype::mint_token || tx.type == txtype::update_token) && !saw_token_op)
+  if ((tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token || tx.type == txtype::update_token) && !saw_token_op)
   {
     reason = "deploy/mint/update transaction must include at least one token descriptor operation";
     return false;

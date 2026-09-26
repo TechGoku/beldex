@@ -457,7 +457,7 @@ namespace rct {
         return C;
     }
 
-    // Blind an token ID for a tx_out_zarcanum output:
+    // Blind an token ID for a tx_out_zyphora output:
     //   T = token_id + r * X
     // where r is the per-output blinding scalar
     key blindTokenId(const key& token_id, const key& r) {

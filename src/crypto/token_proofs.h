@@ -21,11 +21,13 @@
 
 #include <cstdint>
 #include <vector>
+#include <stdexcept>
 #include "ringct/rctTypes.h"       // rct::key, rct::keyV
+#include "crypto/crypto-ops.h"     // sc_check (canonical-scalar validation at parse time)
 #include "serialization/serialization.h" // BEGIN_SERIALIZE_OBJECT, FIELD
 
 // ---------------------------------------------------------------------------
-// Private-token zero-knowledge proof primitives (HF21+)
+// Privacy-token zero-knowledge proof primitives (HF21+)
 //
 // Three proof types, in dependency order:
 //
@@ -49,6 +51,8 @@ struct schnorr_sig_s
     BEGIN_SERIALIZE_OBJECT()
       FIELD(y)
       FIELD(c)
+      if (sc_check(y.bytes) != 0 || sc_check(c.bytes) != 0)
+        throw std::runtime_error("Bad schnorr_sig_s serialization (non-canonical scalar)");
     END_SERIALIZE()
 };
 
@@ -92,6 +96,8 @@ struct linear_composition_proof_s
       FIELD(y0)
       FIELD(y1)
       FIELD(c)
+      if (sc_check(y0.bytes) != 0 || sc_check(y1.bytes) != 0 || sc_check(c.bytes) != 0)
+        throw std::runtime_error("Bad linear_composition_proof_s serialization (non-canonical scalar)");
     END_SERIALIZE()
 };
 
@@ -111,7 +117,7 @@ bool verify_linear_composition_proof(const rct::key&                    msg,
 // Proves knowledge of TWO independent scalars (s0, s1) such that
 // P0 = s0*X  and  P1 = s1*G, under one shared Fiat-Shamir challenge.
 //
-// Used to bind the private-token transfer balance proof (P0 = the
+// Used to bind the privacy-token transfer balance proof (P0 = the
 // balance residual, s0 = secret_x) to the transaction's own keypair
 // (P1 = tx_pub_key, s1 = tx_key.sec) -- so a balance proof can't be detached
 // from / replayed against a transaction it wasn't actually generated for.
@@ -134,6 +140,8 @@ struct double_schnorr_sig_s
       FIELD(y0)
       FIELD(y1)
       FIELD(c)
+      if (sc_check(y0.bytes) != 0 || sc_check(y1.bytes) != 0 || sc_check(c.bytes) != 0)
+        throw std::runtime_error("Bad double_schnorr_sig_s serialization (non-canonical scalar)");
     END_SERIALIZE()
 };
 
@@ -177,6 +185,13 @@ struct BGE_proof_s
       FIELD(f)
       FIELD(y)
       FIELD(z)
+      if (Pk.empty() || f.size() != Pk.size() * 3)
+        throw std::runtime_error("Bad BGE_proof_s serialization");
+      if (sc_check(y.bytes) != 0 || sc_check(z.bytes) != 0)
+        throw std::runtime_error("Bad BGE_proof_s serialization (non-canonical scalar)");
+      for (const auto& fi : f)
+        if (sc_check(fi.bytes) != 0)
+          throw std::runtime_error("Bad BGE_proof_s serialization (non-canonical f scalar)");
     END_SERIALIZE()
 };
 
@@ -205,7 +220,7 @@ bool verify_BGE_proof(const rct::key&  context_hash,
 
 // ── 4. Vector HG aggregation proof ──────────────────────────────────────────
 //
-// Adapted from Zano's vector_UG_aggregation_proof (src/crypto/zarcanum.cpp).
+// Adapted from Zano's vector_UG_aggregation_proof (src/crypto/zyphora.cpp).
 // Binds each output's real amount commitment E_j = amount_j*tag_j + mask_j*G
 // to an auxiliary commitment E'_j = amount_j*H + y'_j*G that the existing,
 // unmodified Bulletproof+ engine can range-prove directly (it already uses
@@ -213,7 +228,7 @@ bool verify_BGE_proof(const rct::key&  context_hash,
 // avoids touching that shared, consensus-critical code at all). real_tags_j
 // varies per output in Zano (a per-output blinded token tag); in Beldex it's
 // the same plaintext token_id for every output in a tx, since one tx may
-// only touch one private token -- a valid specialization of the same
+// only touch one privacy token -- a valid specialization of the same
 // proof.
 //
 // For a random public weight w = Hs(m, {E_j}, {E'_j}), proves knowledge of
@@ -228,7 +243,7 @@ bool verify_BGE_proof(const rct::key&  context_hash,
 // token-id-based proofs already depend on.
 struct vector_ug_aggregation_proof_s
 {
-    rct::keyV amount_commitments_for_rp_aggregation; // E'_j, one per ZC output, premultiplied by 1/8
+    rct::keyV amount_commitments_for_rp_aggregation; // E'_j, one per ZY output, premultiplied by 1/8
     rct::keyV y0s; // response scalars (knowledge of amount_j)
     rct::keyV y1s; // response scalars (knowledge of mask_j + w*y'_j)
     rct::key  c;   // common Fiat-Shamir challenge
@@ -238,12 +253,24 @@ struct vector_ug_aggregation_proof_s
       FIELD(y0s)
       FIELD(y1s)
       FIELD(c)
+      if (amount_commitments_for_rp_aggregation.empty() ||
+          y0s.size() != amount_commitments_for_rp_aggregation.size() ||
+          y1s.size() != amount_commitments_for_rp_aggregation.size())
+        throw std::runtime_error("Bad vector_ug_aggregation_proof_s serialization");
+      if (sc_check(c.bytes) != 0)
+        throw std::runtime_error("Bad vector_ug_aggregation_proof_s serialization (non-canonical c)");
+      for (const auto& s : y0s)
+        if (sc_check(s.bytes) != 0)
+          throw std::runtime_error("Bad vector_ug_aggregation_proof_s serialization (non-canonical y0s)");
+      for (const auto& s : y1s)
+        if (sc_check(s.bytes) != 0)
+          throw std::runtime_error("Bad vector_ug_aggregation_proof_s serialization (non-canonical y1s)");
     END_SERIALIZE()
 };
 
 // Generate a vector HG aggregation proof.
 //   context_hash : binds proof to the transaction (e.g. the HF21 token proof message)
-//   amounts      : amount_j for each ZC output (the prover's secret)
+//   amounts      : amount_j for each ZY output (the prover's secret)
 //   real_masks   : mask_j used in each output's real amount commitment
 //   aux_masks    : y'_j used in each output's auxiliary commitment E'_j
 //   real_commitments : E_j, the outputs' real amount commitments

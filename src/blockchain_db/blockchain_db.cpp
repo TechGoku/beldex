@@ -112,9 +112,9 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
     {
       add_spent_key(var::get<txin_to_key>(tx_input).k_image);
     }
-    else if (std::holds_alternative<txin_zc_input>(tx_input))
+    else if (std::holds_alternative<txin_zy_input>(tx_input))
     {
-      add_spent_key(var::get<txin_zc_input>(tx_input).k_image);
+      add_spent_key(var::get<txin_zy_input>(tx_input).k_image);
     }
     else if (std::holds_alternative<txin_gen>(tx_input))
     {
@@ -130,9 +130,9 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
         {
           remove_spent_key(var::get<txin_to_key>(tx_input).k_image);
         }
-        else if (std::holds_alternative<txin_zc_input>(tx_input))
+        else if (std::holds_alternative<txin_zy_input>(tx_input))
         {
-          remove_spent_key(var::get<txin_zc_input>(tx_input).k_image);
+          remove_spent_key(var::get<txin_zy_input>(tx_input).k_image);
         }
       }
       return;
@@ -143,13 +143,13 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
 
   std::vector<uint64_t> amount_output_indices(tx.vout.size());
 
-  // HF21: rct_signatures.outPk is COMPACTED to non-zarcanum (native) outputs --
-  // tx_out_zarcanum outputs carry their own commitment and are excluded when
+  // HF21: rct_signatures.outPk is COMPACTED to non-zyphora (native) outputs --
+  // tx_out_zyphora outputs carry their own commitment and are excluded when
   // genRctSimple builds outPk. So outPk must be indexed by the native-output
-  // position, NOT the vout index; otherwise a mixed native+zarcanum tx reads
+  // position, NOT the vout index; otherwise a mixed native+zyphora tx reads
   // outPk out of bounds and stores a garbage commitment for the native
   // output(s), which then can never be spent (the wallet's recomputed
-  // commitment never matches what the daemon serves for decoys). Zarcanum
+  // commitment never matches what the daemon serves for decoys). Zyphora
   // outputs need no commitment passed here (add_output reads it from the output
   // itself and ignores this argument).
   size_t native_output_index = 0;
@@ -168,7 +168,7 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
       unlock_time = tx.unlock_time;
     }
 
-    const bool is_zarcanum = std::holds_alternative<cryptonote::tx_out_zarcanum>(tx.vout[i].target);
+    const bool is_zyphora = std::holds_alternative<cryptonote::tx_out_zyphora>(tx.vout[i].target);
 
     // miner v2 txes have their coinbase output in one single out to save space,
     // and we store them as rct outputs with an identity mask
@@ -183,7 +183,7 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
     else
     {
       const rct::key* commitment = nullptr;
-      if (tx.version >= cryptonote::txversion::v2_ringct && !is_zarcanum)
+      if (tx.version >= cryptonote::txversion::v2_ringct && !is_zyphora)
       {
         CHECK_AND_ASSERT_THROW_MES(native_output_index < tx.rct_signatures.outPk.size(),
           "outPk index out of range: native output #" << native_output_index
@@ -193,7 +193,7 @@ void BlockchainDB::add_transaction(const crypto::hash& blk_hash, const std::pair
       amount_output_indices[i] = add_output(tx_hash, tx.vout[i], i, unlock_time, commitment);
     }
 
-    if (!is_zarcanum)
+    if (!is_zyphora)
       ++native_output_index;
   }
 
@@ -285,9 +285,9 @@ void BlockchainDB::remove_transaction(const crypto::hash& tx_hash)
     {
       remove_spent_key(var::get<txin_to_key>(tx_input).k_image);
     }
-    else if (std::holds_alternative<txin_zc_input>(tx_input))
+    else if (std::holds_alternative<txin_zy_input>(tx_input))
     {
-      remove_spent_key(var::get<txin_zc_input>(tx_input).k_image);
+      remove_spent_key(var::get<txin_zy_input>(tx_input).k_image);
     }
   }
 

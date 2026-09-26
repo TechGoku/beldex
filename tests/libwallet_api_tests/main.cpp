@@ -558,7 +558,7 @@ TEST_F(WalletTest1, WalletShowsBalance)
     ASSERT_TRUE(unlockedBalance1 == wallet2->unlockedBalance(0));
     std::cout << "wallet unlocked balance: " << wallet2->unlockedBalance(0) << std::endl;
     const auto token_balances = wallet2->tokenBalances(0);
-    std::cout << "Private token balances:" << std::endl;
+    std::cout << "Privacy token balances:" << std::endl;
     for (const auto& token : token_balances) {
         std::cout << "  " << token.tokenId
                   << " (" << (token.ticker.empty() ? "unknown" : token.ticker) << ")"
@@ -846,7 +846,7 @@ TEST_F(WalletTest1, WalletRefresh)
 //     ASSERT_TRUE(Utils::close_wallet_quietly(wmgr, wallet1));
 // }
 
-// TEST_F(WalletTest1, WalletRegisterPrivateTokenTransaction)
+// TEST_F(WalletTest1, WalletRegisterPrivacyTokenTransaction)
 // {
 //     Wallet::Wallet * wallet1 = wmgr->openWallet(CURRENT_SRC_WALLET, TESTNET_WALLET_PASS, Wallet::NetworkType::TESTNET);
 //     ASSERT_TRUE(wallet1->init(TESTNET_DAEMON_ADDRESS, 0));
@@ -856,7 +856,7 @@ TEST_F(WalletTest1, WalletRefresh)
 //         GTEST_SKIP() << readiness_error;
 //     }
 //     if (wallet1->unlockedBalance(0) == 0) {
-//         GTEST_SKIP() << "Need unlocked native BDX to pay register_private_token fee.";
+//         GTEST_SKIP() << "Need unlocked native BDX to pay register_privacy_token fee.";
 //     }
 
 //     const auto unique_suffix = std::to_string(
@@ -884,7 +884,7 @@ TEST_F(WalletTest1, WalletRefresh)
 
 //     std::string token_id;
 //     Wallet::PendingTransaction * transaction =
-//             wallet1->registerPrivateTokenTransaction(descriptor_json.str(), token_id);
+//             wallet1->registerPrivacyTokenTransaction(descriptor_json.str(), token_id);
 
 //     ASSERT_TRUE(transaction->good()) << transaction->status().second;
 //     ASSERT_FALSE(token_id.empty());

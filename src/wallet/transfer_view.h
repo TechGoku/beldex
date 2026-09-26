@@ -83,7 +83,7 @@ inline pay_type pay_type_from_tx(const cryptonote::transaction tx)
     case cryptonote::txtype::stake: return wallet::pay_type::stake;
     case cryptonote::txtype::beldex_name_system: return wallet::pay_type::bns;
     case cryptonote::txtype::coin_burn: return wallet::pay_type::coin_burn;
-    case cryptonote::txtype::register_private_token: return wallet::pay_type::register_token;
+    case cryptonote::txtype::register_privacy_token: return wallet::pay_type::register_token;
     case cryptonote::txtype::mint_token: return wallet::pay_type::mint_token;
     case cryptonote::txtype::update_token: return wallet::pay_type::update_token;
     case cryptonote::txtype::burn_token: return wallet::pay_type::burn_token;

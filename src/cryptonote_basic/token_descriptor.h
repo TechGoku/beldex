@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -8,6 +10,15 @@
 
 namespace cryptonote
 {
+  // Consensus bounds on a token descriptor. These are enforced by
+  // validate_token_descriptor_for_registration, which runs inside
+  // apply_token_operation_to_state -- changing any of them is a hardfork.
+  inline constexpr uint8_t  TOKEN_DESCRIPTOR_VERSION    = 1;
+  inline constexpr size_t   TOKEN_TICKER_MAX_LENGTH     = 14;
+  inline constexpr size_t   TOKEN_FULL_NAME_MAX_LENGTH  = 64;   // N-4
+  inline constexpr size_t   TOKEN_META_INFO_MAX_LENGTH  = 4096;
+  inline constexpr uint8_t  TOKEN_MAX_DECIMAL_POINT     = 18;
+
   enum class token_descriptor_json_mode
   {
     registration,

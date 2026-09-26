@@ -1223,7 +1223,7 @@ namespace lws
         // TODO: report the daemon's real fork version here. This was pinned at
         // 17, which silently disabled every client-side gate above it --
         // including the whole HF22 private-token path, since the client tests
-        // fork_version >= HF_VERSION_PRIVATE_TOKENS before it will build a
+        // fork_version >= feature::PRIVACY_TOKENS before it will build a
         // token transaction at all. Pinned to 22 so the feature is reachable;
         // it must become dynamic before this serves a real network, or the
         // client will try to build token transactions on a chain that has not
