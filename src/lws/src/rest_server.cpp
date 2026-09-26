@@ -2257,15 +2257,20 @@ namespace lws
                    << " -- reason_codes: " << result.value("reason_codes", json::array()).dump()
                    << " -- full result: " << result.dump().substr(0, 600));
           };
-          if (result.value("not_relayed", false))
+          /* The daemon answers "OK" only for a transaction it accepted and
+             relayed. A rejection is STATUS_FAILED, spelled "FAILED", with the
+             causes (including "not_relayed") listed in reason_codes; a daemon
+             still syncing answers "BUSY". Comparing against "Failed", as this
+             used to, matched none of them, so every rejected transaction --
+             a double spend, a bad proof -- was reported to the wallet as sent. */
+          const std::string status = result.value("status", std::string{});
+          if (status != "OK")
           {
-            log_rejection("not relayed");
-            return {lws::error::tx_relay_failed};
-          }
-          if (result.value("status", std::string{"OK"}) == "Failed")
-          {
-            log_rejection("rejected by daemon");
-            return {lws::error::status_failed};
+            const json codes = result.value("reason_codes", json::array());
+            const bool not_relayed =
+              std::find(codes.begin(), codes.end(), "not_relayed") != codes.end();
+            log_rejection(not_relayed ? "not relayed" : "rejected by daemon");
+            return {not_relayed ? lws::error::tx_relay_failed : lws::error::status_failed};
           }
         }
         catch (const std::exception& e)
