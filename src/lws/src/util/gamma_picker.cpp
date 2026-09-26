@@ -114,6 +114,15 @@ namespace lws
     throw std::runtime_error{"Unable to select random output in spendable range using gamma distribution after 100 attempts"};
   }
 
+  std::optional<std::uint64_t> gamma_picker::to_global(const std::uint64_t rank) const noexcept
+  {
+    if (bucket_to_global.empty())
+      return rank;
+    if (bucket_to_global.size() <= rank)
+      return std::nullopt;
+    return bucket_to_global[rank];
+  }
+
   std::vector<std::uint64_t> gamma_picker::take_offsets()
   {
     return std::vector<std::uint64_t>{std::move(rct_offsets)};

@@ -139,7 +139,23 @@ namespace lws
             if (spendable < out.size())
                 return {lws::error::not_enough_mixin};
             if (spendable == out.size())
-                return pick_all(out, 0);
+            {
+                /* Every spendable output is needed, numbered by rank. A rank is
+                   only a global output id in an unmapped bucket; the token
+                   bucket has to be translated, or the ring names whichever
+                   outputs happen to hold those global ids. This is the path the
+                   first token on a chain takes: its registration creates exactly
+                   the minimum number of token outputs a ring needs. */
+                MONERO_CHECK(pick_all(out, 0));
+                for (auto& entry : out)
+                {
+                    const auto global = pick_rct.to_global(entry.index);
+                    if (!global)
+                        return {lws::error::not_enough_mixin};
+                    entry.index = *global;
+                }
+                return success();
+            }
 
             for (auto& entry : out)
             {

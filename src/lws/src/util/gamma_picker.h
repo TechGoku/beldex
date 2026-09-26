@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -60,6 +61,13 @@ namespace lws
       \return Selected output using gamma distribution.
     */
     std::uint64_t operator()();
+
+    /*!
+      \return The global output id for `rank` within this picker's bucket, or
+        `rank` itself when the picker has no rank map. Empty if the map does not
+        reach `rank`.
+    */
+    std::optional<std::uint64_t> to_global(std::uint64_t rank) const noexcept;
 
     //! \return Current ringct distribution used for `operator()()` output selection.
     const std::vector<std::uint64_t>& offsets() const noexcept { return rct_offsets; }
