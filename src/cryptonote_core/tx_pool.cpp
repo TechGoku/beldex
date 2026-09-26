@@ -944,21 +944,24 @@ namespace cryptonote
 
     for(const auto& in: tx.vin)
     {
-      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, txin, false);
-      CHECK_AND_ASSERT_MES(seen_key_images.insert(txin.k_image).second,
+      // Native (txin_to_key) and privacy-token (txin_zy_input) inputs both
+      // carry a key image, and both must be tracked here: a token spend left
+      // out of m_spent_key_images could be double spent within the pool.
+      const crypto::key_image& ki = get_input_key_image(in);
+      CHECK_AND_ASSERT_MES(seen_key_images.insert(ki).second,
           false,
-          "duplicate key image in transaction: " << txin.k_image
+          "duplicate key image in transaction: " << ki
           << "\ntx_id=" << id);
-      auto it = m_spent_key_images.find(txin.k_image);
+      auto it = m_spent_key_images.find(ki);
       if (it != m_spent_key_images.end())
       {
         const std::unordered_set<crypto::hash>& kei_image_set = it->second;
         CHECK_AND_ASSERT_MES(kept_by_block || kei_image_set.size() == 0, false, "internal error: kept_by_block=" << kept_by_block
-                                            << ",  kei_image_set.size()=" << kei_image_set.size() << "\ntxin.k_image=" << txin.k_image
+                                            << ",  kei_image_set.size()=" << kei_image_set.size() << "\ntxin.k_image=" << ki
                                             << "\ntx_id=" << id );
         CHECK_AND_ASSERT_MES(kei_image_set.count(id) == 0, false, "internal error: try to insert duplicate iterator in key_image set");
       }
-      key_images_to_insert.push_back(txin.k_image);
+      key_images_to_insert.push_back(ki);
     }
 
     for (const crypto::key_image &k_image : key_images_to_insert)
@@ -980,21 +983,22 @@ namespace cryptonote
 
     for(const txin_v& vi: tx.vin)
     {
-      CHECKED_GET_SPECIFIC_VARIANT(vi, txin_to_key, txin, false);
+      // Same input kinds as insert_key_images.
+      const crypto::key_image& ki = get_input_key_image(vi);
 
-      CHECK_AND_ASSERT_MES(seen_key_images.insert(txin.k_image).second, false, "duplicate key image in transaction: "
-                                    << txin.k_image << "\ntransaction id = " << actual_hash);
+      CHECK_AND_ASSERT_MES(seen_key_images.insert(ki).second, false, "duplicate key image in transaction: "
+                                    << ki << "\ntransaction id = " << actual_hash);
 
-      auto it = m_spent_key_images.find(txin.k_image);
-      CHECK_AND_ASSERT_MES(it != m_spent_key_images.end(), false, "failed to find transaction input in key images. img=" << txin.k_image
+      auto it = m_spent_key_images.find(ki);
+      CHECK_AND_ASSERT_MES(it != m_spent_key_images.end(), false, "failed to find transaction input in key images. img=" << ki
                                     << "\ntransaction id = " << actual_hash);
       const std::unordered_set<crypto::hash>& key_image_set = it->second;
-      CHECK_AND_ASSERT_MES(key_image_set.size(), false, "empty key_image set, img=" << txin.k_image
+      CHECK_AND_ASSERT_MES(key_image_set.size(), false, "empty key_image set, img=" << ki
         << "\ntransaction id = " << actual_hash);
 
-      CHECK_AND_ASSERT_MES(key_image_set.count(actual_hash), false, "transaction id not found in key_image set, img=" << txin.k_image
+      CHECK_AND_ASSERT_MES(key_image_set.count(actual_hash), false, "transaction id not found in key_image set, img=" << ki
         << "\ntransaction id = " << actual_hash);
-      key_images_to_erase.push_back(txin.k_image);
+      key_images_to_erase.push_back(ki);
     }
 
     for (const crypto::key_image &k_image : key_images_to_erase)
