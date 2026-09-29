@@ -377,6 +377,52 @@ namespace lws
       return cache;
     }
 
+    /* The chain's current hard fork, which the client builds every transaction
+       against. Among other things it decides whether the Bulletproofs+ proofs
+       are part of the message a ring signature signs, so reporting anything but
+       the daemon's own answer makes the client sign a message the node does not
+       check, and every send fails "ringct non-semantics verification". Cached
+       briefly: it only changes at a fork height. */
+    expect<std::uint64_t> get_fork_version_cache()
+    {
+      static constexpr const auto cache_ttl = std::chrono::seconds{10};
+      static std::mutex cache_mutex;
+      static std::uint64_t cache = 0;
+      static auto last_update = std::chrono::steady_clock::now();
+      static bool cache_initialized = false;
+
+      {
+        const std::lock_guard<std::mutex> lock{cache_mutex};
+        if (cache_initialized && std::chrono::steady_clock::now() - last_update < cache_ttl)
+          return cache;
+      }
+
+      auto fetched = post_json_rpc("hard_fork_info");
+      if (!fetched)
+        return fetched.error();
+
+      std::uint64_t version = 0;
+      try
+      {
+        const json& result = deep_unwrap(deep_unwrap(*fetched).at("result"));
+        version = result.at("version").get<std::uint64_t>();
+      }
+      catch (const std::exception& e)
+      {
+        MERROR("unexpected hard_fork_info response: " << e.what()
+               << " -- body: " << fetched->dump().substr(0, 400));
+        return {lws::error::bad_daemon_response};
+      }
+      if (version == 0)
+        return {lws::error::bad_daemon_response};
+
+      const std::lock_guard<std::mutex> lock{cache_mutex};
+      cache = version;
+      last_update = std::chrono::steady_clock::now();
+      cache_initialized = true;
+      return cache;
+    }
+
     expect<json> get_output_distribution_cache()
     {
       static constexpr const auto cache_ttl = std::chrono::seconds{30};
@@ -1220,18 +1266,17 @@ namespace lws
         // the fresher of the two, so report whichever is further along.
         blockchain_height = std::max(blockchain_height, std::uint64_t(user->first.scan_height));
 
-        // TODO: report the daemon's real fork version here. This was pinned at
-        // 17, which silently disabled every client-side gate above it --
-        // including the whole HF22 private-token path, since the client tests
-        // fork_version >= feature::PRIVACY_TOKENS before it will build a
-        // token transaction at all. Pinned to 22 so the feature is reachable;
-        // it must become dynamic before this serves a real network, or the
-        // client will try to build token transactions on a chain that has not
-        // forked yet.
-        constexpr std::uint64_t PINNED_FORK_VERSION = 22;
+        // The daemon's own fork, never a constant. It used to be pinned: first
+        // at 17, which kept the client from ever building a token transaction,
+        // then at 22, which made it sign every transaction under HF22 rules --
+        // on a chain below HF22 the node checks a different ring-signature
+        // message and rejects even a plain BDX send.
+        const expect<std::uint64_t> fork_version = get_fork_version_cache();
+        if (!fork_version)
+          return fork_version.error();
 
         return response{fee_per_byte, fee_per_output, flash_fee_per_byte, flash_fee_per_output,
-                        flash_fee_fixed, quantization_mask, PINNED_FORK_VERSION,
+                        flash_fee_fixed, quantization_mask, *fork_version,
                         rpc::safe_uint64(received), std::move(unspent),
                         std::move(req.creds.key), next_min_height, blockchain_height};
       }
