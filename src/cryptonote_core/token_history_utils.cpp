@@ -14,6 +14,7 @@
 #include "cryptonote_config.h"
 #include "serialization/binary_utils.h"
 #include "serialization/string.h"
+#include "crypto/hash.h"
 #include "crypto/token_proofs.h"
 #include "ringct/rctOps.h"
 
@@ -125,6 +126,17 @@ void set_reason(std::string* reason, std::string value)
   if (reason) *reason = std::move(value);
 }
 
+struct token_undo_entry
+{
+  crypto::token_id token_id{};
+  token_consensus_state prev_state{};
+
+  BEGIN_SERIALIZE_OBJECT()
+    FIELD(token_id)
+    FIELD(prev_state)
+  END_SERIALIZE()
+};
+
 // Count tx_out_zyphora outputs in a transaction.
 size_t count_zyphora_outputs(const transaction& tx)
 {
@@ -134,61 +146,6 @@ size_t count_zyphora_outputs(const transaction& tx)
       ++n;
   return n;
 }
-}
-
-bool load_token_history(BlockchainDB& db, const crypto::token_id& token_id, token_history_t& history)
-{
-  history.clear();
-
-  std::string blob;
-  if (!db.get_token_history(token_id, blob))
-    return false;
-
-  serialization::parse_binary(blob, history);
-  return true;
-}
-
-void store_token_history(BlockchainDB& db, const crypto::token_id& token_id, const token_history_t& history)
-{
-  auto copy = history;
-  db.set_token_history(token_id, serialization::dump_binary(copy));
-}
-
-bool append_tokens_from_transactions(BlockchainDB& db, const std::vector<transaction>& txs, std::string* reason)
-{
-  std::unordered_map<crypto::token_id, token_history_t> cache;
-
-  for (const auto& tx : txs)
-  {
-    size_t skip = 0;
-    tx_extra_token_descriptor_operation tdo{};
-    while (get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, skip++))
-    {
-      const crypto::token_id token_id = get_or_calculate_token_id(tdo);
-      if (token_id == crypto::null_tid)
-      {
-        set_reason(reason, "failed to derive token id while appending history");
-        return false;
-      }
-
-      auto [it, inserted] = cache.try_emplace(token_id);
-      if (inserted)
-        load_token_history(db, token_id, it->second); // absent => empty history
-
-      if (tdo.operation_type == token_descriptor_operation_type::register_token && !it->second.empty())
-      {
-        set_reason(reason, "register_token attempted for existing history");
-        return false;
-      }
-
-      it->second.push_back(tdo);
-    }
-  }
-
-  for (const auto& [token_id, history] : cache)
-    store_token_history(db, token_id, history);
-
-  return true;
 }
 
 bool validate_token_descriptor_operation(const tx_extra_token_descriptor_operation& op, std::string& reason)
@@ -395,31 +352,162 @@ bool apply_token_operation_to_state(
   }
 }
 
-bool load_token_state_from_history(
-    BlockchainDB& db,
-    const crypto::token_id& token_id,
-    token_consensus_state& state,
-    std::string& reason)
+bool load_token_state(BlockchainDB& db, const crypto::token_id& token_id, token_consensus_state& state, std::string& reason)
 {
-  token_history_t history;
-  if (!load_token_history(db, token_id, history))
-    return true;
+  state = token_consensus_state{}; // default: exists == false (unknown token)
 
-  for (const auto& hist_op : history)
+  std::string blob;
+  if (!db.get_token_history(token_id, blob))
+    return true; // unknown token — leave state at its default
+
+  try
   {
-    std::string op_reason;
-    if (!validate_token_descriptor_operation(hist_op, op_reason))
+    serialization::parse_binary(blob, state);
+  }
+  catch (const std::exception& e)
+  {
+    reason = std::string("failed to parse stored token state: ") + e.what();
+    return false;
+  }
+  return true;
+}
+
+bool apply_tokens_from_block(BlockchainDB& db, uint64_t height, const std::vector<transaction>& txs, std::string* reason)
+{
+  std::vector<token_undo_entry> undo;
+  // In-memory working set of the states we mutate this block. Keeping it here (as
+  // the old code did) means multiple operations on one token within a single block
+  // compose correctly without depending on read-your-writes semantics of the
+  // underlying batch transaction.
+  std::unordered_map<crypto::token_id, token_consensus_state> states;
+
+  for (const auto& tx : txs)
+  {
+    size_t skip = 0;
+    tx_extra_token_descriptor_operation tdo{};
+    while (get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, skip++))
     {
-      reason = "invalid operation in stored token history: " + op_reason;
-      return false;
-    }
-    if (!apply_token_operation_to_state(token_id, hist_op, state, op_reason))
-    {
-      reason = "inconsistent stored token history: " + op_reason;
-      return false;
+      const crypto::token_id token_id = get_or_calculate_token_id(tdo);
+      if (token_id == crypto::null_tid)
+      {
+        set_reason(reason, "failed to derive token id while applying block token ops");
+        return false;
+      }
+
+      auto [it, inserted] = states.try_emplace(token_id);
+      if (inserted)
+      {
+        // First time this block touches the token: read its current state (O(1))
+        // and record the pre-block state once, for reorg undo.
+        std::string load_reason;
+        if (!load_token_state(db, token_id, it->second, load_reason))
+        {
+          set_reason(reason, "failed to load token state: " + load_reason);
+          return false;
+        }
+        undo.push_back(token_undo_entry{token_id, it->second});
+      }
+
+      // Apply the operation incrementally to the working state.
+      std::string op_reason;
+      if (!apply_token_operation_to_state(token_id, tdo, it->second, op_reason))
+      {
+        set_reason(reason, "token state transition rejected: " + op_reason);
+        return false;
+      }
+
+      // Bookkeeping fields (not consensus-hashed; local integrity aid only).
+      const std::string op_blob = serialization::dump_binary(tdo);
+      it->second.op_count += 1;
+      it->second.last_op_hash = crypto::cn_fast_hash(op_blob.data(), op_blob.size());
     }
   }
 
+  // Persist each touched token's final state once, plus this height's undo record.
+  for (auto& [token_id, state] : states)
+    db.set_token_history(token_id, serialization::dump_binary(state));
+  if (!undo.empty())
+    db.set_token_undo(height, serialization::dump_binary(undo));
+
+  return true;
+}
+
+bool rewind_tokens_for_height(BlockchainDB& db, uint64_t height, std::string* reason)
+{
+  std::string blob;
+  if (!db.get_token_undo(height, blob))
+    return true; // no token operations were applied at this height
+
+  std::vector<token_undo_entry> undo;
+  try
+  {
+    serialization::parse_binary(blob, undo);
+  }
+  catch (const std::exception& e)
+  {
+    set_reason(reason, std::string("failed to parse token undo record while rewinding: ") + e.what());
+    return false;
+  }
+
+  // Order-independent: exactly one entry per token, holding its full pre-block
+  // state. Restore it, or delete the row if the token was created in this block.
+  for (const auto& entry : undo)
+  {
+    if (entry.prev_state.exists)
+    {
+      token_consensus_state prev = entry.prev_state;
+      db.set_token_history(entry.token_id, serialization::dump_binary(prev));
+    }
+    else
+    {
+      db.remove_token_history(entry.token_id);
+    }
+  }
+
+  db.del_token_undo(height);
+  return true;
+}
+
+bool validate_token_transaction_fees(const transaction& tx, hf hf_version, network_type nettype, std::string& reason)
+{
+  using operation = token_descriptor_operation_type;
+  operation expected = operation::undefined;
+  switch (tx.type)
+  {
+    case txtype::register_privacy_token: expected = operation::register_token; break;
+    case txtype::mint_token: expected = operation::mint_token; break;
+    case txtype::update_token: expected = operation::update_token; break;
+    case txtype::burn_token: expected = operation::burn_token; break;
+    default:
+      reason = "Token fee validation requires a token transaction";
+      return false;
+  }
+
+  tx_extra_token_descriptor_operation op{}, extra_op{};
+  if (!get_token_descriptor_operation_from_tx_extra(tx.extra, op, 0) ||
+      get_token_descriptor_operation_from_tx_extra(tx.extra, extra_op, 1) ||
+      op.operation_type != expected)
+  {
+    reason = "Token fees require exactly one operation matching the transaction type";
+    return false;
+  }
+
+  const auto policy = tokens::fee_for_operation(hf_version, expected, nettype);
+  if (!policy.enabled)
+  {
+    reason = "Token operation is not enabled at this hardfork";
+    return false;
+  }
+  const uint64_t burned = get_burned_amount_from_tx_extra(tx.extra);
+  const uint64_t fee = tx.rct_signatures.txnFee;
+  if (!policy.paid(burned, fee))
+  {
+    reason = "Token transaction requires " + std::string{policy.exact_burn ? "exactly " : "at least "} +
+        std::to_string(policy.burn_amount) + " burned and at least " +
+        std::to_string(policy.governance_amount) + " remaining for governance; declared burn " +
+        std::to_string(burned) + ", transaction fee " + std::to_string(fee);
+    return false;
+  }
   return true;
 }
 
@@ -430,7 +518,15 @@ bool validate_tx_token_operations_against_db(
     hf hf_version)
 {
   if (hf_version < feature::PRIVACY_TOKENS)
+  {
+    tx_extra_token_descriptor_operation pre_fork_op{};
+    if (get_token_descriptor_operation_from_tx_extra(tx.extra, pre_fork_op, 0))
+    {
+      reason = "token descriptor operations are not allowed before the privacy-token hard fork";
+      return false;
+    }
     return true;
+  }
 
   size_t op_index = 0;
   tx_extra_token_descriptor_operation op{};
@@ -454,15 +550,6 @@ bool validate_tx_token_operations_against_db(
       return false;
     }
 
-    // ── F0 fix: tx.type and the descriptor operation_type MUST be the matching
-    // pair. Consensus rules were historically split across the two fields -- some
-    // keyed on tx.type (surjection ring membership, proof presence), others on
-    // op.operation_type (ownership, "outputs sum to commitment", supply update) --
-    // with nothing forcing them to agree. A mint_token-typed tx carrying a
-    // burn_token op could therefore gain minting power (from tx.type) while
-    // skipping the ownership and conservation checks (which the burn op waives),
-    // letting anyone mint arbitrary amounts of any token. Enforce the bijection
-    // up front so the two fields can never disagree.
     {
       bool type_matches = false;
       switch (op.operation_type)
@@ -480,20 +567,12 @@ bool validate_tx_token_operations_against_db(
       }
     }
 
-    // ── F0 fix: exactly one token descriptor operation per token transaction.
-    // verTokenProofs only ever reads the first TDO, so a second TDO could apply a
-    // state change (e.g. a second burn decrementing supply again) that no proof
-    // covers. op_index has already been incremented by the while-condition, so it
-    // equals 1 on the first operation, 2 on the second, etc.
     if (op_index > 1)
     {
       reason = "a token transaction must carry exactly one token descriptor operation";
       return false;
     }
 
-    // ── F0 fix: a burn must actually spend token inputs. The balance-proof gate
-    // is keyed on the ZY input count, so a burn with zero ZY inputs bypasses
-    // conservation entirely; such a burn is also semantically meaningless.
     if (op.operation_type == token_descriptor_operation_type::burn_token)
     {
       size_t zy_input_count = 0;
@@ -548,7 +627,7 @@ bool validate_tx_token_operations_against_db(
     }
 
     auto [it, inserted] = states.try_emplace(token_id);
-    if (inserted && !load_token_state_from_history(db, token_id, it->second, reason))
+    if (inserted && !load_token_state(db, token_id, it->second, reason))
       return false;
 
     // ── HF21: amount-commitment binding (register + mint + burn) ─────────────
@@ -609,68 +688,6 @@ bool validate_tx_token_operations_against_db(
   {
     reason = "deploy/mint/update transaction must include at least one token descriptor operation";
     return false;
-  }
-
-  return true;
-}
-
-bool rewind_tokens_from_transactions(BlockchainDB& db, const std::vector<transaction>& txs, std::string* reason)
-{
-  std::unordered_map<crypto::token_id, token_history_t> cache;
-
-  for (auto tx_it = txs.rbegin(); tx_it != txs.rend(); ++tx_it)
-  {
-    std::vector<std::pair<crypto::token_id, tx_extra_token_descriptor_operation>> tx_ops;
-    size_t skip = 0;
-    tx_extra_token_descriptor_operation tdo{};
-    while (get_token_descriptor_operation_from_tx_extra(tx_it->extra, tdo, skip++))
-    {
-      const crypto::token_id token_id = get_or_calculate_token_id(tdo);
-      if (token_id == crypto::null_tid)
-      {
-        set_reason(reason, "failed to derive token id while rewinding history");
-        return false;
-      }
-      tx_ops.emplace_back(token_id, tdo);
-    }
-
-    for (auto op_it = tx_ops.rbegin(); op_it != tx_ops.rend(); ++op_it)
-    {
-      const auto& [token_id, op] = *op_it;
-      auto [state_it, inserted] = cache.try_emplace(token_id);
-      if (inserted)
-      {
-        if (!load_token_history(db, token_id, state_it->second) || state_it->second.empty())
-        {
-          set_reason(reason, "token history missing while rewinding");
-          return false;
-        }
-      }
-
-      if (state_it->second.empty())
-      {
-        set_reason(reason, "token history unexpectedly empty while rewinding");
-        return false;
-      }
-
-      auto expected = op;
-      auto current = state_it->second.back();
-      if (serialization::dump_binary(current) != serialization::dump_binary(expected))
-      {
-        set_reason(reason, "rewind mismatch: last history op does not match popped tx op");
-        return false;
-      }
-
-      state_it->second.pop_back();
-    }
-  }
-
-  for (const auto& [token_id, history] : cache)
-  {
-    if (history.empty())
-      db.remove_token_history(token_id);
-    else
-      store_token_history(db, token_id, history);
   }
 
   return true;

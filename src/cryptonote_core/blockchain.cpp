@@ -841,6 +841,7 @@ block Blockchain::pop_block_from_blockchain()
   std::vector<transaction> popped_txs;
 
   CHECK_AND_ASSERT_THROW_MES(m_db->height() > 1, "Cannot pop the genesis block");
+  const uint64_t popped_height = m_db->height() - 1; // height of the block being popped (before pop)
   const hf popped_hf = get_network_version(m_db->height() - 1);
 
   try
@@ -864,8 +865,8 @@ block Blockchain::pop_block_from_blockchain()
   {
     std::string rewind_reason;
     CHECK_AND_ASSERT_THROW_MES(
-        rewind_tokens_from_transactions(*m_db, popped_txs, &rewind_reason),
-        "Failed to rewind token history while popping block: " + rewind_reason);
+        rewind_tokens_for_height(*m_db, popped_height, &rewind_reason),
+        "Failed to rewind token state while popping block: " + rewind_reason);
   }
 
   m_bns_db.block_detach(*this, m_db->height());
@@ -3316,6 +3317,12 @@ bool Blockchain::check_tx_outputs(const transaction& tx, tx_verification_context
   // from v10, allow bulletproofs
   auto height = get_current_blockchain_height();
   const hf hf_version = get_network_version(height);
+  if (hf_version < feature::PRIVACY_TOKENS && tx.has_zyphora_outputs())
+  {
+    MERROR_VER("tx_out_zyphora output present before privacy-token hard fork");
+    tvc.m_invalid_output = true;
+    return false;
+  }
   if (hf_version < hf::hf8) {
     const bool bulletproof = rct::is_rct_bulletproof(tx.rct_signatures.type);
     if (bulletproof || !tx.rct_signatures.p.bulletproofs.empty())
@@ -3650,6 +3657,25 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     {
       if (tvc.m_invalid_version) MERROR_VER("TX Invalid version: " << tx.version << " for hardfork: " << (int)hf_version << " min/max version:  " << min_version << "/" << max_version);
       if (tvc.m_invalid_type)    MERROR_VER("TX Invalid type: " << tx.type << " for hardfork: " << (int)hf_version << " max type: " << max_type);
+      return false;
+    }
+  }
+
+  if (hf_version < feature::PRIVACY_TOKENS && tx_has_privacy_token_content(tx))
+  {
+    MERROR_VER("Privacy-token content present before hard-fork activation in tx " << get_transaction_hash(tx));
+    tvc.m_invalid_input  = true;
+    tvc.m_verbose_error  = "privacy-token content before HF activation";
+    return false;
+  }
+  {
+    const size_t zy_input_count = std::count_if(tx.vin.begin(), tx.vin.end(),
+        [](const txin_v& i){ return std::holds_alternative<txin_zy_input>(i); });
+    if (zy_input_count != tx.zy_sig.size())
+    {
+      MERROR_VER("Tx " << get_transaction_hash(tx) << " has " << zy_input_count
+                 << " zyphora inputs but " << tx.zy_sig.size() << " ZY signatures");
+      tvc.m_invalid_input = true;
       return false;
     }
   }
@@ -4064,32 +4090,13 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         return false;
       }
     }
-    else if (tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token || tx.type == txtype::update_token)
+    else if (tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token ||
+             tx.type == txtype::update_token || tx.type == txtype::burn_token)
     {
-      cryptonote::tx_extra_token_descriptor_operation op;
-      size_t skip = 0;
-      uint64_t total_burn_required = 0;
-      while (cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, op, skip++)) {
-        total_burn_required += tokens::burn_needed(hf_version, op.operation_type);
-      }
-      
-      if (total_burn_required > 0)
+      if (!validate_token_transaction_fees(tx, hf_version, m_nettype, tvc.m_verbose_error))
       {
-        const uint64_t burn = cryptonote::get_burned_amount_from_tx_extra(tx.extra);
-        const uint64_t fee  = tx.rct_signatures.txnFee;
-
-        const bool burn_mismatch = (tx.type == txtype::register_privacy_token)
-                                     ? (burn != total_burn_required)
-                                     : (burn < total_burn_required);
-        if (burn_mismatch || burn > fee)
-        {
-          tvc.m_verbose_error = "Token transaction requires burning " +
-                                std::string(tx.type == txtype::register_privacy_token ? "exactly " : "at least ") +
-                                std::to_string(total_burn_required) +
-                                " but burned " + std::to_string(burn) + " (fee: " + std::to_string(fee) + ")";
-          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
-          return false;
-        }
+        MERROR_VER("Failed to validate Token TX fees: " << tvc.m_verbose_error);
+        return false;
       }
 
       if (tx.type == txtype::register_privacy_token)
@@ -4177,19 +4184,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
           MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
           return false;
         }
-        const uint64_t burned    = cryptonote::get_burned_amount_from_tx_extra(tx.extra);
-        const uint64_t tx_fee    = tx.rct_signatures.txnFee;
-        const uint64_t miner_fee = tx_fee >= burned ? tx_fee - burned : 0;
-        if (miner_fee < tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT)
-        {
-          tvc.m_verbose_error = "Token registration requires a miner fee (fee minus burn) of at least " +
-                                std::to_string(tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT) +
-                                " to fund the governance payment, but the miner fee was " +
-                                std::to_string(miner_fee) + " (fee " + std::to_string(tx_fee) +
-                                ", burned " + std::to_string(burned) + ")";
-          MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
-          return false;
-        }
+
       }
     }
   }
@@ -5073,6 +5068,7 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
     t_checktx += std::chrono::steady_clock::now() - cc;
 
     // Gather and validate token descriptor operations carried in tx.extra.
+    if (get_network_version() >= feature::PRIVACY_TOKENS)
     {
       size_t op_index = 0;
       tx_extra_token_descriptor_operation op{};
@@ -5101,7 +5097,7 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
         if (inserted)
         {
           std::string load_reason;
-          if (!load_token_state_from_history(*m_db, token_id, state_it->second, load_reason))
+          if (!load_token_state(*m_db, token_id, state_it->second, load_reason))
           {
             MERROR_VER("Failed to load existing token state for tx " << tx_id << ": " << load_reason);
             bvc.m_verifivation_failed = true;
@@ -5124,7 +5120,8 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
 
     fee_summary += fee;
     if (tx.type == txtype::register_privacy_token && get_network_version() >= feature::PRIVACY_TOKENS)
-      registration_governance_fee_summary += tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT;
+      registration_governance_fee_summary += tokens::fee_for_operation(
+          get_network_version(), token_descriptor_operation_type::register_token, m_nettype).governance_amount;
     cumulative_block_weight += tx_weight;
   }
 
@@ -5259,7 +5256,7 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
     {
       std::string append_reason;
       CHECK_AND_ASSERT_MES(
-          append_tokens_from_transactions(*m_db, only_txs, &append_reason),
+          apply_tokens_from_block(*m_db, new_height - 1, only_txs, &append_reason),
           false,
           "Failed to persist token operation(s): " << append_reason);
     }

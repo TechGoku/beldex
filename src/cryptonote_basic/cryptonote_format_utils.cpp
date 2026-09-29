@@ -1018,6 +1018,24 @@ namespace cryptonote
     return get_field_from_tx_extra(tx_extra, op, skip);
   }
   //---------------------------------------------------------------
+  bool tx_has_privacy_token_content(const transaction& tx)
+  {
+    if (tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token ||
+        tx.type == txtype::update_token || tx.type == txtype::burn_token)
+      return true;
+    if (tx.has_zyphora_inputs() || tx.has_zyphora_outputs())
+      return true;
+    if (!tx.zy_sig.empty() || !tx.token_proofs.empty())
+      return true;
+    tx_extra_token_descriptor_operation tdo{};
+    if (get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, 0))
+      return true;
+    tx_extra_collateral_lock lock{};
+    if (get_collateral_lock_from_tx_extra(tx.extra, lock))
+      return true;
+    return false;
+  }
+  //---------------------------------------------------------------
   bool get_inputs_money_amount(const transaction& tx, uint64_t& money)
   {
     money = 0;

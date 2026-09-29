@@ -81,6 +81,7 @@ struct mdb_txn_cursors
   MDB_cursor *output_blacklist;
   MDB_cursor *properties;
   MDB_cursor *token_histories;
+  MDB_cursor *token_undo;
   MDB_cursor *native_output_heights;
   MDB_cursor *zy_output_heights;
 };
@@ -111,6 +112,7 @@ struct mdb_rflags
   bool m_rf_master_node_proofs;
   bool m_rf_properties;
   bool m_rf_token_histories;
+  bool m_rf_token_undo;
   bool m_rf_native_output_heights;
   bool m_rf_zy_output_heights;
 };
@@ -454,6 +456,10 @@ private:
   bool token_exists(const crypto::token_id &token_id) const override;
   std::vector<crypto::token_id> get_all_token_ids() const override;
 
+  void set_token_undo(uint64_t height, const std::string &data) override;
+  bool get_token_undo(uint64_t height, std::string &data) const override;
+  bool del_token_undo(uint64_t height) override;
+
 private:
   template <typename T,
             std::enable_if_t<std::is_same_v<T, cryptonote::block> ||
@@ -495,6 +501,7 @@ private:
   MDB_dbi m_master_node_data;
   MDB_dbi m_master_node_proofs;
   MDB_dbi m_token_histories;
+  MDB_dbi m_token_undo;
 
   MDB_dbi m_properties;
 

@@ -602,16 +602,6 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
-  enum class token_descriptor_operation_type : uint8_t
-  {
-    undefined = 0,
-    register_token = 1,
-    mint_token = 2,
-    update_token = 3,
-    burn_token = 4,
-    _count
-  };
-
   enum token_descriptor_operation_field : uint8_t
   {
     token_field_none = 0,

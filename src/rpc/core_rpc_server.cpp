@@ -3981,7 +3981,7 @@ namespace cryptonote::rpc {
 
     std::string reason;
     cryptonote::token_consensus_state state{};
-    if (!cryptonote::load_token_state_from_history(db, token_id, state, reason))
+    if (!cryptonote::load_token_state(db, token_id, state, reason))
       throw rpc_error{ERROR_INTERNAL, "Failed to load token state: " + reason};
 
     resp["token_id"]         = req.token_id;

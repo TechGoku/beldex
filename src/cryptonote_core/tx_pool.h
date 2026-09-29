@@ -563,6 +563,9 @@ namespace cryptonote
     key_images_container get_spent_key_images(bool already_locked = false);
 
   private:
+    // Unit tests seed validated inputs to isolate block-template selection.
+    friend struct tx_pool_test_access;
+
 
     /**
      * @brief insert key images into m_spent_key_images

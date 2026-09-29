@@ -177,6 +177,9 @@ public:
   bool remove_token_history(const crypto::token_id &token_id) override { return false; }
   bool token_exists(const crypto::token_id &token_id) const override { return false; }
   std::vector<crypto::token_id> get_all_token_ids() const override { return {}; }
+  void set_token_undo(uint64_t height, const std::string &data) override { }
+  bool get_token_undo(uint64_t height, std::string &data) const override { return false; }
+  bool del_token_undo(uint64_t height) override { return false; }
 
   virtual void add_alt_block(const crypto::hash &blkid, const cryptonote::alt_block_data_t &data, const cryptonote::blobdata &blob, const cryptonote::blobdata *checkpoint) override {}
   virtual bool get_alt_block(const crypto::hash &blkid, alt_block_data_t *data, cryptonote::blobdata *blob, cryptonote::blobdata *checkpoint) const override { return false; }

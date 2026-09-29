@@ -259,10 +259,11 @@ const char* const LMDB_MASTER_NODE_LATEST = "master_node_proofs"; // contains th
 
 const char* const LMDB_PROPERTIES = "properties";
 const char* const LMDB_TOKEN_HISTORIES = "token_histories";
+const char* const LMDB_TOKEN_UNDO = "token_undo";
 const char* const LMDB_NATIVE_OUTPUT_HEIGHTS = "native_output_heights"; // height -> amount_index, for non-token amount==0 outputs
 const char* const LMDB_ZY_OUTPUT_HEIGHTS = "zy_output_heights";         // height -> amount_index, for tx_out_zyphora outputs
 
-constexpr unsigned int LMDB_DB_COUNT = 26; // Should agree with the number of db's above
+constexpr unsigned int LMDB_DB_COUNT = 27; // Should agree with the number of db's above
 
 const char zerokey[8] = {0};
 const MDB_val zerokval = { sizeof(zerokey), (void *)zerokey };
@@ -406,6 +407,7 @@ void setup_rcursor(const MDB_dbi& db, MDB_cursor*& cursor, MDB_txn* txn, bool* r
 #define m_cur_hf_versions	m_cursors->hf_versions
 #define m_cur_properties	m_cursors->properties
 #define m_cur_token_histories	m_cursors->token_histories
+#define m_cur_token_undo	m_cursors->token_undo
 #define m_cur_native_output_heights	m_cursors->native_output_heights
 #define m_cur_zy_output_heights	m_cursors->zy_output_heights
 
@@ -1591,6 +1593,7 @@ void BlockchainLMDB::open(const fs::path& filename, cryptonote::network_type net
 
   lmdb_db_open(txn, LMDB_MASTER_NODE_LATEST, MDB_CREATE, m_master_node_proofs, "Failed to open db handle for m_master_node_proofs");
   lmdb_db_open(txn, LMDB_TOKEN_HISTORIES, MDB_CREATE, m_token_histories, "Failed to open db handle for m_token_histories");
+  lmdb_db_open(txn, LMDB_TOKEN_UNDO, MDB_INTEGERKEY | MDB_CREATE, m_token_undo, "Failed to open db handle for m_token_undo");
   lmdb_db_open(txn, LMDB_NATIVE_OUTPUT_HEIGHTS, MDB_INTEGERKEY | MDB_DUPSORT | MDB_DUPFIXED | MDB_CREATE, m_native_output_heights, "Failed to open db handle for m_native_output_heights");
   lmdb_db_open(txn, LMDB_ZY_OUTPUT_HEIGHTS, MDB_INTEGERKEY | MDB_DUPSORT | MDB_DUPFIXED | MDB_CREATE, m_zy_output_heights, "Failed to open db handle for m_zy_output_heights");
 
@@ -1616,6 +1619,7 @@ void BlockchainLMDB::open(const fs::path& filename, cryptonote::network_type net
   mdb_set_compare(txn, m_alt_blocks, compare_hash32);
   mdb_set_compare(txn, m_master_node_proofs, compare_hash32);
   mdb_set_compare(txn, m_token_histories, compare_hash32);
+  mdb_set_compare(txn, m_token_undo, compare_uint64);
   mdb_set_compare(txn, m_properties, compare_string);
 
   if (!(mdb_flags & MDB_RDONLY))
@@ -1781,6 +1785,8 @@ void BlockchainLMDB::reset()
     throw0(DB_ERROR(lmdb_error("Failed to drop m_master_node_data: ", result).c_str()));
   if (auto result = mdb_drop(txn, m_token_histories, 0))
     throw0(DB_ERROR(lmdb_error("Failed to drop m_token_histories: ", result).c_str()));
+  if (auto result = mdb_drop(txn, m_token_undo, 0))
+    throw0(DB_ERROR(lmdb_error("Failed to drop m_token_undo: ", result).c_str()));
   if (auto result = mdb_drop(txn, m_native_output_heights, 0))
     throw0(DB_ERROR(lmdb_error("Failed to drop m_native_output_heights: ", result).c_str()));
   if (auto result = mdb_drop(txn, m_zy_output_heights, 0))
@@ -6742,6 +6748,70 @@ std::vector<crypto::token_id> BlockchainLMDB::get_all_token_ids() const
   }
 
   return result;
+}
+
+void BlockchainLMDB::set_token_undo(uint64_t height, const std::string& data)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+
+  TXN_BLOCK_PREFIX(0);
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+  setup_cursor(m_token_undo, m_cur_token_undo, *txn_ptr);
+
+  MDB_val key{sizeof(height), (void*)&height};
+  MDB_val_sized(blob, data);
+  int result = mdb_cursor_put(m_cur_token_undo, &key, &blob, 0);
+  if (result)
+    throw0(DB_ERROR(lmdb_error("Failed to write token undo to db transaction: ", result)));
+
+  TXN_BLOCK_POSTFIX_SUCCESS();
+}
+
+bool BlockchainLMDB::get_token_undo(uint64_t height, std::string& data) const
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+
+  TXN_PREFIX_RDONLY();
+  RCURSOR(token_undo);
+
+  MDB_val k{sizeof(height), (void*)&height};
+  MDB_val v;
+  int result = mdb_cursor_get(m_cur_token_undo, &k, &v, MDB_SET_KEY);
+  if (result != MDB_SUCCESS)
+  {
+    if (result == MDB_NOTFOUND)
+      return false;
+    throw0(DB_ERROR(lmdb_error("DB error attempting to get token undo", result).c_str()));
+  }
+
+  data.assign(reinterpret_cast<const char*>(v.mv_data), v.mv_size);
+  return true;
+}
+
+bool BlockchainLMDB::del_token_undo(uint64_t height)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+
+  TXN_BLOCK_PREFIX(0);
+  mdb_txn_cursors *m_cursors = &m_wcursors;
+  setup_cursor(m_token_undo, m_cur_token_undo, *txn_ptr);
+
+  MDB_val key{sizeof(height), (void*)&height};
+  int result = mdb_cursor_get(m_cur_token_undo, &key, nullptr, MDB_SET_KEY);
+  if (result == MDB_NOTFOUND)
+    return false;
+  if (result != MDB_SUCCESS)
+    throw0(DB_ERROR(lmdb_error("Error finding token undo to remove: ", result)));
+
+  result = mdb_cursor_del(m_cur_token_undo, 0);
+  if (result != MDB_SUCCESS)
+    throw0(DB_ERROR(lmdb_error("Error removing token undo: ", result)));
+
+  TXN_BLOCK_POSTFIX_SUCCESS();
+  return true;
 }
 
 

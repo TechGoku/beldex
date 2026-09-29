@@ -1624,6 +1624,12 @@ namespace cryptonote
       return false;
     }
 
+    if (m_blockchain_storage.get_network_version() < feature::PRIVACY_TOKENS && tx_has_privacy_token_content(tx))
+    {
+      MERROR_VER("privacy-token content before hard-fork activation, rejected for tx id= " << get_transaction_hash(tx));
+      return false;
+    }
+
     if (tx.version >= txversion::v2_ringct)
     {
       const size_t native_outputs = std::count_if(tx.vout.begin(), tx.vout.end(), [](const tx_out& out) {

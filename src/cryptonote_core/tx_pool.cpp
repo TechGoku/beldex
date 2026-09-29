@@ -1996,7 +1996,8 @@ end:
       next_block_reward_context.fee                       = raw_fee + meta.fee;
       const uint64_t candidate_registration_governance_fee =
           registration_governance_fee +
-          (is_token_registration ? tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT : 0);
+          (is_token_registration ? tokens::fee_for_operation(
+              version, token_descriptor_operation_type::register_token, m_blockchain.nettype()).governance_amount : 0);
       next_block_reward_context.registration_governance_fee = candidate_registration_governance_fee;
       const size_t reward_weight = total_weight + meta.weight +
           (candidate_registration_governance_fee ? COINBASE_BLOB_RESERVED_SIZE : 0);

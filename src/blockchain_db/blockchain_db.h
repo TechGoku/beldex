@@ -1835,6 +1835,9 @@ public:
   virtual bool remove_token_history(const crypto::token_id& token_id) = 0;
   virtual bool token_exists(const crypto::token_id &token_id) const = 0;
   virtual std::vector<crypto::token_id> get_all_token_ids() const = 0;
+  virtual void set_token_undo(uint64_t height, const std::string &data) = 0;
+  virtual bool get_token_undo(uint64_t height, std::string &data) const = 0;
+  virtual bool del_token_undo(uint64_t height) = 0;
 
   // This function accepts an empty timestamps/difficulties array to fill, or
   // a prior timestamps/difficulties array that was filled by a previous call to

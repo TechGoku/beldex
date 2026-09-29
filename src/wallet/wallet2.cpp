@@ -12348,17 +12348,21 @@ std::vector<wallet2::pending_tx> wallet2::create_privacy_token_registration_tx(
   auto hf_ver = get_hard_fork_version();
   THROW_WALLET_EXCEPTION_IF(!hf_ver, error::wallet_internal_error,
       "Failed to get hard fork version from daemon");
+  const auto token_fee = tokens::fee_for_operation(
+      *hf_ver, cryptonote::token_descriptor_operation_type::register_token, m_nettype);
+  THROW_WALLET_EXCEPTION_IF(!token_fee.enabled, error::wallet_internal_error,
+      "Privacy token operations are not enabled at the current hardfork");
   THROW_WALLET_EXCEPTION_IF(priority == tools::tx_priority_flash, error::wallet_internal_error,
       "Privacy token registration cannot use flash priority: the registration burn is fixed by consensus");
   MINFO("create_privacy_token_registration_tx: registration fee - burning "
-        << print_money(tokens::REGISTRATION_FEE_BURN_AMOUNT) << " and paying "
-        << print_money(tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT)
+        << print_money(token_fee.burn_amount) << " and paying "
+        << print_money(token_fee.governance_amount)
         << " to the governance wallet");
 
   beldex_construct_tx_params tx_params = wallet2::construct_params(
       *hf_ver, txtype::register_privacy_token, priority,
-      tokens::REGISTRATION_FEE_BURN_AMOUNT);
-  tx_params.governance_fee_fixed = tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT;
+      token_fee.burn_amount);
+  tx_params.governance_fee_fixed = token_fee.governance_amount;
 
   // NOTE: the tx_extra collateral lock is written during tx construction
   // (construct_tx_with_tx_key), which is the first point where the collateral
@@ -12382,8 +12386,13 @@ std::vector<wallet2::pending_tx> wallet2::create_token_mint_tx(
   auto hf_ver = get_hard_fork_version();
   THROW_WALLET_EXCEPTION_IF(!hf_ver, error::wallet_internal_error,
       "Failed to get hard fork version from daemon");
+  const auto token_fee = tokens::fee_for_operation(
+      *hf_ver, cryptonote::token_descriptor_operation_type::mint_token, m_nettype);
+  THROW_WALLET_EXCEPTION_IF(!token_fee.enabled, error::wallet_internal_error,
+      "Privacy token operations are not enabled at the current hardfork");
   beldex_construct_tx_params tx_params = wallet2::construct_params(
-      *hf_ver, txtype::mint_token, priority, tokens::burn_needed(*hf_ver, cryptonote::token_descriptor_operation_type::mint_token));
+      *hf_ver, txtype::mint_token, priority, token_fee.burn_amount);
+  tx_params.governance_fee_fixed = token_fee.governance_amount;
 
   return create_transactions_2(dsts, fake_outs_count, 0 /*unlock_time*/,
                                priority, extra, subaddr_account,
@@ -12401,8 +12410,13 @@ std::vector<wallet2::pending_tx> wallet2::create_token_update_tx(
   auto hf_ver = get_hard_fork_version();
   THROW_WALLET_EXCEPTION_IF(!hf_ver, error::wallet_internal_error,
       "Failed to get hard fork version from daemon");
+  const auto token_fee = tokens::fee_for_operation(
+      *hf_ver, cryptonote::token_descriptor_operation_type::update_token, m_nettype);
+  THROW_WALLET_EXCEPTION_IF(!token_fee.enabled, error::wallet_internal_error,
+      "Privacy token operations are not enabled at the current hardfork");
   beldex_construct_tx_params tx_params = wallet2::construct_params(
-      *hf_ver, txtype::update_token, priority, tokens::burn_needed(*hf_ver, cryptonote::token_descriptor_operation_type::update_token));
+      *hf_ver, txtype::update_token, priority, token_fee.burn_amount);
+  tx_params.governance_fee_fixed = token_fee.governance_amount;
 
   std::vector<cryptonote::tx_destination_entry> dsts; // Update tx typically doesn't transfer funds
   return create_transactions_2(dsts, fake_outs_count, 0 /*unlock_time*/,
@@ -12422,8 +12436,13 @@ std::vector<wallet2::pending_tx> wallet2::create_token_burn_tx(
   auto hf_ver = get_hard_fork_version();
   THROW_WALLET_EXCEPTION_IF(!hf_ver, error::wallet_internal_error,
       "Failed to get hard fork version from daemon");
+  const auto token_fee = tokens::fee_for_operation(
+      *hf_ver, cryptonote::token_descriptor_operation_type::burn_token, m_nettype);
+  THROW_WALLET_EXCEPTION_IF(!token_fee.enabled, error::wallet_internal_error,
+      "Privacy token operations are not enabled at the current hardfork");
   beldex_construct_tx_params tx_params = wallet2::construct_params(
-      *hf_ver, txtype::burn_token, priority);
+      *hf_ver, txtype::burn_token, priority, token_fee.burn_amount);
+  tx_params.governance_fee_fixed = token_fee.governance_amount;
   tx_params.burn_token_id = token_id;
   tx_params.burn_token_amount = amount;
 

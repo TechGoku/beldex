@@ -8158,6 +8158,9 @@ bool simple_wallet::register_privacy_token(const std::vector<std::string>& args_
     {
       std::string height_err;
       const uint64_t bc_height = m_wallet->get_daemon_blockchain_height(height_err);
+      const auto reg_fee = tokens::fee_for_operation(
+          cryptonote::feature::PRIVACY_TOKENS, cryptonote::token_descriptor_operation_type::register_token,
+          m_wallet->nettype());
       success_msg_writer() << tr("\nThis registration will also:\n")
                            << tr("  Lock collateral: ") << print_money(tokens::REGISTRATION_COLLATERAL_AMOUNT)
                            << tr(" BDX for ") << tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS << tr(" blocks")
@@ -8166,9 +8169,9 @@ bool simple_wallet::register_privacy_token(const std::vector<std::string>& args_
                                        std::to_string(bc_height + tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS) + ")"
                                  : std::string{})
                            << "\n"
-                           << tr("  Registration fee: ") << print_money(tokens::REGISTRATION_FEE_AMOUNT)
-                           << tr(" BDX (") << print_money(tokens::REGISTRATION_FEE_BURN_AMOUNT)
-                           << tr(" burned, ") << print_money(tokens::REGISTRATION_FEE_GOVERNANCE_AMOUNT)
+                           << tr("  Registration fee: ") << print_money(reg_fee.burn_amount + reg_fee.governance_amount)
+                           << tr(" BDX (") << print_money(reg_fee.burn_amount)
+                           << tr(" burned, ") << print_money(reg_fee.governance_amount)
                            << tr(" to the governance wallet), on top of the network tx fee\n")
                            << tr("  The locked collateral is returned to you when it unlocks; the fee is not.");
     }
