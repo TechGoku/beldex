@@ -264,17 +264,40 @@ namespace cryptonote
   }
   static void read_bytes(wire::json_reader& source, txout_to_key& self)
   {
-    wire::object(source, WIRE_FIELD(key));
+    // The daemon nests the output type inside "target" as {"key": "<hex>"},
+    // so by the time this runs the reader is positioned on the bare key.
+    wire::read_bytes(source, self.key);
+  }
+  static void read_bytes(wire::json_reader& source, tx_out_zyphora& self)
+  {
+    wire::object(source,
+      wire::field("stealth_address", std::ref(self.stealth_address)),
+      wire::field("amount_commitment", std::ref(self.amount_commitment)),
+      wire::field("blinded_token_id", std::ref(self.blinded_token_id)),
+      wire::field("encrypted_amount", std::ref(self.encrypted_amount)),
+      wire::field("mix_attr", std::ref(self.mix_attr)),
+      wire::field("version", std::ref(self.version))
+    );
+  }
+  static void read_bytes(wire::json_reader& source, txout_target_v& self)
+  {
+    // "target" holds a single-key object naming the output type -- the same
+    // shape txin_v uses. HF22 adds "zyphora"; without it every block carrying
+    // a privacy-token output fails to parse and kills the scanner.
+    wire::object(source,
+      wire::variant_field("transaction output variant", std::ref(self),
+        wire::option<txout_to_key>{"key"},
+        wire::option<tx_out_zyphora>{"zyphora"},
+        wire::option<txout_to_script>{"to_script"},
+        wire::option<txout_to_scripthash>{"to_scripthash"}
+      )
+    );
   }
   static void read_bytes(wire::json_reader& source, tx_out& self)
   {
     wire::object(source,
       WIRE_FIELD(amount),
-      wire::variant_field("transaction output variant", std::ref(self.target),
-        wire::option<txout_to_key>{"target"},
-        wire::option<txout_to_script>{"to_script"},
-        wire::option<txout_to_scripthash>{"to_scripthash"}
-      )
+      wire::field("target", std::ref(self.target))
     );
   }
 
@@ -294,12 +317,31 @@ namespace cryptonote
   {
     wire::object(source, WIRE_FIELD(amount), WIRE_FIELD(key_offsets), wire::field("k_image", std::ref(self.k_image)));
   }
+  /* HF22: the input side of a privacy-token spend.
+
+     Mirrors tx_out_zyphora on the output side. A token output is consumed by
+     this variant rather than txin_to_key, so any transaction that SPENDS a
+     token - a burn, a mint, a transfer - carries one. Without it the reader
+     throws "Schema expected object" on the whole get_blocks_fast reply and the
+     scan threads die, which takes the light wallet server down with them: not
+     just the token accounts, every account, from the first such block onward.
+
+     The shape is txin_to_key's minus `amount` - a token amount is hidden in the
+     commitment and is not on the input. */
+  static void read_bytes(wire::json_reader& source, txin_zy_input& self)
+  {
+    wire::object(source,
+      WIRE_FIELD(key_offsets),
+      wire::field("k_image", std::ref(self.k_image))
+    );
+  }
   static void read_bytes(wire::json_reader& source, txin_v& self)
   {
     wire::object(source,
       wire::variant_field("transaction input variant", std::ref(self),
         wire::option<txin_to_key>{"key"},
         wire::option<txin_gen>{"gen"},
+        wire::option<txin_zy_input>{"zy_input"},
         wire::option<txin_to_script>{"to_script"},
         wire::option<txin_to_scripthash>{"to_scripthash"}
       )
@@ -317,14 +359,23 @@ namespace cryptonote
     // fixup for a miner_tx that lacks it. (optional_field needs a boost::optional
     // target, hence the temporary.)
     boost::optional<rct::rctSig> rct_signatures;
+    boost::optional<std::vector<std::uint64_t>> output_unlock_times;
     wire::object(source,
       WIRE_FIELD(version),
       WIRE_FIELD(unlock_time),
       wire::field("vin", std::ref(self.vin)),
       wire::field("vout", std::ref(self.vout)),
       WIRE_FIELD(extra),
+      // Since txversion v3 the per-output unlock times are the authoritative
+      // ones and tx.unlock_time is a legacy tx-wide value. Without reading
+      // these, transaction::get_unlock_time() falls back to that 0 and every
+      // time-locked output -- an HF22 registration's collateral above all --
+      // is recorded as immediately spendable. Optional: a v1/v2 tx has none.
+      wire::optional_field("output_unlock_times", std::ref(output_unlock_times)),
       wire::optional_field("rct_signatures", std::ref(rct_signatures))
     );
+    if (output_unlock_times)
+      self.output_unlock_times = std::move(*output_unlock_times);
     if (rct_signatures)
       self.rct_signatures = std::move(*rct_signatures);
   }

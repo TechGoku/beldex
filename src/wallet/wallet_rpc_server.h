@@ -154,6 +154,9 @@ namespace tools
     wallet_rpc::SET_LOG_LEVEL::response                   invoke(wallet_rpc::SET_LOG_LEVEL::request&& req);
     wallet_rpc::SET_LOG_CATEGORIES::response              invoke(wallet_rpc::SET_LOG_CATEGORIES::request&& req);
     wallet_rpc::GET_VERSION::response                     invoke(wallet_rpc::GET_VERSION::request&& req);
+    wallet_rpc::SETUP_BACKGROUND_SYNC::response           invoke(wallet_rpc::SETUP_BACKGROUND_SYNC::request&& req);
+    wallet_rpc::START_BACKGROUND_SYNC::response           invoke(wallet_rpc::START_BACKGROUND_SYNC::request&& req);
+    wallet_rpc::STOP_BACKGROUND_SYNC::response            invoke(wallet_rpc::STOP_BACKGROUND_SYNC::request&& req);
     wallet_rpc::STAKE::response                           invoke(wallet_rpc::STAKE::request&& req);
     wallet_rpc::REGISTER_MASTER_NODE::response            invoke(wallet_rpc::REGISTER_MASTER_NODE::request&& req);
     wallet_rpc::CAN_REQUEST_STAKE_UNLOCK::response        invoke(wallet_rpc::CAN_REQUEST_STAKE_UNLOCK::request&& req);
@@ -169,7 +172,11 @@ namespace tools
     wallet_rpc::BNS_ENCRYPT_VALUE::response               invoke(wallet_rpc::BNS_ENCRYPT_VALUE::request&& req);
     wallet_rpc::COIN_BURN::response                       invoke(wallet_rpc::COIN_BURN::request&& req);
     wallet_rpc::QUERY_KEY::response                       invoke(wallet_rpc::QUERY_KEY::request&& req);
-
+    wallet_rpc::REGISTER_PRIVACY_TOKEN::response                invoke(wallet_rpc::REGISTER_PRIVACY_TOKEN::request&& req);
+    wallet_rpc::GET_OWNED_TOKENS::response                invoke(wallet_rpc::GET_OWNED_TOKENS::request&& req);
+    wallet_rpc::MINT_TOKEN::response                      invoke(wallet_rpc::MINT_TOKEN::request&& req);
+    wallet_rpc::BURN_TOKEN::response                      invoke(wallet_rpc::BURN_TOKEN::request&& req);
+    wallet_rpc::UPDATE_TOKEN::response                    invoke(wallet_rpc::UPDATE_TOKEN::request&& req);
   private:
 
       /// Handles a POST request to /json_rpc.
@@ -209,7 +216,6 @@ namespace tools
       // After the call `m_long_poll_disabled` will be false (and must be set back to true if you
       // want to re-start the thread).
       void stop_long_poll_thread();
-
       std::unique_ptr<wallet2> m_wallet;
       fs::path m_wallet_dir;
       std::vector<std::tuple<std::string /*ip*/, uint16_t /*port*/, bool /*required*/>> m_bind;

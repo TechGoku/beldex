@@ -50,7 +50,7 @@
 // advance which version they will stop working with
 // Don't go over 32767 for any of these
 #define WALLET_RPC_VERSION_MAJOR 1
-#define WALLET_RPC_VERSION_MINOR 17
+#define WALLET_RPC_VERSION_MINOR 18
 #define MAKE_WALLET_RPC_VERSION(major,minor) (((major)<<16)|(minor))
 #define WALLET_RPC_VERSION MAKE_WALLET_RPC_VERSION(WALLET_RPC_VERSION_MAJOR, WALLET_RPC_VERSION_MINOR)
 
@@ -85,7 +85,6 @@ namespace tools::wallet_rpc {
     }
   }
 
-
   BELDEX_RPC_DOC_INTROSPECT
   // Return the wallet's balance.
   struct GET_BALANCE : RPC_COMMAND
@@ -102,6 +101,17 @@ namespace tools::wallet_rpc {
       KV_MAP_SERIALIZABLE
     };
 
+    // HF21: per-token balance entry
+    struct token_balance_entry
+    {
+      std::string token_id;           // Hex-encoded token pubkey
+      std::string ticker;             // Token ticker symbol (e.g. "TKN")
+      uint64_t    balance;            // Total balance (atomic units of the token)
+      uint64_t    unlocked_balance;   // Spendable balance
+
+      KV_MAP_SERIALIZABLE
+    };
+
     struct per_subaddress_info
     {
       uint32_t account_index;       // Index of the account in the wallet.
@@ -113,9 +123,11 @@ namespace tools::wallet_rpc {
       uint64_t num_unspent_outputs; // Number of unspent outputs available for the subaddress.
       uint64_t blocks_to_unlock;    // The number of blocks remaining for the balance to unlock
       uint64_t time_to_unlock;      // Timestamp of expected unlock
+      std::vector<token_balance_entry> token_balances; // HF21: per-token balances for this subaddress
 
       KV_MAP_SERIALIZABLE
     };
+
 
     struct response
     {
@@ -125,6 +137,8 @@ namespace tools::wallet_rpc {
       std::vector<per_subaddress_info> per_subaddress; // Balance information for each subaddress in an account.
       uint64_t blocks_to_unlock;                       // The number of blocks remaining for the balance to unlock
       uint64_t   time_to_unlock;                       // Timestamp of expected unlock
+      // HF21: per-token balances (empty for wallets with no privacy token outputs)
+      std::vector<token_balance_entry> token_balances;
 
       KV_MAP_SERIALIZABLE
     };
@@ -828,6 +842,7 @@ namespace tools::wallet_rpc {
     uint64_t block_height;                      // Block height the transfer occurred on
     bool frozen;                                // If the output has been intentionally frozen by the user, i.e. unspendable.
     bool unlocked;                              // If the TX is spendable yet
+    uint64_t unlock_time;                       // Per-output unlock height/timestamp for this transfer.
 
     KV_MAP_SERIALIZABLE
   };
@@ -1051,6 +1066,14 @@ BELDEX_RPC_DOC_INTROSPECT
     };
   };
 
+  struct token_received_entry
+  {
+    std::string token_id; // Hex-encoded token ID
+    uint64_t amount;      // Amount of the token received
+
+    KV_MAP_SERIALIZABLE
+  };
+
   BELDEX_RPC_DOC_INTROSPECT
   // Check a transaction in the blockchain with its secret key.
   struct CHECK_TX_KEY : RPC_COMMAND
@@ -1068,7 +1091,8 @@ BELDEX_RPC_DOC_INTROSPECT
 
     struct response
     {
-      uint64_t received;      // Amount of the transaction.
+      uint64_t received;      // Amount of the native transaction.
+      std::vector<token_received_entry> token_received; // Amount of tokens received
       bool in_pool;           // States if the transaction is still in pool or has been added to a block.
       uint64_t confirmations; // Number of block mined after the one with the transaction.
 
@@ -1119,6 +1143,7 @@ BELDEX_RPC_DOC_INTROSPECT
     {
       bool good;              // States if the inputs proves the transaction.
       uint64_t received;      // Amount of the transaction.
+      std::vector<token_received_entry> token_received; // Amount of tokens received
       bool in_pool;           // States if the transaction is still in pool or has been added to a block.
       uint64_t confirmations; // Number of block mined after the one with the transaction.
 
@@ -1366,7 +1391,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Export transfers to csv
-  struct EXPORT_TRANSFERS : RPC_COMMAND
+  struct EXPORT_TRANSFERS : RESTRICTED
   {
     static constexpr auto names() { return NAMES("export_transfers"); }
 
@@ -1420,7 +1445,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Export a signed set of key images.
-  struct EXPORT_KEY_IMAGES : RPC_COMMAND
+  struct EXPORT_KEY_IMAGES : RESTRICTED
   {
     static constexpr auto names() { return NAMES("export_key_images"); }
 
@@ -1669,7 +1694,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Start mining in the beldex daemon.
-  struct START_MINING : RPC_COMMAND
+  struct START_MINING : RESTRICTED
   {
     static constexpr auto names() { return NAMES("start_mining"); }
 
@@ -1685,7 +1710,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Stop mining in the beldex daemon.
-  struct STOP_MINING : RPC_COMMAND
+  struct STOP_MINING : RESTRICTED
   {
     static constexpr auto names() { return NAMES("stop_mining"); }
 
@@ -1754,7 +1779,7 @@ BELDEX_RPC_DOC_INTROSPECT
 
   BELDEX_RPC_DOC_INTROSPECT
   // Close the currently opened wallet, after trying to save it.
-  struct CLOSE_WALLET : RPC_COMMAND
+  struct CLOSE_WALLET : RESTRICTED
   {
     static constexpr auto names() { return NAMES("close_wallet"); }
 
@@ -2585,7 +2610,219 @@ This command is only required if the open wallet is one of the owners of a BNS r
       KV_MAP_SERIALIZABLE
     };
   };
-  
+  // HF21: Register a new privacy token on-chain.
+  struct REGISTER_PRIVACY_TOKEN : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("register_privacy_token"); }
+    static constexpr const char* description =
+        "Register a new privacy token. Pass a JSON descriptor containing: "
+        "ticker, full_name, total_max_supply, current_supply, decimal_point, meta_info.";
+
+    struct request
+    {
+      std::string json_string;                // Inline token JSON descriptor
+      uint32_t account_index = 0;             // Account to use for fees
+      uint32_t priority = 0;                  // Transaction priority
+      std::set<uint32_t> subaddr_indices;     // (Optional) Subaddresses to use for fees
+      bool get_tx_hex = false;                // (Optional) Return TX as hex
+      bool get_tx_key = false;                // (Optional) Return TX key
+      bool do_not_relay = false;              // (Optional) Don't broadcast to network
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string token_id;       // Hex-encoded calculated token ID
+      std::string tx_hash;        // Transaction hash of the registration tx
+      std::string tx_key;         // Transaction key (if requested)
+      std::string tx_hex;         // Transaction hex blob (if requested)
+      std::string ticker;         // Confirmed ticker from descriptor
+      std::string full_name;      // Full name from descriptor
+      uint64_t tx_fee = 0;        // Fee paid in this transaction
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  struct SETUP_BACKGROUND_SYNC : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("setup_background_sync"); }
+
+    struct request
+    {
+      std::string background_sync_type;
+      std::string wallet_password;
+      std::string background_cache_password;
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  // HF21: Get a list of tokens created by the wallet
+  struct GET_OWNED_TOKENS : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("get_owned_tokens"); }
+
+    struct request {
+      std::string owner;          // Optional wallet address or spend public key hex to filter by owner
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct token_info {
+      std::string token_id;        // Hex-encoded token public key
+      std::string full_name;       // Token full name
+      std::string ticker;          // Token ticker symbol
+      uint64_t max_supply;
+      uint64_t current_supply;
+      uint8_t  decimal_point;
+      std::string meta_info;
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response {
+      std::vector<token_info> tokens;
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  struct START_BACKGROUND_SYNC : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("start_background_sync"); }
+
+    struct request
+    {
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  // HF21: Mint additional tokens for an existing privacy token.
+  struct MINT_TOKEN : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("mint_token"); }
+
+    struct request
+    {
+      std::string token_id;        // Hex-encoded token ID
+      uint64_t amount;             // Amount to mint (in atomic units)
+      uint32_t priority;           // Transaction priority
+      uint32_t account_index;      // (Optional) Index of the account to pay for the transaction fees. (defaults to 0)
+      std::set<uint32_t> subaddr_indices; // (Optional) List of subaddresses to pay for the transaction fees.
+      bool do_not_relay;           // (Optional) If true, the newly created transaction will not be relayed to the network.
+      bool get_tx_hex;             // (Optional) Return the transaction as hex string.
+      bool get_tx_metadata;        // (Optional) Return transaction metadata.
+      bool get_tx_key;             // (Optional) Return the transaction key.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+      std::string tx_key;
+      uint64_t fee;
+      std::string tx_blob;
+      std::string tx_metadata;
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  struct STOP_BACKGROUND_SYNC : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("stop_background_sync"); }
+
+    struct request
+    {
+      std::string wallet_password;
+      std::string seed;
+      std::string seed_offset;
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  // HF21: Burn supply from an existing privacy token.
+  struct BURN_TOKEN : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("burn_token"); }
+
+    struct request
+    {
+      std::string token_id;        // Hex-encoded token ID
+      uint64_t amount;             // Amount to burn (in atomic units)
+      uint32_t priority;           // Transaction priority
+      uint32_t account_index;      // (Optional) Index of the account to pay for the transaction fees. (defaults to 0)
+      std::set<uint32_t> subaddr_indices; // (Optional) List of subaddresses to pay for the transaction fees.
+      bool do_not_relay;           // (Optional) If true, the newly created transaction will not be relayed to the network.
+      bool get_tx_hex;             // (Optional) Return the transaction as hex string.
+      bool get_tx_metadata;        // (Optional) Return transaction metadata.
+      bool get_tx_key;             // (Optional) Return the transaction key.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+      std::string tx_key;
+      uint64_t fee;
+      std::string tx_blob;
+      std::string tx_metadata;
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  // HF21: Update an existing privacy token metadata.
+  struct UPDATE_TOKEN : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("update_token"); }
+
+    struct request
+    {
+      std::string token_id;        // Hex-encoded token ID
+      std::string json_filename;   // Path to the token JSON descriptor file containing metadata to update
+      std::string json_string;     // Inline token JSON descriptor
+      uint32_t priority;           // Transaction priority
+      uint32_t account_index;      // (Optional) Index of the account to pay for the transaction fees. (defaults to 0)
+      std::set<uint32_t> subaddr_indices; // (Optional) List of subaddresses to pay for the transaction fees.
+      bool do_not_relay;           // (Optional) If true, the newly created transaction will not be relayed to the network.
+      bool get_tx_hex;             // (Optional) Return the transaction as hex string.
+      bool get_tx_metadata;        // (Optional) Return transaction metadata.
+      bool get_tx_key;             // (Optional) Return the transaction key.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+      std::string tx_key;
+      uint64_t fee;
+      std::string tx_blob;
+      std::string tx_metadata;
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
   /// List of all supported rpc command structs to allow compile-time enumeration of all supported
   /// RPC types.  Every type added above that has an RPC endpoint needs to be added here, and needs
   /// a core_rpc_server::invoke() overload that takes a <TYPE>::request and returns a
@@ -2681,6 +2918,9 @@ This command is only required if the open wallet is one of the owners of a BNS r
     SET_DAEMON,
     SET_LOG_LEVEL,
     SET_LOG_CATEGORIES,
+    SETUP_BACKGROUND_SYNC,
+    START_BACKGROUND_SYNC,
+    STOP_BACKGROUND_SYNC,
     BNS_BUY_MAPPING,
     BNS_UPDATE_MAPPING,
     BNS_RENEW_MAPPING,
@@ -2690,7 +2930,12 @@ This command is only required if the open wallet is one of the owners of a BNS r
     BNS_ADD_KNOWN_NAMES,
     BNS_DECRYPT_VALUE,
     BNS_ENCRYPT_VALUE,
-    COIN_BURN
+    COIN_BURN,
+    REGISTER_PRIVACY_TOKEN,
+    GET_OWNED_TOKENS,
+    MINT_TOKEN,
+    BURN_TOKEN,
+    UPDATE_TOKEN
   >;
 
 }

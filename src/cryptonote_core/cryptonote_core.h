@@ -651,7 +651,9 @@ namespace cryptonote
       *
       * @brief get per block distribution of outputs of a given amount
       */
-     bool get_output_distribution(uint64_t amount, uint64_t from_height, uint64_t to_height, uint64_t &start_height, std::vector<uint64_t> &distribution, uint64_t &base) const;
+     bool get_output_distribution(uint64_t amount, uint64_t from_height, uint64_t to_height, uint64_t &start_height, std::vector<uint64_t> &distribution, uint64_t &base,
+         output_distribution_type otype = output_distribution_type::native,
+         std::vector<uint64_t> *output_indices = nullptr) const;
 
      void get_output_blacklist(std::vector<uint64_t> &blacklist) const;
 
@@ -1178,6 +1180,7 @@ namespace cryptonote
      tools::periodic_task m_blockchain_pruning_interval{5h}; //!< interval for incremental blockchain pruning
      tools::periodic_task m_master_node_vote_relayer{2min, false};
      tools::periodic_task m_mn_proof_cleanup_interval{1h, false};
+     tools::periodic_task m_mn_list_store_interval{5min, false}; //!< interval for checkpointing the master node list so an unclean exit doesn't force a full rescan
      tools::periodic_task m_systemd_notify_interval{10s};
 
      std::atomic<bool> m_starter_message_showed; //!< has the "daemon will sync now" message been shown?

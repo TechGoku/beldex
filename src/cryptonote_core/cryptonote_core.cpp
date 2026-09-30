@@ -880,13 +880,14 @@ namespace cryptonote
     {
       std::string keystr;
       bool r = tools::slurp_file(keypath, keystr);
-      memcpy(&unwrap(unwrap(privkey)), keystr.data(), sizeof(privkey));
-      memwipe(&keystr[0], keystr.size());
       CHECK_AND_ASSERT_MES(r, false, "failed to load master node key from " + keypath.u8string());
-      CHECK_AND_ASSERT_MES(keystr.size() == sizeof(privkey), false,
-          "master node key file " + keypath.u8string() + " has an invalid size");
+      CHECK_AND_ASSERT_MES(keystr.size() == sizeof(privkey), false, "master node key file " + keypath.u8string() + " has an invalid size");
+      
+      memcpy(&unwrap(unwrap(privkey)), keystr.data(), sizeof(privkey));
 
       r = get_pubkey(privkey, pubkey);
+
+      memwipe(&keystr[0], keystr.size());
       CHECK_AND_ASSERT_MES(r, false, "failed to generate pubkey from secret key");
     }
     else
@@ -1623,9 +1624,18 @@ namespace cryptonote
       return false;
     }
 
+    if (m_blockchain_storage.get_network_version() < feature::PRIVACY_TOKENS && tx_has_privacy_token_content(tx))
+    {
+      MERROR_VER("privacy-token content before hard-fork activation, rejected for tx id= " << get_transaction_hash(tx));
+      return false;
+    }
+
     if (tx.version >= txversion::v2_ringct)
     {
-      if (tx.rct_signatures.outPk.size() != tx.vout.size())
+      const size_t native_outputs = std::count_if(tx.vout.begin(), tx.vout.end(), [](const tx_out& out) {
+        return !std::holds_alternative<tx_out_zyphora>(out.target);
+      });
+      if (tx.rct_signatures.outPk.size() != native_outputs)
       {
         MERROR_VER("tx with mismatched vout/outPk count, rejected for tx id= " << get_transaction_hash(tx));
         return false;
@@ -1887,8 +1897,7 @@ namespace cryptonote
     std::unordered_set<crypto::key_image> ki;
     for(const auto& in: tx.vin)
     {
-      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, tokey_in, false);
-      if(!ki.insert(tokey_in.k_image).second)
+      if(!ki.insert(get_input_key_image(in)).second)
         return false;
     }
     return true;
@@ -1898,9 +1907,16 @@ namespace cryptonote
   {
     for(const auto& in: tx.vin)
     {
-      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, tokey_in, false);
-      for (size_t n = 1; n < tokey_in.key_offsets.size(); ++n)
-        if (tokey_in.key_offsets[n] == 0)
+      const std::vector<uint64_t>* key_offsets = nullptr;
+      if (const auto* tokey_in = std::get_if<txin_to_key>(&in))
+        key_offsets = &tokey_in->key_offsets;
+      else if (const auto* zy_in = std::get_if<txin_zy_input>(&in))
+        key_offsets = &zy_in->key_offsets;
+      else
+        return false;
+
+      for (size_t n = 1; n < key_offsets->size(); ++n)
+        if ((*key_offsets)[n] == 0)
           return false;
     }
 
@@ -1912,8 +1928,7 @@ namespace cryptonote
     std::unordered_set<crypto::key_image> ki;
     for(const auto& in: tx.vin)
     {
-      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, tokey_in, false);
-      if (!(rct::scalarmultKey(rct::ki2rct(tokey_in.k_image), rct::curveOrder()) == rct::identity()))
+      if (!(rct::scalarmultKey(rct::ki2rct(get_input_key_image(in)), rct::curveOrder()) == rct::identity()))
         return false;
     }
     return true;
@@ -1991,7 +2006,16 @@ namespace cryptonote
   bool core::handle_btencoded_uptime_proof(const NOTIFY_BTENCODED_UPTIME_PROOF::request &req, bool &my_uptime_proof_confirmation)
   {
     crypto::x25519_public_key pkey = {};
-    auto proof = std::make_unique<uptime_proof::Proof>(req.proof);
+    std::unique_ptr<uptime_proof::Proof> proof;
+    try
+    {
+      proof = std::make_unique<uptime_proof::Proof>(req.proof);
+    }
+    catch (const std::exception &e)
+    {
+      MWARNING("Failed to parse uptime proof: " << e.what());
+      return false;
+    }
     proof->sig = tools::make_from_guts<crypto::signature>(req.sig);
     proof->sig_ed25519 = tools::make_from_guts<crypto::ed25519_signature>(req.ed_sig);
     auto pubkey = proof->pubkey;
@@ -2070,9 +2094,10 @@ namespace cryptonote
     return m_blockchain_storage.get_outs(req, res);
   }
   //-----------------------------------------------------------------------------------------------
-  bool core::get_output_distribution(uint64_t amount, uint64_t from_height, uint64_t to_height, uint64_t &start_height, std::vector<uint64_t> &distribution, uint64_t &base) const
+  bool core::get_output_distribution(uint64_t amount, uint64_t from_height, uint64_t to_height, uint64_t &start_height, std::vector<uint64_t> &distribution, uint64_t &base,
+      output_distribution_type otype, std::vector<uint64_t> *output_indices) const
   {
-    return m_blockchain_storage.get_output_distribution(amount, from_height, to_height, start_height, distribution, base);
+    return m_blockchain_storage.get_output_distribution(amount, from_height, to_height, start_height, distribution, base, otype, output_indices);
   }
   //-----------------------------------------------------------------------------------------------
   void core::get_output_blacklist(std::vector<uint64_t> &blacklist) const
@@ -2422,6 +2447,7 @@ namespace cryptonote
     m_check_disk_space_interval.do_call([this] { return check_disk_space(); });
     m_block_rate_interval.do_call([this] { return check_block_rate(); });
     m_mn_proof_cleanup_interval.do_call([&mnl=m_master_node_list] { mnl.cleanup_proofs(); return true; });
+    m_mn_list_store_interval.do_call([&mnl=m_master_node_list] { mnl.checkpoint_state(); return true; });
 
     std::chrono::seconds lifetime{time(nullptr) - get_start_time()};
     if (m_master_node && lifetime > get_net_config().UPTIME_PROOF_STARTUP_DELAY) // Give us some time to connect to peers before sending uptimes

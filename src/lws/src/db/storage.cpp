@@ -638,7 +638,11 @@ namespace db
       int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
       while (err == 0 && values.size() < batch_rows)
       {
-        if (value.mv_size == sizeof(output_v2))
+        // Already at v2 or beyond - leave untouched. Accepting the current
+        // `output` size matters because a DB that has already reached v3 can
+        // still be re-entered here from version 0, and v1/v2/v3 are three
+        // distinct compile-time sizes, so this cannot mask a corrupt row.
+        if (value.mv_size == sizeof(output_v2) || value.mv_size == sizeof(output))
         {
           err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT); // already current
           continue;
@@ -704,12 +708,122 @@ namespace db
     // remain valid across this migration.
   }
 
+  // Migrate the `outputs` table from the pre-private-token layout (v2) to the
+  // current one (v3), which appends the four private-token fields. Same
+  // guarantees as migrate_1_2 above: fresh DB is a no-op, already-v3 rows are
+  // left alone, an unrecognised record size aborts the txn rather than
+  // guessing, and no spend rows are touched.
+  //
+  // Every existing row predates HF22 and so cannot be a token output; they all
+  // get zeroed token fields, which is exactly what "ordinary BDX output" means
+  // to the reader.
+  void migrate_2_3(MDB_txn& txn, tables_ const& tables)
+  {
+    MINFO("Checking outputs for private-token field migration (v2 -> v3)");
+
+    /* Converted in bounded batches, exactly as migrate_1_2: a row changes size,
+       so it is deleted and re-inserted, and holding every converted row at once
+       would need the whole outputs table in memory. Unlike v1 -> v2, this step
+       converts EVERY row of a database written before the token fork, so the
+       bound matters here most of all. After each batch the walk restarts from
+       the beginning; v3 rows are skipped cheaply. */
+    constexpr const std::size_t batch_rows = 200000;
+
+    struct owned_key { std::vector<unsigned char> data; };
+    std::vector<owned_key> keys;
+    std::vector<output> values;
+    keys.reserve(batch_rows);
+    values.reserve(batch_rows);
+
+    std::size_t converted_total = 0;
+
+    for (;;)
+    {
+      cursor::outputs cur;
+      const expect<void> opened = check_cursor(txn, tables.outputs, cur);
+      if (!opened)
+        MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
+
+      keys.clear();
+      values.clear();
+
+      MDB_val key{}, value{};
+      int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+      while (err == 0 && values.size() < batch_rows)
+      {
+        if (value.mv_size == sizeof(output))
+        {
+          err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT); // already current
+          continue;
+        }
+        if (value.mv_size != sizeof(output_v2))
+        {
+          MONERO_THROW(lws::error::bad_blockchain,
+            "Unexpected output record size during migration; refusing to modify the database");
+        }
+
+        const auto& old = *reinterpret_cast<const output_v2*>(value.mv_data);
+        output v3{};
+        v3.link = old.link;
+        v3.spend_meta.id = old.spend_meta.id;
+        v3.spend_meta.amount = old.spend_meta.amount;
+        v3.spend_meta.mixin_count = old.spend_meta.mixin_count;
+        v3.spend_meta.index = old.spend_meta.index;
+        v3.spend_meta.tx_public = old.spend_meta.tx_public;
+        v3.timestamp = old.timestamp;
+        v3.unlock_time = old.unlock_time;
+        v3.tx_prefix_hash = old.tx_prefix_hash;
+        v3.locked_key_image = old.locked_key_image;
+        v3.pub = old.pub;
+        v3.ringct_mask = old.ringct_mask;
+        std::memcpy(v3.reserved, old.reserved, sizeof(v3.reserved));
+        v3.extra = old.extra;
+        std::memcpy(&v3.payment_id, &old.payment_id, sizeof(v3.payment_id));
+        // Token fields stay zeroed: no output predating HF22 is a token output.
+
+        owned_key k;
+        k.data.assign(static_cast<unsigned char*>(key.mv_data),
+                      static_cast<unsigned char*>(key.mv_data) + key.mv_size);
+        keys.push_back(std::move(k));
+        values.push_back(v3);
+
+        err = mdb_cursor_del(cur.get(), 0);
+        if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
+        err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
+      }
+
+      if (err != 0 && err != MDB_NOTFOUND)
+        MONERO_THROW(lmdb::error(err), "cursor iteration failed");
+
+      if (values.empty())
+        break; // nothing at v2 left
+
+      for (std::size_t i = 0; i < values.size(); ++i)
+      {
+        MDB_val k{ keys[i].data.size(), keys[i].data.data() };
+        MDB_val v = lmdb::to_val(values[i]);
+        const int put = mdb_put(&txn, tables.outputs, &k, &v, 0);
+        if (put) MONERO_THROW(lmdb::error(put), "mdb_put failed");
+      }
+
+      converted_total += values.size();
+      MINFO("Private-token field migration: converted " << converted_total << " row(s) so far");
+    }
+
+    MINFO("Private-token field migration complete: converted " << converted_total << " row(s)");
+  }
+
   expect<void> migrate(MDB_txn& txn, tables_ const& tables, unsigned oldversion)
   {
     if (oldversion < 2)
     {
       migrate_1_2(txn, tables);
       MONERO_CHECK(complete_migration(txn, tables, 2));
+    }
+    if (oldversion < 3)
+    {
+      migrate_2_3(txn, tables);
+      MONERO_CHECK(complete_migration(txn, tables, 3));
     }
     return success();
   }
@@ -749,7 +863,9 @@ namespace db
         }
     }
 
-    if (current_version < 2) {
+    // Keep this in step with the highest version migrate() knows about, or a
+    // DB one version behind is silently left unmigrated.
+    if (current_version < 3) {
         expect<void> result = this->migrate(*txn, tables, current_version);
         if (!result) {
             MONERO_THROW(result.error(), "Migration failed");

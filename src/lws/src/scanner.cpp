@@ -399,24 +399,86 @@ namespace lws
               }
             }
           }
+          else if (cryptonote::txin_zy_input const* const zc_data =
+                     std::get_if<cryptonote::txin_zy_input>(std::addressof(in)))
+          {
+            /* HF22: the input side of a privacy-token spend - a burn, a mint, or
+               a token transfer. Without this branch the spend is silently not
+               recorded, and the account keeps counting an output it no longer
+               owns: a burn that consumed 1,000,000 and returned 750,000 in
+               change reported 1,750,000, because the change was added and
+               nothing was ever taken away.
+
+               Token outputs are stored under amount 0 (see the storing side
+               below), so the lookup uses 0 rather than an input amount - which
+               txin_zy_input does not carry, the value being hidden in the
+               commitment. */
+            mixin = boost::numeric_cast<std::uint32_t>(
+              std::max(std::size_t(1), zc_data->key_offsets.size()) - 1
+            );
+
+            std::uint64_t goffset = 0;
+            for (std::uint64_t offset : zc_data->key_offsets)
+            {
+              goffset += offset;
+              if (user.has_spendable(db::output_id{0, goffset}))
+              {
+                user.add_spend(
+                    db::spend{
+                        db::transaction_link{height, tx_hash},
+                        zc_data->k_image,
+                        db::output_id{0, goffset},
+                        timestamp,
+                        tx.unlock_time,
+                        mixin,
+                        {0, 0, 0}, // reserved
+                        payment_id.first,
+                        payment_id.second.long_
+                    }
+                );
+              }
+            }
+          }
           else if (std::get_if<cryptonote::txin_gen>(std::addressof(in)))
             ext = db::extra(ext | db::coinbase_output);
         }
 
         std::size_t index = -1;
+        // HF22: rct_signatures.outPk / ecdhInfo cover only the NATIVE outputs,
+        // while `index` walks every vout. A token tx interleaves zyphora
+        // outputs with native ones (fee change, registration collateral), so
+        // indexing those vectors by vout position runs off the end -- a 12
+        // output registration has just 2 entries. Track the native ordinal
+        // separately. output_indices is unaffected: the daemon emits one entry
+        // per vout, so out_ids stays indexed by `index`.
+        std::size_t native_index = 0;
         for (auto const& out : tx.vout)
         {
           // std::cout << "entered in vout " << std::endl;
           ++index;
+          const bool is_native_out =
+              std::get_if<cryptonote::tx_out_zyphora>(std::addressof(out.target)) == nullptr;
+          const std::size_t this_native_index = native_index;
+          if (is_native_out)
+            ++native_index;
 
           cryptonote::txout_to_key const* const out_data =
               std::get_if<cryptonote::txout_to_key>(std::addressof(out.target));
-          if (!out_data)
+          // HF22: a private-token output is a tx_out_zyphora, which carries its
+          // one-time key as `stealth_address` rather than `key`. Ownership is
+          // decided identically from there. Before this, the get_if above
+          // returned null for these and every token output was silently skipped.
+          cryptonote::tx_out_zyphora const* const zout_data =
+              std::get_if<cryptonote::tx_out_zyphora>(std::addressof(out.target));
+          if (!out_data && !zout_data)
             continue; // to next output
+
+          const crypto::public_key& out_pub =
+              out_data ? out_data->key : zout_data->stealth_address;
 
           crypto::public_key derived_pub;
           const bool received =
-              crypto::wallet::derive_subaddress_public_key(out_data->key, derived, index, derived_pub) &&
+              crypto::wallet::derive_subaddress_public_key(out_pub, derived, index, derived_pub) &&
               derived_pub == user.spend_public();
 
           if (!received)
@@ -429,14 +491,38 @@ namespace lws
           }
 
           std::uint64_t amount = out.amount;
-          
+
           rct::key mask = rct::identity();
-          if (!amount && !(ext & db::coinbase_output) && cryptonote::txversion::v1 < tx.version)
+          crypto::token_id token_id = crypto::null_tid;
+          if (zout_data)
+          {
+            // HF22: recover the plaintext token id and amount. `acc` is unused
+            // by decode_zyphora_output -- everything it needs comes from the
+            // derivation and the output itself -- which is what lets a
+            // view-only server decode these at all. It re-derives the amount
+            // commitment and returns false on mismatch, so a corrupt or
+            // misattributed output is rejected rather than stored wrong.
+            const cryptonote::account_keys view_only{};
+            rct::key amount_mask{};
+            rct::key token_blinding_mask{};
+            if (!cryptonote::decode_zyphora_output(
+                  view_only, *zout_data, derived, index,
+                  amount, token_id, amount_mask, token_blinding_mask))
+            {
+              MWARNING(user.address() << " failed to decode private-token output for tx "
+                       << tx_hash << ", skipping output");
+              continue; // to next output
+            }
+            mask = amount_mask;
+            ext = db::extra(ext | db::ringct_output);
+          }
+          else if (!amount && !(ext & db::coinbase_output) && cryptonote::txversion::v1 < tx.version)
           {
             
             const bool bulletproof2 = true;
             const auto decrypted = lws::decode_amount(
-              tx.rct_signatures.outPk.at(index).mask, tx.rct_signatures.ecdhInfo.at(index), derived, index, bulletproof2
+              tx.rct_signatures.outPk.at(this_native_index).mask,
+              tx.rct_signatures.ecdhInfo.at(this_native_index), derived, index, bulletproof2
             );
             if (!decrypted)
             {
@@ -469,14 +555,29 @@ namespace lws
                 key.pub_key
               },
                   timestamp,
-                  tx.unlock_time,
+                  // Since txversion v3 the per-output unlock times are the
+                  // authoritative ones; tx.unlock_time is a legacy tx-wide
+                  // value and is 0 on any modern transaction. HF22 relies on
+                  // this: a registration locks ONLY its collateral output, so
+                  // reading the tx-level field reports a wallet's locked
+                  // collateral as immediately spendable.
+                  tx.get_unlock_time(index),
                   *prefix_hash,
                   locked_key_image ? *locked_key_image : crypto::key_image{},
-                  out_data->key,
+                  out_pub,
                   mask,
                   {0, 0, 0, 0, 0, 0, 0}, // reserved bytes
                   db::pack(ext, user_payment_id.first),
-                  user_payment_id.second
+                  user_payment_id.second,
+                  // HF22 private tokens. All zero for an ordinary BDX output.
+                  // The blinded id, commitment and encrypted amount are stored
+                  // verbatim because the wallet re-derives its own blinding
+                  // scalar from them when spending; that scalar has no other
+                  // source and the server cannot supply it.
+                  zout_data ? reinterpret_cast<const crypto::public_key&>(token_id) : crypto::public_key{},
+                  zout_data ? reinterpret_cast<const crypto::public_key&>(zout_data->blinded_token_id) : crypto::public_key{},
+                  zout_data ? zout_data->amount_commitment : crypto::public_key{},
+                  zout_data ? zout_data->encrypted_amount : std::uint64_t(0)
             }
           );
 

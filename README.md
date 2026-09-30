@@ -22,6 +22,13 @@ More information on the project can be found on the website and in the whitepape
 
 Beldex is an open source project, and we encourage contributions from anyone with something to offer. For more information on contributing, please contact team@beldex.io
 
+### Privacy token anonymity model
+
+Privacy token (ZY / Zyphora) transactions hide the output amount, the token
+identity, and which ring member is spent. They do **not** hide that a transaction
+is a token transaction, nor its token input/output counts or token-vs-native
+split. See [docs/token-privacy.md](docs/token-privacy.md) for the full model.
+
 ## Compiling Beldex from source
 
 ### Dependencies
@@ -44,7 +51,7 @@ library archives (`.a`).
 | libzmq       | 4.3.0         | YES      | `libzmq3-dev`          | `zeromq`     | `zeromq-devel`      | NO       | ZeroMQ library   |
 | sqlite3      | 3.24.0        | YES      | `libsqlite3-dev`       | `sqlite`     | `sqlite-devel`      | NO       | Beldex Name System |
 | libsodium    | 1.0.9         | YES      | `libsodium-dev`        | `libsodium`  | `libsodium-devel`   | NO       | cryptography     |
-| libcurl      | 4.0           | NO       | `curl`                 | `curl-devel` | NO                  | HTTP     | RPC              |
+| libcurl      | 4.0           | NO       | `libcurl4-openssl-dev` | `curl-devel` | NO                  | HTTP     | RPC              |
 | libuv (Win)  | any           | NO       | (Windows only)         | --           | --                  | NO       | RPC event loop   |
 | libunwind    | any           | NO       | `libunwind8-dev`       | `libunwind`  | `libunwind-devel`   | YES      | Stack traces     |
 | liblzma      | any           | NO       | `liblzma-dev`          | `xz`         | `xz-devel`          | YES      | For libunwind    |
@@ -67,7 +74,7 @@ breakdown of the minimum set of required boost packages.
 Install all dependencies at once on Debian/Ubuntu:
 
 ```
-sudo apt update && sudo apt install build-essential cmake pkg-config libboost-all-dev libzmq3-dev libsodium-dev libunwind8-dev liblzma-dev libreadline6-dev doxygen graphviz libpgm-dev libsqlite3-dev curl
+sudo apt update && sudo apt install build-essential cmake pkg-config libboost-all-dev libzmq3-dev libsodium-dev libunwind8-dev liblzma-dev libreadline6-dev doxygen graphviz libpgm-dev libsqlite3-dev curl libcurl4-openssl-dev
 ```
 
 Install all dependencies at once on macOS with the provided Brewfile:

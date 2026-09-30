@@ -139,7 +139,23 @@ namespace lws
             if (spendable < out.size())
                 return {lws::error::not_enough_mixin};
             if (spendable == out.size())
-                return pick_all(out, 0);
+            {
+                /* Every spendable output is needed, numbered by rank. A rank is
+                   only a global output id in an unmapped bucket; the token
+                   bucket has to be translated, or the ring names whichever
+                   outputs happen to hold those global ids. This is the path the
+                   first token on a chain takes: its registration creates exactly
+                   the minimum number of token outputs a ring needs. */
+                MONERO_CHECK(pick_all(out, 0));
+                for (auto& entry : out)
+                {
+                    const auto global = pick_rct.to_global(entry.index);
+                    if (!global)
+                        return {lws::error::not_enough_mixin};
+                    entry.index = *global;
+                }
+                return success();
+            }
 
             for (auto& entry : out)
             {
@@ -158,7 +174,9 @@ namespace lws
         const epee::span<const std::uint64_t> amounts, 
         gamma_picker& pick_rct,
         epee::span<histogram> histograms,
-        const std::function<key_fetcher> fetch
+        const std::function<key_fetcher> fetch,
+        epee::span<const bool> is_token,
+        gamma_picker* pick_token
     ) {
         if (mixin == 0 || amounts.empty())
             return std::vector<random_ring>{amounts.size()};
@@ -174,6 +192,8 @@ namespace lws
         // std::cout << "amounts.size() : " << amounts.size() << std::endl;
         for (auto ring : boost::combine(amounts, rings))
             boost::get<1>(ring).amount = boost::get<0>(ring);
+        for (std::size_t i = 0; i < rings.size() && i < is_token.size(); ++i)
+            rings[i].is_token = is_token[i];
 
         std::sort(histograms.begin(), histograms.end(), by_amount{});
         for (unsigned tries = 0; tries < 64; ++tries)
@@ -196,7 +216,9 @@ namespace lws
                         expect<void> picked{};
                         const std::uint64_t amount = ring->amount;
                         if (amount == 0)
-                            picked = gamma_pick(latest, pick_rct);
+                            picked = gamma_pick(
+                                latest, (ring->is_token && pick_token) ? *pick_token : pick_rct
+                            );
                         else
                         {
                             const auto match =
@@ -255,14 +277,24 @@ namespace lws
             /* \TODO For maximum privacy, the real outputs need to be fetched
             below. This requires an update of the REST API. */
 
-            // fetch all new keys in one shot
+            /* Fetch all new keys in one shot - but only if any were proposed.
+               Every ring can already be full on a later pass, and asking the
+               daemon for an empty set of outputs is rejected as invalid
+               params, which turned the whole request into a 500. Reachable
+               once rings are drawn from different buckets, because one bucket
+               can satisfy its rings while another is still retrying. */
             const std::size_t expected = proposed.size();
-            auto result = fetch(std::move(proposed));
-            if (!result)
-                return result.error();
-
-            if (expected != result->size())
-                return {lws::error::bad_daemon_response};
+            std::vector<output_keys> fetched{};
+            if (expected)
+            {
+                auto result = fetch(std::move(proposed));
+                if (!result)
+                    return result.error();
+                if (expected != result->size())
+                    return {lws::error::bad_daemon_response};
+                fetched = std::move(*result);
+            }
+            const std::vector<output_keys>* const result = std::addressof(fetched);
 
             bool done = true;
             std::size_t offset = 0;

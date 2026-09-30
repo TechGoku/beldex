@@ -567,7 +567,9 @@ namespace cryptonote
      * @param return-by-reference distribution the start offset of the first rct output in this block (same as previous if none)
      * @param return-by-reference base how many outputs of that amount are before the stated distribution
      */
-    bool get_output_distribution(uint64_t amount, uint64_t from_height, uint64_t to_height, uint64_t &start_height, std::vector<uint64_t> &distribution, uint64_t &base) const;
+    bool get_output_distribution(uint64_t amount, uint64_t from_height, uint64_t to_height, uint64_t &start_height, std::vector<uint64_t> &distribution, uint64_t &base,
+        output_distribution_type otype = output_distribution_type::native,
+        std::vector<uint64_t> *output_indices = nullptr) const;
 
     /**
      * @brief gets global output indexes that should not be used, i.e. registration tx outputs
@@ -743,6 +745,7 @@ namespace cryptonote
     bool get_transactions_blobs(const std::vector<crypto::hash>& txs_ids, std::vector<blobdata>& txs, std::unordered_set<crypto::hash>* missed_txs = nullptr, bool pruned = false) const;
     bool get_split_transactions_blobs(const std::vector<crypto::hash>& txs_ids, std::vector<std::tuple<crypto::hash, cryptonote::blobdata, crypto::hash, cryptonote::blobdata>>& txs, std::unordered_set<crypto::hash>* missed_txs = nullptr) const;
     bool get_transactions(const std::vector<crypto::hash>& txs_ids, std::vector<transaction>& txs, std::unordered_set<crypto::hash>* missed_txs = nullptr) const;
+
 
     /**
      * @brief looks up transactions based on a list of transaction hashes and returns the block
@@ -1033,6 +1036,15 @@ namespace cryptonote
 
 #ifndef IN_UNIT_TESTS
   private:
+
+    /**
+     * @brief Non-locking form of get_transactions.
+     *
+     * The caller must already hold the blockchain lock. Private on purpose: a non-locking accessor
+     * is easy to call from the wrong place, and the locking get_transactions() is the entry point
+     * everything outside Blockchain should use.
+     */
+    bool _get_transactions(const std::vector<crypto::hash>& txs_ids, std::vector<transaction>& txs, std::unordered_set<crypto::hash>* missed_txs = nullptr) const;
 #endif
 
     struct block_pow_verified
@@ -1188,6 +1200,12 @@ namespace cryptonote
     template<class visitor_t>
     bool scan_outputkeys_for_indexes(const txin_to_key& tx_in_to_key, visitor_t &vis, const crypto::hash &tx_prefix_hash, uint64_t* pmax_related_block_height = NULL) const;
 
+    // HF21: privacy token (zyphora) input variant. Outputs are stored in
+    // the same amount=0 bucket as native rct outputs; the visitor additionally
+    // receives each ring member's blinded_token_id.
+    template<class visitor_t>
+    bool scan_outputkeys_for_indexes(const txin_zy_input& tx_in_zy, visitor_t &vis, const crypto::hash &tx_prefix_hash, uint64_t* pmax_related_block_height = NULL) const;
+
     /**
      * @brief collect output public keys of a transaction input set
      *
@@ -1206,6 +1224,11 @@ namespace cryptonote
      * @return false if any output is not yet unlocked, or is missing, otherwise true
      */
     bool check_tx_input(const txin_to_key& txin, const crypto::hash& tx_prefix_hash, std::vector<rct::ctkey> &output_keys, uint64_t* pmax_related_block_height);
+
+    // HF21: privacy token (zyphora) analogue of check_tx_input. Populates
+    // output_keys (stealth_address, amount_commitment) the same way check_tx_input
+    // does, plus a parallel ring of each member's blinded_token_id.
+    bool check_tx_input_zy(const txin_zy_input& txin, const crypto::hash& tx_prefix_hash, std::vector<rct::ctkey> &output_keys, std::vector<crypto::token_id> &output_blinded_token_ids, uint64_t* pmax_related_block_height);
 
     /**
      * @brief validate a transaction's inputs and their keys
@@ -1337,7 +1360,7 @@ namespace cryptonote
      *
      * @return false if anything is found wrong with the miner transaction, otherwise true
      */
-    bool validate_miner_transaction(const block& b, size_t cumulative_block_weight, uint64_t fee, uint64_t& base_reward, uint64_t already_generated_coins, hf version);
+    bool validate_miner_transaction(const block& b, size_t cumulative_block_weight, uint64_t fee, uint64_t& base_reward, uint64_t already_generated_coins, hf version, uint64_t registration_governance_fee = 0);
 
     /**
      * @brief reverts the blockchain to its previous state following a failed switch

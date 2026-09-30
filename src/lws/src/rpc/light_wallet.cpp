@@ -93,6 +93,23 @@ namespace
       optional_rct = std::addressof(rct);
     }
 
+    /* HF22: a privacy-token output. The client rebuilds the output and recovers
+       its own blinding scalar from these when spending - that scalar has no
+       other source and the server cannot derive it on the wallet's behalf.
+       Omitted entirely for an ordinary BDX output, so a server that predates
+       tokens and a wallet that predates them both behave as before. */
+    crypto::public_key const* token_id = nullptr;
+    crypto::public_key const* blinded_token_id = nullptr;
+    crypto::public_key const* amount_commitment = nullptr;
+    boost::optional<lws::rpc::safe_uint64> encrypted_amount;
+    if (self.data.first.token_id != crypto::public_key{})
+    {
+      token_id = std::addressof(self.data.first.token_id);
+      blinded_token_id = std::addressof(self.data.first.blinded_token_id);
+      amount_commitment = std::addressof(self.data.first.amount_commitment);
+      encrypted_amount = lws::rpc::safe_uint64(self.data.first.encrypted_amount);
+    }
+
     wire::object(dest,
       wire::field("amount", lws::rpc::safe_uint64(self.data.first.spend_meta.amount)),
       wire::field("public_key", self.data.first.pub),
@@ -105,7 +122,11 @@ namespace
       wire::field("timestamp", iso_timestamp(self.data.first.timestamp)),
       wire::field("height", self.data.first.link.height),
       wire::field("spend_key_images", std::cref(self.data.second)),
-      wire::optional_field("rct", optional_rct)
+      wire::optional_field("rct", optional_rct),
+      wire::optional_field("token_id", token_id),
+      wire::optional_field("blinded_token_id", blinded_token_id),
+      wire::optional_field("amount_commitment", amount_commitment),
+      wire::optional_field("encrypted_amount", encrypted_amount)
     );
   }
 
@@ -123,10 +144,16 @@ namespace lws
   static void write_bytes(wire::json_writer& dest, random_output const& self)
   {
     const rct_bytes rct{self.keys.mask, rct::zero(), rct::zero()};
+    // HF22: only present when this decoy is a private-token output. Absent
+    // means native, which is what beldex-core-cpp already assumes when the
+    // field is missing, so an ordinary BDX ring is unchanged.
+    const auto blinded_token_id = self.keys.blinded_token_id != crypto::null_tid ?
+      std::addressof(self.keys.blinded_token_id) : nullptr;
     wire::object(dest,
       wire::field("global_index", rpc::safe_uint64(self.index)),
       wire::field("public_key", std::cref(self.keys.key)),
-      wire::field("rct", std::cref(rct))
+      wire::field("rct", std::cref(rct)),
+      wire::optional_field("blinded_token_id", blinded_token_id)
     );
   }
   static void write_bytes(wire::json_writer& dest, random_ring const& self)
@@ -242,6 +269,16 @@ namespace lws
     );
   }
 
+  void rpc::write_bytes(wire::json_writer& dest, const token_balance& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD_COPY(token_id),
+      WIRE_FIELD_COPY(total_received),
+      WIRE_FIELD_COPY(total_sent),
+      WIRE_FIELD_COPY(locked_funds)
+    );
+  }
+
   void rpc::write_bytes(wire::json_writer& dest, const get_address_info_response& self)
   {
     wire::object(dest,
@@ -254,13 +291,23 @@ namespace lws
       WIRE_FIELD_COPY(transaction_height),
       WIRE_FIELD_COPY(blockchain_height),
       WIRE_FIELD_COPY(next_min_height),
-      WIRE_FIELD(spent_outputs)
+      WIRE_FIELD(spent_outputs),
+      WIRE_FIELD(tokens)
       // WIRE_OPTIONAL_FIELD(rates)
     );
   }
 
   namespace rpc
   {
+    static void write_bytes(wire::json_writer& dest, const get_address_txs_response::transaction::token_leg& self)
+    {
+      wire::object(dest,
+        WIRE_FIELD_COPY(token_id),
+        wire::field("received", safe_uint64(self.received)),
+        wire::field("sent", safe_uint64(self.sent))
+      );
+    }
+
     static void write_bytes(wire::json_writer& dest, boost::range::index_value<const get_address_txs_response::transaction&> self)
     {
       epee::span<const std::uint8_t> const* payment_id = nullptr;
@@ -279,6 +326,11 @@ namespace lws
 
       const bool is_coinbase = (extra.first & db::coinbase_output);
 
+
+      std::vector<get_address_txs_response::transaction::token_leg> const* token_legs = nullptr;
+      if (!self.value().token_legs.empty())
+        token_legs = std::addressof(self.value().token_legs);
+
       wire::object(dest,
         wire::field("id", std::uint64_t(self.index())),
         wire::field("hash", std::cref(self.value().info.link.tx_hash)),
@@ -291,7 +343,11 @@ namespace lws
         wire::field("coinbase", is_coinbase),
         wire::field("mempool", false),
         wire::field("mixin", self.value().info.spend_meta.mixin_count),
-        wire::field("spent_outputs", std::cref(self.value().spends))
+        wire::field("spent_outputs", std::cref(self.value().spends)),
+        // HF22: one entry per token this transaction moved. Omitted entirely
+        // for an ordinary BDX transaction, so those are byte-for-byte what
+        // they always were.
+        wire::optional_field("token_legs", token_legs)
       );
     }
   } // rpc
@@ -310,9 +366,91 @@ namespace lws
     );
   }
 
+  void rpc::write_bytes(wire::json_writer& dest, const token_balance_entry& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(token_id),
+      WIRE_FIELD(status),
+      WIRE_FIELD_COPY(total_received),
+      WIRE_FIELD_COPY(total_sent),
+      WIRE_FIELD_COPY(locked_funds),
+      WIRE_FIELD_COPY(unlocked_balance),
+      WIRE_FIELD(ticker),
+      WIRE_FIELD(full_name),
+      WIRE_FIELD(owner),
+      WIRE_FIELD(meta_info),
+      WIRE_FIELD_COPY(current_supply),
+      WIRE_FIELD_COPY(total_max_supply),
+      WIRE_FIELD_COPY(decimal_point)
+    );
+  }
+  void rpc::read_bytes(wire::json_reader& source, get_token_balances_request& self)
+  {
+    std::string address;
+    boost::optional<std::vector<std::string>> token_ids;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      wire::optional_field("token_ids", std::ref(token_ids))
+    );
+    if (token_ids)
+      self.token_ids = std::move(*token_ids);
+    convert_address(address, self.creds.address);
+  }
+  void rpc::write_bytes(wire::json_writer& dest, const get_token_balances_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(tokens),
+      WIRE_FIELD_COPY(scanned_height),
+      WIRE_FIELD_COPY(blockchain_height)
+    );
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, get_token_info_request& self)
+  {
+    wire::object(source, WIRE_FIELD(token_id));
+  }
+  void rpc::write_bytes(wire::json_writer& dest, const get_token_info_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(token_id),
+      WIRE_FIELD(ticker),
+      WIRE_FIELD(full_name),
+      WIRE_FIELD(owner),
+      WIRE_FIELD(meta_info),
+      WIRE_FIELD_COPY(current_supply),
+      WIRE_FIELD_COPY(total_max_supply),
+      WIRE_FIELD_COPY(decimal_point)
+    );
+  }
+  void rpc::read_bytes(wire::json_reader& source, get_token_list_request& self)
+  {
+    // Both fields are optional; the struct's defaults (offset 0, count 100)
+    // stand when the caller omits them.
+    boost::optional<std::uint64_t> offset;
+    boost::optional<std::uint64_t> count;
+    wire::object(source,
+      wire::optional_field("offset", std::ref(offset)),
+      wire::optional_field("count", std::ref(count))
+    );
+    if (offset) self.offset = *offset;
+    if (count)  self.count  = *count;
+  }
+  void rpc::write_bytes(wire::json_writer& dest, const get_token_list_response& self)
+  {
+    wire::object(dest, WIRE_FIELD(token_ids), WIRE_FIELD_COPY(total_count));
+  }
+
   void rpc::read_bytes(wire::json_reader& source, get_random_outs_request& self)
   {
-    wire::object(source, WIRE_FIELD(count), WIRE_FIELD(amounts));
+    boost::optional<std::vector<std::string>> token_ids;
+    wire::object(source,
+      WIRE_FIELD(count),
+      WIRE_FIELD(amounts),
+      wire::optional_field("token_ids", std::ref(token_ids))
+    );
+    if (token_ids)
+      self.token_ids = std::move(*token_ids);
   }
   void rpc::write_bytes(wire::json_writer& dest, const get_random_outs_response& self)
   {
@@ -324,6 +462,8 @@ namespace lws
     std::string address;
     boost::optional<std::uint64_t> min_height;
     boost::optional<std::uint64_t> max_count;
+    boost::optional<std::string> token_id;
+    boost::optional<bool> all_tokens;
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
@@ -332,8 +472,13 @@ namespace lws
       WIRE_OPTIONAL_FIELD(use_dust),
       WIRE_OPTIONAL_FIELD(dust_threshold),
       wire::optional_field("min_height", std::ref(min_height)),
-      wire::optional_field("max_count", std::ref(max_count))
+      wire::optional_field("max_count", std::ref(max_count)),
+      wire::optional_field("token_id", std::ref(token_id)),
+      wire::optional_field("all_tokens", std::ref(all_tokens))
     );
+    if (token_id)
+      self.token_id = std::move(*token_id);
+    self.all_tokens = all_tokens.value_or(false);
     convert_address(address, self.creds.address);
     self.min_height = min_height.value_or(0);
     self.max_count = max_count.value_or(0);
@@ -356,6 +501,7 @@ namespace lws
       // WIRE_FIELD_COPY(fee_mask),
       WIRE_FIELD_COPY(amount),
       WIRE_FIELD_COPY(next_min_height),
+      WIRE_FIELD_COPY(blockchain_height),
       wire::field("outputs", wire::as_array(std::cref(self.outputs), expand))
     );
   }
