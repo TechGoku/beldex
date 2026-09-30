@@ -244,6 +244,7 @@ namespace cryptonote
     // native BDX burn amounts continue to use burn_fixed/burn_percent above.
     crypto::token_id burn_token_id = crypto::null_tid;
     uint64_t burn_token_amount = 0;
+    network_type nettype = network_type::MAINNET;
   };
 
   //---------------------------------------------------------------

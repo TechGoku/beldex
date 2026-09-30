@@ -65,7 +65,7 @@ enum struct lmdb_version
     v5,     // alt_block_data_1_t => alt_block_data_t: Alt block data has boolean for if the block was checkpointed
     v6,     // remigrate quorum_signature struct due to alignment change
     v7,     // rebuild the checkpoint table because v6 update in-place made MDB_LAST not give us the newest checkpoint
-    v8,     // add token history table and blinded_token_id output metadata for privacy token ring filtering
+    v8,     // add token history table, blinded_token_id output records, and the native/token output-by-height indexe.
     _count
 };
 
@@ -6224,7 +6224,7 @@ void BlockchainLMDB::migrate_7_8()
   // ── v8 on-disk record layout (BEFORE the new field) ──
 
 #pragma pack(push, 1)
-  struct v8_output_data_t
+  struct v7_output_data_t
   {
     crypto::public_key pubkey;
     uint64_t unlock_time;
@@ -6232,11 +6232,11 @@ void BlockchainLMDB::migrate_7_8()
     rct::key commitment;
   };
 
-  struct v8_outkey
+  struct v7_outkey
   {
     uint64_t amount_index;
     uint64_t output_id;
-    v8_output_data_t data;
+    v7_output_data_t data;
   };
 #pragma pack(pop)
 
@@ -6282,9 +6282,9 @@ void BlockchainLMDB::migrate_7_8()
       if (ret)
         throw0(DB_ERROR(lmdb_error("migrate_7_8: enumerate old outputs: ", ret).c_str()));
 
-      if (v.mv_size == sizeof(v8_outkey))
+      if (v.mv_size == sizeof(v7_outkey))
       {
-        const v8_outkey *old = static_cast<const v8_outkey *>(v.mv_data);
+        const v7_outkey *old = static_cast<const v7_outkey *>(v.mv_data);
 
         outkey nk{};
         nk.amount_index = old->amount_index;

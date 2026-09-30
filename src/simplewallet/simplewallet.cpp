@@ -8162,7 +8162,7 @@ bool simple_wallet::register_privacy_token(const std::vector<std::string>& args_
           cryptonote::feature::PRIVACY_TOKENS, cryptonote::token_descriptor_operation_type::register_token,
           m_wallet->nettype());
       success_msg_writer() << tr("\nThis registration will also:\n")
-                           << tr("  Lock collateral: ") << print_money(tokens::REGISTRATION_COLLATERAL_AMOUNT)
+                           << tr("  Lock collateral: ") << print_money(tokens::registration_collateral_amount(m_wallet->nettype()))
                            << tr(" BDX for ") << tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS << tr(" blocks")
                            << (height_err.empty()
                                  ? std::string{" (unlocks at block ~"} +

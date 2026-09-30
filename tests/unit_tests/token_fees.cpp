@@ -37,6 +37,13 @@ transaction fee_tx(operation op, uint64_t burned, uint64_t fee)
   return tx;
 }
 
+TEST(TokenFees, RegistrationCollateralByNetwork)
+{
+  EXPECT_EQ(tokens::registration_collateral_amount(TESTNET), 100 * beldex::COIN);
+  for (auto net : {MAINNET, DEVNET, FAKECHAIN})
+    EXPECT_EQ(tokens::registration_collateral_amount(net), 10'000 * beldex::COIN);
+}
+
 TEST(TokenFees, ExplicitScheduleAndActivation)
 {
   const auto registration = tokens::fee_for_operation(active, operation::register_token, MAINNET);

@@ -218,6 +218,101 @@ TEST(TokenProofs, AggregationRejectsEveryScalarAlias)
     reject_scalar_alias(proof, [i](auto& p) -> auto& { return p.y1s[i]; }, verify);
   }
 }
+
+TEST(TokenProofs, TorsionPointsAreRejected)
+{
+  // Canonical order-8 (small-subgroup) point: 8*P == identity but P != identity.
+  // Adding it to a point shares the same 8x representative, so any proof that
+  // cofactor-clears (x8) without binding the exact encoding into its
+  // Fiat-Shamir transcript would accept the mutated bytes -> txid malleability.
+  rct::key torsion;
+  ASSERT_TRUE(tools::hex_to_type(
+      std::string_view("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),
+      torsion));
+  ASSERT_TRUE(rct::scalarmult8(torsion) == rct::identity());
+  ASSERT_FALSE(torsion == rct::identity());
+
+  const auto msg = rct::d2h(123), secret = rct::d2h(7), a = rct::d2h(7), b = rct::d2h(11);
+
+  // Schnorr over G and X: torsion on the public key.
+  {
+    const auto g = rct::scalarmultBase(secret);
+    crypto::schnorr_sig_s s{};
+    ASSERT_TRUE(crypto::generate_schnorr_sig(msg, g, secret, s));
+    EXPECT_FALSE(crypto::verify_schnorr_sig(msg, plus(g, torsion), s));
+    const auto x = rct::scalarmultX(secret);
+    ASSERT_TRUE(crypto::generate_schnorr_sig_X(msg, x, secret, s));
+    EXPECT_FALSE(crypto::verify_schnorr_sig_X(msg, plus(x, torsion), s));
+  }
+
+  // Linear composition + double schnorr: torsion on the public point(s).
+  {
+    const auto P = plus(rct::scalarmultBase(a), rct::scalarmultX(b));
+    crypto::linear_composition_proof_s c{};
+    ASSERT_TRUE(crypto::generate_linear_composition_proof(msg, P, a, b, c));
+    EXPECT_FALSE(crypto::verify_linear_composition_proof(msg, plus(P, torsion), c));
+    const auto p0 = rct::scalarmultX(a), p1 = rct::scalarmultBase(b);
+    crypto::double_schnorr_sig_s d{};
+    ASSERT_TRUE(crypto::generate_double_schnorr_sig(msg, p0, a, p1, b, d));
+    EXPECT_FALSE(crypto::verify_double_schnorr_sig(msg, plus(p0, torsion), p1, d));
+    EXPECT_FALSE(crypto::verify_double_schnorr_sig(msg, p0, plus(p1, torsion), d));
+  }
+
+  // BGE: torsion on every proof point field (A, B, Pk[]) and public input (T, ring[]).
+  {
+    rct::keyV ring;
+    for (size_t i = 0; i < 5; ++i) ring.push_back(rct::scalarmultH(rct::d2h(i + 1)));
+    const auto target = plus(ring.back(), rct::scalarmultX(secret));
+    crypto::BGE_proof_s proof{};
+    ASSERT_TRUE(crypto::generate_BGE_proof(msg, ring, target, secret, ring.size() - 1, proof));
+    ASSERT_TRUE(crypto::verify_BGE_proof(msg, ring, target, proof));
+    EXPECT_FALSE(crypto::verify_BGE_proof(msg, ring, plus(target, torsion), proof));
+    for (size_t i = 0; i < ring.size(); ++i)
+    {
+      auto r = ring; r[i] = plus(r[i], torsion);
+      EXPECT_FALSE(crypto::verify_BGE_proof(msg, r, target, proof));
+    }
+    for (size_t field = 0; field < 2 + proof.Pk.size(); ++field)
+    {
+      auto m = proof;
+      auto& pt = field == 0 ? m.A : field == 1 ? m.B : m.Pk[field - 2];
+      pt = plus(pt, torsion);
+      EXPECT_FALSE(crypto::verify_BGE_proof(msg, ring, target, m));
+    }
+  }
+
+  // Aggregation: torsion on the proof commitment field E'_j (guarded by an
+  // explicit main-subgroup check, since E'_j enters the transcript only after
+  // 8x clearing) and on the public inputs (commitments and tags).
+  {
+    const rct::keyV amounts{rct::d2h(3), rct::d2h(5)}, masks{rct::d2h(7), rct::d2h(11)},
+        aux_masks{rct::d2h(13), rct::d2h(17)},
+        tags{rct::scalarmultX(rct::d2h(19)), rct::scalarmultX(rct::d2h(23))};
+    rct::keyV real, aux;
+    for (size_t i = 0; i < amounts.size(); ++i)
+    {
+      real.push_back(plus(rct::scalarmultKey(tags[i], amounts[i]), rct::scalarmultBase(masks[i])));
+      aux.push_back(plus(rct::scalarmultH(amounts[i]), rct::scalarmultBase(aux_masks[i])));
+    }
+    crypto::vector_ug_aggregation_proof_s proof{};
+    ASSERT_TRUE(crypto::generate_vector_ug_aggregation_proof(msg, amounts, masks, aux_masks, real, aux, tags, proof));
+    ASSERT_TRUE(crypto::verify_vector_ug_aggregation_proof(msg, real, tags, proof));
+    for (size_t i = 0; i < proof.amount_commitments_for_rp_aggregation.size(); ++i)
+    {
+      auto m = proof;
+      m.amount_commitments_for_rp_aggregation[i] =
+          plus(m.amount_commitments_for_rp_aggregation[i], torsion);
+      EXPECT_FALSE(crypto::verify_vector_ug_aggregation_proof(msg, real, tags, m));
+    }
+    for (size_t i = 0; i < real.size(); ++i)
+    {
+      auto r = real; r[i] = plus(r[i], torsion);
+      EXPECT_FALSE(crypto::verify_vector_ug_aggregation_proof(msg, r, tags, proof));
+      auto t = tags; t[i] = plus(t[i], torsion);
+      EXPECT_FALSE(crypto::verify_vector_ug_aggregation_proof(msg, real, t, proof));
+    }
+  }
+}
 } // namespace
 
 namespace {

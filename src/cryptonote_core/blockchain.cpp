@@ -4120,10 +4120,10 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
           return false;
         }
 
-        if (coll_lock.amount < tokens::REGISTRATION_COLLATERAL_AMOUNT)
+        if (coll_lock.amount < tokens::registration_collateral_amount(m_nettype))
         {
           tvc.m_verbose_error = "Token registration collateral " + std::to_string(coll_lock.amount) +
-                                " is below minimum " + std::to_string(tokens::REGISTRATION_COLLATERAL_AMOUNT);
+                                " is below minimum " + std::to_string(tokens::registration_collateral_amount(m_nettype));
           MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);
           return false;
         }
@@ -4178,7 +4178,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
             tx.rct_signatures.outPk[collateral_rct_index].mask != expected_commitment)
         {
           tvc.m_verbose_error = "Token registration requires a locked collateral output of at least " +
-                                std::to_string(tokens::REGISTRATION_COLLATERAL_AMOUNT) +
+                                std::to_string(tokens::registration_collateral_amount(m_nettype)) +
                                 " whose commitment matches the declared amount, locked for " +
                                 std::to_string(tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS) + " blocks";
           MERROR_VER("Failed to validate Token TX reason: " << tvc.m_verbose_error);

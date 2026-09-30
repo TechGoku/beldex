@@ -565,7 +565,7 @@ namespace cryptonote
   // so it discloses neither the tx secret key nor any other output.
   struct tx_extra_collateral_lock
   {
-    uint64_t amount;       // Declared collateral amount (must be >= REGISTRATION_COLLATERAL_AMOUNT)
+    uint64_t amount;       // Declared collateral amount (must meet the network registration collateral minimum)
     rct::key mask;         // Blinding factor of that output's amount commitment
     uint8_t  output_index; // Index into tx.vout[] of the collateral output
 

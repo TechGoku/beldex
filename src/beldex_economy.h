@@ -152,6 +152,14 @@ constexpr uint64_t burn_needed(cryptonote::hf hf_version, mapping_years map_year
 namespace tokens
 {
 inline constexpr uint64_t REGISTRATION_COLLATERAL_AMOUNT = 10'000 * beldex::COIN;
+inline constexpr uint64_t REGISTRATION_COLLATERAL_AMOUNT_TESTNET = 100 * beldex::COIN;
+
+constexpr uint64_t registration_collateral_amount(cryptonote::network_type nettype)
+{
+  return nettype == cryptonote::network_type::TESTNET
+      ? REGISTRATION_COLLATERAL_AMOUNT_TESTNET : REGISTRATION_COLLATERAL_AMOUNT;
+}
+
 inline constexpr uint64_t REGISTRATION_COLLATERAL_LOCK_BLOCKS = 2880 * 30 * 6;
 inline constexpr uint64_t REGISTRATION_COLLATERAL_LOCK_TOLERANCE_BLOCKS = 60;
 // Token operation surcharges in atomic BDX, in addition to the ordinary

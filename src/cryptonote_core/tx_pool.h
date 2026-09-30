@@ -43,6 +43,7 @@
 #include "cryptonote_basic/verification_context.h"
 #include "blockchain_db/blockchain_db.h"
 #include "crypto/hash.h"
+#include "crypto/crypto.h"
 #include "tx_flash.h"
 #include "beldex_economy.h"
 
@@ -632,6 +633,39 @@ namespace cryptonote
     bool remove_transaction_keyimages(const transaction_prefix& tx, const crypto::hash &txid);
 
     /**
+     * @brief record a pooled tx's token operations in m_pending_token_ops
+     *
+     * The token-op index is maintained exactly like m_spent_key_images: alongside it at every
+     * point a tx enters or leaves the pool, and rebuilt from the backend in init(). Callers must
+     * hold m_transactions_lock.
+     *
+     * @param tx the transaction (prefix is enough: type and extra both live there)
+     * @param txid the transaction's hash
+     */
+    void index_token_ops(const transaction_prefix &tx, const crypto::hash &txid);
+
+    /**
+     * @brief forget a tx's token operations
+     *
+     * Only erases entries this txid actually owns, so removing one tx can never drop the index
+     * entry belonging to another.
+     */
+    void unindex_token_ops(const transaction_prefix &tx, const crypto::hash &txid);
+
+    /**
+     * @brief is some OTHER pooled tx already carrying an operation on this token?
+     *
+     * @param token_id the token to look for
+     * @param exclude a txid to ignore (the tx being checked, so re-checking an already-pooled tx
+     * doesn't report itself)
+     * @param holder set to the txid holding the token when true is returned
+     *
+     * @return true if another pooled tx holds an operation on this token
+     */
+    bool token_op_in_pool(const crypto::token_id &token_id, const crypto::hash &exclude,
+                          crypto::hash &holder) const;
+
+    /**
      * @brief check if a transaction is a valid candidate for inclusion in a block
      *
      * @param txd the transaction to check (and info about it)
@@ -705,6 +739,7 @@ namespace cryptonote
 
     //! container for spent key images from the transactions in the pool
     key_images_container m_spent_key_images;
+    mutable std::unordered_map<crypto::token_id, crypto::hash> m_pending_token_ops;
 
     //TODO: this time should be a named constant somewhere, not hard-coded
     //! interval on which to check for stale/"stuck" transactions

@@ -8174,6 +8174,7 @@ bool wallet2::sign_tx(unsigned_tx_set &exported_txs, std::vector<wallet2::pendin
     rct::multisig_out msout;
 
     beldex_construct_tx_params tx_params;
+    tx_params.nettype = m_nettype;
     tx_params.hf_version = sd.hf_version;
     tx_params.tx_type    = sd.tx_type;
     bool r = cryptonote::construct_tx_and_get_tx_key(m_account.get_keys(), m_subaddresses, sd.sources, sd.splitted_dsts, sd.change_dts, sd.extra, ptx.tx, sd.unlock_time, tx_key, additional_tx_keys, rct_config, m_multisig ? &msout : NULL, tx_params);
@@ -8659,6 +8660,7 @@ bool wallet2::sign_multisig_tx(multisig_tx_set &exported_txs, std::vector<crypto
     auto sources = sd.sources;
 
     beldex_construct_tx_params tx_params;
+    tx_params.nettype = m_nettype;
     tx_params.hf_version      = sd.hf_version;
     tx_params.tx_type         = sd.tx_type;
     rct::RCTConfig rct_config = sd.rct_config;
@@ -12330,7 +12332,7 @@ std::vector<wallet2::pending_tx> wallet2::create_privacy_token_registration_tx(
 
   cryptonote::tx_destination_entry collateral_dest;
   collateral_dest.addr = get_subaddress({subaddr_account, 0});
-  collateral_dest.amount = tokens::REGISTRATION_COLLATERAL_AMOUNT;
+  collateral_dest.amount = tokens::registration_collateral_amount(m_nettype);
   collateral_dest.is_subaddress = subaddr_account != 0;
   collateral_dest.token_id = crypto::null_tid;
 
@@ -12341,7 +12343,7 @@ std::vector<wallet2::pending_tx> wallet2::create_privacy_token_registration_tx(
   dsts.push_back(collateral_dest);
 
   MINFO("create_privacy_token_registration_tx: locking "
-        << print_money(tokens::REGISTRATION_COLLATERAL_AMOUNT)
+        << print_money(tokens::registration_collateral_amount(m_nettype))
         << " collateral until block " << collateral_unlock_height
         << " (" << tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS << " blocks)");
 
@@ -12454,6 +12456,7 @@ std::vector<wallet2::pending_tx> wallet2::create_token_burn_tx(
 // ─────────────────────────────────────────────────────────────────────────────
 std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryptonote::tx_destination_entry> dsts, const size_t fake_outs_count, const uint64_t unlock_time, uint32_t priority, const std::vector<uint8_t>& extra_base, uint32_t subaddr_account, std::set<uint32_t> subaddr_indices, beldex_construct_tx_params &tx_params, const unique_index_container& subtract_fee_from_outputs)
 {
+  tx_params.nettype = m_nettype;
   //ensure device is let in NONE mode in any case
   LOG_PRINT_L0("create_transactions_2 get_device prio:" << priority);
   hw::device &hwdev = m_account.get_device();

@@ -84,6 +84,11 @@ namespace cryptonote
       return d;
     }
 
+    bool input_has_key_image(const txin_v &in)
+    {
+      return std::holds_alternative<txin_to_key>(in) || std::holds_alternative<txin_zy_input>(in);
+    }
+
     uint64_t get_transaction_weight_limit(hf version)
     {
       // from v10, bulletproofs, limit a tx to 50% of the minimum block weight
@@ -221,44 +226,29 @@ namespace cryptonote
         }
       }
     }
-    else if (tx.type == txtype::mint_token)
+    else if (tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token ||
+             tx.type == txtype::update_token || tx.type == txtype::burn_token)
     {
-      // At most one mint_token tx per token_id may sit in the pool at a time:
-      // two mints of the same token can each individually validate against
-      // committed DB state (check_tx_inputs never sees the other), but if
-      // both land in the same block the second one can push current_supply
-      // over total_max_supply -- a check that only runs cumulatively at
-      // block-add time (Blockchain::handle_block_to_main_chain), so the
-      // whole block would be built then rejected. Same rationale as the BNS
-      // buy check above; see also token_ops_this_block in fill_block_template
-      // for the (reorg-proof) check that fully closes this at block-build time.
       cryptonote::tx_extra_token_descriptor_operation data{};
-      if (!cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, data))
+      size_t op_index = 0;
+      bool saw_token_op = false;
+      while (cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, data, op_index++))
+      {
+        saw_token_op = true;
+        const crypto::token_id token_id = cryptonote::get_or_calculate_token_id(data);
+        crypto::hash holder{};
+        if (token_op_in_pool(token_id, get_transaction_hash(tx), holder))
+        {
+          LOG_PRINT_L1("New TX: " << get_transaction_hash(tx) << ", has TX: " << holder
+              << " from the pool that already carries an operation on the same token_id.");
+          return true;
+        }
+      }
+
+      if (!saw_token_op)
       {
         MERROR("Could not get token descriptor operation from tx: " << get_transaction_hash(tx) << ", tx to add is possibly invalid, rejecting");
         return true;
-      }
-      const crypto::token_id token_id = cryptonote::get_or_calculate_token_id(data);
-
-      std::vector<transaction> pool_txs;
-      get_transactions(pool_txs);
-      for (const transaction& pool_tx : pool_txs)
-      {
-        if (pool_tx.type != tx.type)
-          continue;
-
-        cryptonote::tx_extra_token_descriptor_operation pool_data{};
-        if (!cryptonote::get_token_descriptor_operation_from_tx_extra(pool_tx.extra, pool_data))
-        {
-          LOG_PRINT_L1("Could not get token descriptor operation from tx: " << get_transaction_hash(tx) << ", possibly corrupt tx in the pool");
-          return true;
-        }
-
-        if (token_id == cryptonote::get_or_calculate_token_id(pool_data))
-        {
-          LOG_PRINT_L1("New TX: " << get_transaction_hash(tx) << ", has TX: " << get_transaction_hash(pool_tx) << " from the pool that is already minting the same token_id.");
-          return true;
-        }
       }
     }
     else
@@ -479,6 +469,7 @@ namespace cryptonote
           m_blockchain.add_txpool_tx(id, blob, meta);
           if (!insert_key_images(tx, id, opts.kept_by_block))
             return false;
+          index_token_ops(tx, id);
           m_txs_by_fee_and_receive_time.emplace(std::tuple<bool, double, std::time_t>(non_standard_tx, fee / (double)(tx_weight ? tx_weight : 1), receive_time), id);
           lock.commit();
         }
@@ -525,6 +516,7 @@ namespace cryptonote
         m_blockchain.add_txpool_tx(id, blob, meta);
         if (!insert_key_images(tx, id, opts.kept_by_block))
           return false;
+        index_token_ops(tx, id);
         m_txs_by_fee_and_receive_time.emplace(std::tuple<bool, double, std::time_t>(non_standard_tx, fee / (double)(tx_weight ? tx_weight : 1), receive_time), id);
         lock.commit();
       }
@@ -823,6 +815,7 @@ namespace cryptonote
         m_blockchain.remove_txpool_tx(txid);
         m_txpool_weight -= orphan_meta.weight;
         remove_transaction_keyimages(orphan_tx, txid);
+        unindex_token_ops(orphan_tx, txid);
         return true;
       }
       MERROR("Failed to find tx in txpool sorted list");
@@ -857,6 +850,7 @@ namespace cryptonote
     if (!remove_transaction_keyimages(tx, txid))
       MERROR("Failed to remove key images for tx " << txid << " being removed from the txpool; "
              "the spent key image map may be inconsistent until restart");
+    unindex_token_ops(tx, txid);
     m_txs_by_fee_and_receive_time.erase(it);
 
     return true;
@@ -944,24 +938,25 @@ namespace cryptonote
 
     for(const auto& in: tx.vin)
     {
-      // Native (txin_to_key) and privacy-token (txin_zy_input) inputs both
-      // carry a key image, and both must be tracked here: a token spend left
-      // out of m_spent_key_images could be double spent within the pool.
-      const crypto::key_image& ki = get_input_key_image(in);
-      CHECK_AND_ASSERT_MES(seen_key_images.insert(ki).second,
-          false,
-          "duplicate key image in transaction: " << ki
+      CHECK_AND_ASSERT_MES(input_has_key_image(in), false,
+          "wrong variant type: " << tools::type_name(tools::variant_type(in))
+          << ", expected txin_to_key or txin_zy_input"
           << "\ntx_id=" << id);
-      auto it = m_spent_key_images.find(ki);
+      const crypto::key_image &k_image = get_input_key_image(in);
+      CHECK_AND_ASSERT_MES(seen_key_images.insert(k_image).second,
+          false,
+          "duplicate key image in transaction: " << k_image
+          << "\ntx_id=" << id);
+      auto it = m_spent_key_images.find(k_image);
       if (it != m_spent_key_images.end())
       {
         const std::unordered_set<crypto::hash>& kei_image_set = it->second;
         CHECK_AND_ASSERT_MES(kept_by_block || kei_image_set.size() == 0, false, "internal error: kept_by_block=" << kept_by_block
-                                            << ",  kei_image_set.size()=" << kei_image_set.size() << "\ntxin.k_image=" << ki
+                                            << ",  kei_image_set.size()=" << kei_image_set.size() << "\ntxin.k_image=" << k_image
                                             << "\ntx_id=" << id );
         CHECK_AND_ASSERT_MES(kei_image_set.count(id) == 0, false, "internal error: try to insert duplicate iterator in key_image set");
       }
-      key_images_to_insert.push_back(ki);
+      key_images_to_insert.push_back(k_image);
     }
 
     for (const crypto::key_image &k_image : key_images_to_insert)
@@ -983,22 +978,25 @@ namespace cryptonote
 
     for(const txin_v& vi: tx.vin)
     {
-      // Same input kinds as insert_key_images.
-      const crypto::key_image& ki = get_input_key_image(vi);
+      CHECK_AND_ASSERT_MES(input_has_key_image(vi), false,
+          "wrong variant type: " << tools::type_name(tools::variant_type(vi))
+          << ", expected txin_to_key or txin_zy_input"
+          << "\ntransaction id = " << actual_hash);
+      const crypto::key_image &k_image = get_input_key_image(vi);
 
-      CHECK_AND_ASSERT_MES(seen_key_images.insert(ki).second, false, "duplicate key image in transaction: "
-                                    << ki << "\ntransaction id = " << actual_hash);
+      CHECK_AND_ASSERT_MES(seen_key_images.insert(k_image).second, false, "duplicate key image in transaction: "
+                                    << k_image << "\ntransaction id = " << actual_hash);
 
-      auto it = m_spent_key_images.find(ki);
-      CHECK_AND_ASSERT_MES(it != m_spent_key_images.end(), false, "failed to find transaction input in key images. img=" << ki
+      auto it = m_spent_key_images.find(k_image);
+      CHECK_AND_ASSERT_MES(it != m_spent_key_images.end(), false, "failed to find transaction input in key images. img=" << k_image
                                     << "\ntransaction id = " << actual_hash);
       const std::unordered_set<crypto::hash>& key_image_set = it->second;
-      CHECK_AND_ASSERT_MES(key_image_set.size(), false, "empty key_image set, img=" << ki
+      CHECK_AND_ASSERT_MES(key_image_set.size(), false, "empty key_image set, img=" << k_image
         << "\ntransaction id = " << actual_hash);
 
-      CHECK_AND_ASSERT_MES(key_image_set.count(actual_hash), false, "transaction id not found in key_image set, img=" << ki
+      CHECK_AND_ASSERT_MES(key_image_set.count(actual_hash), false, "transaction id not found in key_image set, img=" << k_image
         << "\ntransaction id = " << actual_hash);
-      key_images_to_erase.push_back(ki);
+      key_images_to_erase.push_back(k_image);
     }
 
     for (const crypto::key_image &k_image : key_images_to_erase)
@@ -1015,6 +1013,64 @@ namespace cryptonote
     ++m_cookie;
     return true;
   }
+  //---------------------------------------------------------------------------------
+  static bool tx_carries_token_ops(const transaction_prefix &tx)
+  {
+    return tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token ||
+           tx.type == txtype::update_token || tx.type == txtype::burn_token;
+  }
+  //---------------------------------------------------------------------------------
+  void tx_memory_pool::index_token_ops(const transaction_prefix &tx, const crypto::hash &txid)
+  {
+    if (!tx_carries_token_ops(tx))
+      return;
+
+    cryptonote::tx_extra_token_descriptor_operation tdo{};
+    size_t op_index = 0;
+    while (cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, op_index++))
+    {
+      const crypto::token_id tid = cryptonote::get_or_calculate_token_id(tdo);
+      if (tid == crypto::null_tid)
+        continue;
+      m_pending_token_ops.emplace(tid, txid);
+    }
+  }
+  //---------------------------------------------------------------------------------
+  void tx_memory_pool::unindex_token_ops(const transaction_prefix &tx, const crypto::hash &txid)
+  {
+    if (!tx_carries_token_ops(tx))
+      return;
+
+    cryptonote::tx_extra_token_descriptor_operation tdo{};
+    size_t op_index = 0;
+    while (cryptonote::get_token_descriptor_operation_from_tx_extra(tx.extra, tdo, op_index++))
+    {
+      const crypto::token_id tid = cryptonote::get_or_calculate_token_id(tdo);
+      auto it = m_pending_token_ops.find(tid);
+      if (it != m_pending_token_ops.end() && it->second == txid)
+        m_pending_token_ops.erase(it);
+    }
+  }
+  //---------------------------------------------------------------------------------
+  bool tx_memory_pool::token_op_in_pool(const crypto::token_id &token_id, const crypto::hash &exclude,
+                                         crypto::hash &holder) const
+  {
+    auto it = m_pending_token_ops.find(token_id);
+    if (it == m_pending_token_ops.end())
+      return false;
+
+    if (it->second == exclude)
+      return false;
+    if (!have_tx(it->second))
+    {
+      m_pending_token_ops.erase(it);
+      return false;
+    }
+
+    holder = it->second;
+    return true;
+  }
+  //---------------------------------------------------------------------------------
   tx_memory_pool::key_images_container tx_memory_pool::get_spent_key_images(bool already_locked) {
     std::unique_lock tx_lock{*this, std::defer_lock};
     std::unique_lock bc_lock{m_blockchain, std::defer_lock};
@@ -1066,6 +1122,7 @@ namespace cryptonote
       if (!remove_transaction_keyimages(tx, id))
         MERROR("Failed to remove key images for tx " << id << " taken from the txpool; "
                "the spent key image map may be inconsistent until restart");
+      unindex_token_ops(tx, id);
       lock.commit();
     }
     catch (const std::exception &e)
@@ -1152,6 +1209,7 @@ namespace cryptonote
             if (!remove_transaction_keyimages(tx, txid))
               MERROR("Failed to remove key images for stuck tx " << txid << "; "
                      "the spent key image map may be inconsistent until restart");
+            unindex_token_ops(tx, txid);
           }
         }
         catch (const std::exception &e)
@@ -1643,7 +1701,7 @@ namespace cryptonote
             }
             for (const auto& tx : txs) {
               for (const auto& in : tx.vin) {
-                if (auto* ttk = std::get_if<txin_to_key>(&in); ttk && key_image_conflicts.erase(ttk->k_image)) {
+                if (input_has_key_image(in) && key_image_conflicts.erase(get_input_key_image(in))) {
                   earliest = std::min(earliest, block_height);
                   if (key_image_conflicts.empty())
                     goto end;
@@ -2091,6 +2149,7 @@ end:
           if (!remove_transaction_keyimages(tx, txid))
             MERROR("Failed to remove key images for tx " << txid << "; "
                    "the spent key image map may be inconsistent until restart");
+          unindex_token_ops(tx, txid);
           auto sorted_it = find_tx_in_sorted_container(txid);
           if (sorted_it == m_txs_by_fee_and_receive_time.end())
           {
@@ -2122,6 +2181,7 @@ end:
     m_txpool_max_weight = max_txpool_weight ? max_txpool_weight : DEFAULT_MEMPOOL_MAX_WEIGHT;
     m_txs_by_fee_and_receive_time.clear();
     m_spent_key_images.clear();
+    m_pending_token_ops.clear();
     m_txpool_weight = 0;
     std::vector<crypto::hash> remove;
 
@@ -2145,6 +2205,7 @@ end:
           MFATAL("Failed to insert key images from txpool tx");
           return false;
         }
+        index_token_ops(tx, txid);
 
         const bool non_standard_tx = !tx.is_transfer();
         m_txs_by_fee_and_receive_time.emplace(std::tuple<bool, double, time_t>(non_standard_tx, meta.fee / (double)meta.weight, meta.receive_time), txid);

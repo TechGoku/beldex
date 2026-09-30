@@ -928,6 +928,9 @@ bool verify_vector_ug_aggregation_proof(const rct::key&  context_hash,
     for (const auto& s : sig.y0s) if (sc_check(s.bytes) != 0) return false;
     for (const auto& s : sig.y1s) if (sc_check(s.bytes) != 0) return false;
 
+    for (const auto& e : sig.amount_commitments_for_rp_aggregation)
+      if (!rct::isInMainSubgroup(e)) return false;
+
     std::vector<uint8_t> buf;
     buf.reserve((1 + 2 * n) * 32);
     auto push = [&](const rct::key& k){ buf.insert(buf.end(), k.bytes, k.bytes + 32); };

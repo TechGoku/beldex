@@ -1443,14 +1443,14 @@ namespace cryptonote
                       continue;
                   if (tx.get_unlock_time(i) == 0 || tx.get_unlock_time(i) >= cryptonote::MAX_BLOCK_NUMBER)
                       continue; // must be locked, and locked by BLOCK HEIGHT (see C-1)
-                  if (tx.vout[i].amount < tokens::REGISTRATION_COLLATERAL_AMOUNT)
+                  if (tx.vout[i].amount < tokens::registration_collateral_amount(tx_params.nettype))
                       continue;
                   collateral_index = i;
                   break;
               }
               CHECK_AND_ASSERT_MES(collateral_index < tx.vout.size(), false,
                   "register_privacy_token tx is missing its height-locked native collateral output of at least "
-                      << tokens::REGISTRATION_COLLATERAL_AMOUNT);
+                      << tokens::registration_collateral_amount(tx_params.nettype));
               CHECK_AND_ASSERT_MES(collateral_index < amount_keys.size(), false,
                   "Missing amount key for the collateral output");
 
