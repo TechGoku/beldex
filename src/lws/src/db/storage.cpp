@@ -4,8 +4,10 @@
 #include <boost/range/adaptor/reversed.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/iterator_range.hpp>
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <utility>
@@ -578,169 +580,191 @@ namespace db
   // it is treated as a hard error: we throw, the enclosing write txn is aborted,
   // and the DB is left byte-for-byte unchanged. We never delete output or spend
   // rows here - that only risks losing funds visibility.
+  /* Rewrite the `outputs` table one account at a time, converting every row
+     of `Old` layout to `New` and keeping rows already in a size listed in
+     `keep_sizes` byte-for-byte.
+
+     A row changes size between layouts, so it cannot be updated in place; it is
+     deleted and re-inserted. That is done per account: read ALL of the
+     account's rows, delete them all, write them back, then move on to the next
+     account. Each account is visited exactly once, so the walk always ends, in
+     one pass over the table, holding only one account's rows in memory.
+
+     An earlier version converted fixed-size batches and restarted from the top
+     of the table after each one, relying on converted rows reading back in the
+     new size to make progress. When they did not - a table whose rows per key
+     are stored at a fixed size truncates a longer row next to shorter ones - it
+     re-converted the same rows forever. Here every rewritten account is read
+     back and checked instead: a row that did not come back in the size written
+     aborts the migration, which rolls back the enclosing write txn and leaves
+     the database byte-for-byte unchanged.
+
+     A row in no recognised size cannot occur in a healthy database and is a
+     hard error, with the same rollback. Spend rows are never touched. */
+  template<typename Old, typename New, typename Convert>
+  void migrate_outputs_by_account(MDB_txn& txn, tables_ const& tables, const char* what,
+                                  std::initializer_list<std::size_t> keep_sizes, Convert convert)
+  {
+    cursor::outputs cur;
+    const expect<void> opened = check_cursor(txn, tables.outputs, cur);
+    if (!opened)
+      MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
+
+    const auto keep = [&](std::size_t size)
+    {
+      return std::find(keep_sizes.begin(), keep_sizes.end(), size) != keep_sizes.end();
+    };
+
+    std::size_t converted = 0;
+    std::size_t next_report = 200000;
+    std::vector<unsigned char> account;
+    std::vector<std::vector<unsigned char>> rows;
+
+    MDB_val key{}, value{};
+    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+    while (err == 0)
+    {
+      account.assign(static_cast<const unsigned char*>(key.mv_data),
+                     static_cast<const unsigned char*>(key.mv_data) + key.mv_size);
+      rows.clear();
+      std::size_t old_rows = 0;
+
+      int dup = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST_DUP);
+      for (; dup == 0; dup = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT_DUP))
+      {
+        const auto* bytes = static_cast<const unsigned char*>(value.mv_data);
+        if (value.mv_size == sizeof(Old))
+        {
+          const New converted_row = convert(*reinterpret_cast<const Old*>(value.mv_data));
+          const auto* out = reinterpret_cast<const unsigned char*>(std::addressof(converted_row));
+          rows.emplace_back(out, out + sizeof(New));
+          ++old_rows;
+        }
+        else if (keep(value.mv_size))
+          rows.emplace_back(bytes, bytes + value.mv_size);
+        else
+          MONERO_THROW(lws::error::bad_blockchain,
+            "Unexpected output record size during migration; refusing to modify the database");
+      }
+      if (dup != MDB_NOTFOUND)
+        MONERO_THROW(lmdb::error(dup), "cursor iteration failed");
+
+      MDB_val account_key{account.size(), account.data()};
+      if (old_rows)
+      {
+        int rc = mdb_del(&txn, tables.outputs, &account_key, nullptr);
+        if (rc)
+          MONERO_THROW(lmdb::error(rc), "mdb_del failed");
+        for (auto& row : rows)
+        {
+          MDB_val v{row.size(), row.data()};
+          rc = mdb_put(&txn, tables.outputs, &account_key, &v, 0);
+          if (rc)
+            MONERO_THROW(lmdb::error(rc), "mdb_put failed");
+        }
+
+        // Read the account back: same number of rows, each in a size we wrote.
+        MDB_cursor* check = nullptr;
+        rc = mdb_cursor_open(&txn, tables.outputs, &check);
+        if (rc)
+          MONERO_THROW(lmdb::error(rc), "Failed to open migration check cursor");
+        std::size_t back = 0;
+        bool sizes_ok = true;
+        MDB_val ck = account_key, cv{};
+        for (rc = mdb_cursor_get(check, &ck, &cv, MDB_SET_KEY); rc == 0;
+             rc = mdb_cursor_get(check, &ck, &cv, MDB_NEXT_DUP))
+        {
+          ++back;
+          sizes_ok = sizes_ok && (cv.mv_size == sizeof(New) || keep(cv.mv_size));
+        }
+        mdb_cursor_close(check);
+        if (rc != MDB_NOTFOUND || back != rows.size() || !sizes_ok)
+          MONERO_THROW(lws::error::bad_blockchain,
+            "Output migration did not read back as written; refusing to modify the database");
+
+        converted += old_rows;
+        if (converted >= next_report)
+        {
+          MINFO(what << ": converted " << converted << " row(s) so far");
+          next_report = converted + 200000;
+        }
+      }
+
+      // The rewrite went through the txn, not this cursor, so seek back to the
+      // account just handled and step to the next one.
+      MDB_val seek_key{account.size(), account.data()}, seek_value{};
+      int rc = mdb_cursor_get(cur.get(), &seek_key, &seek_value, MDB_SET_KEY);
+      if (rc)
+        MONERO_THROW(lmdb::error(rc), "cursor seek failed");
+      err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT_NODUP);
+    }
+    if (err != MDB_NOTFOUND)
+      MONERO_THROW(lmdb::error(err), "cursor iteration failed");
+
+    MINFO(what << " complete: converted " << converted << " row(s)");
+  }
+
   void migrate_1_2(MDB_txn& txn, tables_ const& tables)
   {
     MINFO("Checking outputs for locked_key_image migration (v1 -> v2)");
-
-    cursor::outputs cur;
-    const expect<void> opened = check_cursor(txn, tables.outputs, cur);
-    if (!opened)
-      MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
-
-    struct owned_key { std::vector<unsigned char> data; };
-    std::vector<owned_key> keys;
-    std::vector<output_v2> values;
-
-    MDB_val key{}, value{};
-    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
-
-    while (err == 0)
-    {
-      if (value.mv_size == sizeof(output_v2) || value.mv_size == sizeof(output))
+    // Rows already at v2 - or at v3, since a DB that has reached v3 can be
+    // re-entered here from version 0 - are kept as they are.
+    migrate_outputs_by_account<output_v1, output_v2>(txn, tables, "Output migration",
+      {sizeof(output_v2), sizeof(output)},
+      [](const output_v1& old)
       {
-        // Already at v2 or beyond - leave untouched, advance. Accepting the
-        // current `output` size matters because a DB that has already reached
-        // v3 can still be re-entered here from version 0, and v1/v2/v3 are
-        // three distinct compile-time sizes, so this cannot mask a real
-        // corrupt-row case.
-        err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
-        continue;
-      }
-      if (value.mv_size != sizeof(output_v1))
-      {
-        // Impossible in a healthy DB. Abort instead of deleting/reinterpreting:
-        // aborting rolls back the txn and leaves every row intact.
-        MONERO_THROW(lws::error::bad_blockchain,
-          "Unexpected output record size during migration; refusing to modify the database");
-      }
-
-      // Convert v1 -> v2 by inserting a zeroed locked_key_image. Record size
-      // changes, so we must delete the old row and re-insert the new one; stash
-      // both and apply the puts after the iteration completes.
-      const auto& old = *reinterpret_cast<const output_v1*>(value.mv_data);
-      output_v2 v2{};
-      v2.link = old.link;
-      v2.spend_meta.id = old.spend_meta.id;
-      v2.spend_meta.amount = old.spend_meta.amount;
-      v2.spend_meta.mixin_count = old.spend_meta.mixin_count;
-      v2.spend_meta.index = old.spend_meta.index;
-      v2.spend_meta.tx_public = old.spend_meta.tx_public;
-      v2.timestamp = old.timestamp;
-      v2.unlock_time = old.unlock_time;
-      v2.tx_prefix_hash = old.tx_prefix_hash;
-      v2.locked_key_image = crypto::key_image{};  // defaulted for old rows
-      v2.pub = old.pub;
-      v2.ringct_mask = old.ringct_mask;
-      std::memcpy(v2.reserved, old.reserved, sizeof(v2.reserved));
-      v2.extra = old.extra;
-      std::memcpy(&v2.payment_id, &old.payment_id, sizeof(v2.payment_id));
-
-      owned_key k;
-      k.data.assign(static_cast<unsigned char*>(key.mv_data), static_cast<unsigned char*>(key.mv_data) + key.mv_size);
-      keys.push_back(std::move(k));
-      values.push_back(v2);
-
-      err = mdb_cursor_del(cur.get(), 0);
-      if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
-      err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
-    }
-
-    if (err != MDB_NOTFOUND) MONERO_THROW(lmdb::error(err), "cursor iteration failed");
-
-    for (std::size_t i = 0; i < values.size(); ++i)
-    {
-      MDB_val k{ keys[i].data.size(), keys[i].data.data() };
-      MDB_val v = lmdb::to_val(values[i]);
-      err = mdb_put(&txn, tables.outputs, &k, &v, 0);
-      if (err) MONERO_THROW(lmdb::error(err), "mdb_put failed");
-    }
-
-    MINFO("Output migration complete: converted " << values.size() << " legacy row(s)");
-
-    // NB: no spend rows are touched. The old code had two destructive passes that
-    // deleted spends via the account-id DUPSORT key (mis-modelled as an output
-    // key), which could wipe valid spends. Spends are keyed independently and
-    // remain valid across this migration.
+        output_v2 v2{};
+        v2.link = old.link;
+        v2.spend_meta.id = old.spend_meta.id;
+        v2.spend_meta.amount = old.spend_meta.amount;
+        v2.spend_meta.mixin_count = old.spend_meta.mixin_count;
+        v2.spend_meta.index = old.spend_meta.index;
+        v2.spend_meta.tx_public = old.spend_meta.tx_public;
+        v2.timestamp = old.timestamp;
+        v2.unlock_time = old.unlock_time;
+        v2.tx_prefix_hash = old.tx_prefix_hash;
+        v2.locked_key_image = crypto::key_image{}; // defaulted for old rows
+        v2.pub = old.pub;
+        v2.ringct_mask = old.ringct_mask;
+        std::memcpy(v2.reserved, old.reserved, sizeof(v2.reserved));
+        v2.extra = old.extra;
+        std::memcpy(&v2.payment_id, &old.payment_id, sizeof(v2.payment_id));
+        return v2;
+      });
   }
 
   // Migrate the `outputs` table from the pre-private-token layout (v2) to the
-  // current one (v3), which appends the four private-token fields. Same
-  // guarantees as migrate_1_2 above: fresh DB is a no-op, already-v3 rows are
-  // left alone, an unrecognised record size aborts the txn rather than
-  // guessing, and no spend rows are touched.
-  //
-  // Every existing row predates HF22 and so cannot be a token output; they all
-  // get zeroed token fields, which is exactly what "ordinary BDX output" means
-  // to the reader.
+  // current one (v3), which appends the four private-token fields. Every
+  // existing row predates HF22 and so cannot be a token output; they all get
+  // zeroed token fields, which is exactly what "ordinary BDX output" means to
+  // the reader. This converts every row of a database written before the token
+  // fork, which is why it must be a single bounded pass.
   void migrate_2_3(MDB_txn& txn, tables_ const& tables)
   {
     MINFO("Checking outputs for private-token field migration (v2 -> v3)");
-
-    cursor::outputs cur;
-    const expect<void> opened = check_cursor(txn, tables.outputs, cur);
-    if (!opened)
-      MONERO_THROW(opened.error(), "Failed to open outputs cursor for migration");
-
-    struct owned_key { std::vector<unsigned char> data; };
-    std::vector<owned_key> keys;
-    std::vector<output> values;
-
-    MDB_val key{}, value{};
-    int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
-
-    while (err == 0)
-    {
-      if (value.mv_size == sizeof(output))
+    migrate_outputs_by_account<output_v2, output>(txn, tables, "Private-token field migration",
+      {sizeof(output)},
+      [](const output_v2& old)
       {
-        err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
-        continue;
-      }
-      if (value.mv_size != sizeof(output_v2))
-      {
-        MONERO_THROW(lws::error::bad_blockchain,
-          "Unexpected output record size during migration; refusing to modify the database");
-      }
-
-      const auto& old = *reinterpret_cast<const output_v2*>(value.mv_data);
-      output v3{};
-      v3.link = old.link;
-      v3.spend_meta.id = old.spend_meta.id;
-      v3.spend_meta.amount = old.spend_meta.amount;
-      v3.spend_meta.mixin_count = old.spend_meta.mixin_count;
-      v3.spend_meta.index = old.spend_meta.index;
-      v3.spend_meta.tx_public = old.spend_meta.tx_public;
-      v3.timestamp = old.timestamp;
-      v3.unlock_time = old.unlock_time;
-      v3.tx_prefix_hash = old.tx_prefix_hash;
-      v3.locked_key_image = old.locked_key_image;
-      v3.pub = old.pub;
-      v3.ringct_mask = old.ringct_mask;
-      std::memcpy(v3.reserved, old.reserved, sizeof(v3.reserved));
-      v3.extra = old.extra;
-      std::memcpy(&v3.payment_id, &old.payment_id, sizeof(v3.payment_id));
-      // Token fields stay zeroed: no output predating HF22 is a token output.
-
-      owned_key k;
-      k.data.assign(static_cast<unsigned char*>(key.mv_data), static_cast<unsigned char*>(key.mv_data) + key.mv_size);
-      keys.push_back(std::move(k));
-      values.push_back(v3);
-
-      err = mdb_cursor_del(cur.get(), 0);
-      if (err) MONERO_THROW(lmdb::error(err), "cursor_del failed");
-      err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
-    }
-
-    if (err != MDB_NOTFOUND) MONERO_THROW(lmdb::error(err), "cursor iteration failed");
-
-    for (std::size_t i = 0; i < values.size(); ++i)
-    {
-      MDB_val k{ keys[i].data.size(), keys[i].data.data() };
-      MDB_val v = lmdb::to_val(values[i]);
-      err = mdb_put(&txn, tables.outputs, &k, &v, 0);
-      if (err) MONERO_THROW(lmdb::error(err), "mdb_put failed");
-    }
-
-    MINFO("Private-token field migration complete: converted " << values.size() << " row(s)");
+        output v3{};
+        v3.link = old.link;
+        v3.spend_meta.id = old.spend_meta.id;
+        v3.spend_meta.amount = old.spend_meta.amount;
+        v3.spend_meta.mixin_count = old.spend_meta.mixin_count;
+        v3.spend_meta.index = old.spend_meta.index;
+        v3.spend_meta.tx_public = old.spend_meta.tx_public;
+        v3.timestamp = old.timestamp;
+        v3.unlock_time = old.unlock_time;
+        v3.tx_prefix_hash = old.tx_prefix_hash;
+        v3.locked_key_image = old.locked_key_image;
+        v3.pub = old.pub;
+        v3.ringct_mask = old.ringct_mask;
+        std::memcpy(v3.reserved, old.reserved, sizeof(v3.reserved));
+        v3.extra = old.extra;
+        std::memcpy(&v3.payment_id, &old.payment_id, sizeof(v3.payment_id));
+        // Token fields stay zeroed: no output predating HF22 is a token output.
+        return v3;
+      });
   }
 
   expect<void> migrate(MDB_txn& txn, tables_ const& tables, unsigned oldversion)
