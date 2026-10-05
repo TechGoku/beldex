@@ -12290,6 +12290,14 @@ std::vector<wallet2::pending_tx> wallet2::create_privacy_token_registration_tx(
     uint32_t subaddr_account,
     std::set<uint32_t> subaddr_indices)
 {
+  const auto hf_ver = get_hard_fork_version();
+  THROW_WALLET_EXCEPTION_IF(!hf_ver, error::wallet_internal_error,
+      "Failed to get hard fork version from daemon");
+  THROW_WALLET_EXCEPTION_IF(*hf_ver < feature::PRIVACY_TOKENS, error::wallet_internal_error,
+      "Privacy token registration requires hard fork " +
+          std::to_string(static_cast<unsigned>(feature::PRIVACY_TOKENS)) +
+          " (current hard fork: " + std::to_string(static_cast<unsigned>(*hf_ver)) + ")");
+
   // Count how many ZY outputs are in the caller-supplied destinations.
   size_t zy_count = 0;
   for (const auto& d : dsts)
@@ -12347,9 +12355,6 @@ std::vector<wallet2::pending_tx> wallet2::create_privacy_token_registration_tx(
         << " collateral until block " << collateral_unlock_height
         << " (" << tokens::REGISTRATION_COLLATERAL_LOCK_BLOCKS << " blocks)");
 
-  auto hf_ver = get_hard_fork_version();
-  THROW_WALLET_EXCEPTION_IF(!hf_ver, error::wallet_internal_error,
-      "Failed to get hard fork version from daemon");
   const auto token_fee = tokens::fee_for_operation(
       *hf_ver, cryptonote::token_descriptor_operation_type::register_token, m_nettype);
   THROW_WALLET_EXCEPTION_IF(!token_fee.enabled, error::wallet_internal_error,

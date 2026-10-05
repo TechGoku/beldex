@@ -995,6 +995,12 @@ namespace cryptonote
     bool found_change_already = false;
     for(const tx_destination_entry& dst_entr: destinations)
     {
+      if (dst_entr.is_zyphora() && tx_params.hf_version < feature::PRIVACY_TOKENS)
+      {
+        LOG_ERROR("Cannot construct privacy-token output before the privacy-token hard fork");
+        return false;
+      }
+
       crypto::public_key out_eph_public_key;
 
       bool this_dst_is_change_addr = false;
@@ -1037,7 +1043,7 @@ namespace cryptonote
       }
 
       tx_out out;
-      if (dst_entr.is_zyphora() && tx_params.hf_version >= feature::PRIVACY_TOKENS)
+      if (dst_entr.is_zyphora())
       {
         MTRACE("Constructing privacy token output");
         // ── HF21: privacy token output ──────────────────────────────────
