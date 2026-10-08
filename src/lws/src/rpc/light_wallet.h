@@ -153,6 +153,11 @@ namespace rpc
           crypto::public_key token_id{};
           std::uint64_t received = 0;
           std::uint64_t sent = 0;
+          /*! Every token output of ours that appeared in this transaction's
+              rings - same shape as the BDX `spent_outputs`. `sent` counts
+              decoy appearances too, and only the owner's key images tell
+              them apart, so the client needs these to correct it. */
+          std::vector<transaction_spend> spends{};
         };
         std::vector<token_leg> token_legs;
 
@@ -162,7 +167,7 @@ namespace rpc
           for (token_leg& l : token_legs)
             if (l.token_id == id)
               return l;
-          token_legs.push_back(token_leg{id, 0, 0});
+          token_legs.push_back(token_leg{id, 0, 0, {}});
           return token_legs.back();
         }
       };

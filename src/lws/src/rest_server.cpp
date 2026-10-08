@@ -1677,7 +1677,9 @@ namespace lws
                   resp.transactions.back().info.timestamp = full_spend.timestamp;
                   resp.transactions.back().info.unlock_time = full_spend.unlock_time;
                 }
-                resp.transactions.back().leg(token->token_id).sent += token->meta.amount;
+                auto& leg = resp.transactions.back().leg(token->token_id);
+                leg.sent += token->meta.amount;
+                leg.spends.push_back({token->meta, *spend, incremental});
 
                 ++spend;
                 if (!spend.is_end())

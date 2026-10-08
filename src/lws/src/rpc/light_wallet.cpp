@@ -304,7 +304,8 @@ namespace lws
       wire::object(dest,
         WIRE_FIELD_COPY(token_id),
         wire::field("received", safe_uint64(self.received)),
-        wire::field("sent", safe_uint64(self.sent))
+        wire::field("sent", safe_uint64(self.sent)),
+        wire::optional_field("spent_outputs", self.spends.empty() ? nullptr : std::addressof(self.spends))
       );
     }
 
