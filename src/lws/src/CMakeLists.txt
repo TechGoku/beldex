@@ -197,6 +197,18 @@ if (BUILD_TESTS)
       Threads::Threads
   )
   add_test(NAME lws-rescan-reorg COMMAND lws-rescan-reorg-test)
+
+  # Checks a request body that does not fit its endpoint is answered 400, not
+  # 500; see ../tests/bad_request.cpp.
+  add_executable(lws-bad-request-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/bad_request.cpp)
+  target_link_libraries(lws-bad-request-test PRIVATE
+      beldex-lws-rpc
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Threads::Threads
+  )
+  add_test(NAME lws-bad-request COMMAND lws-bad-request-test)
 endif ()
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )

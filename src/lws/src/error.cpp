@@ -76,6 +76,8 @@ namespace lws
         return "The daemon failed to accept transaction from REST client";
       case error::token_not_found:
         return "No such privacy token on the chain";
+      case error::bad_request:
+        return "Malformed request: a field is missing or has an invalid value";
       default:
         break;
       }

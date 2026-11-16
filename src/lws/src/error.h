@@ -37,7 +37,8 @@ namespace lws
     system_clock_invalid_range, //!< System clock is out of range for storage format
     tx_relay_failed,            //!< Daemon failed to relayed tx from REST client
     status_failed,              //!< Daemon failed to approve tx from REST client
-    token_not_found             //!< No such HF22 privacy token on the chain
+    token_not_found,            //!< No such HF22 privacy token on the chain
+    bad_request                 //!< REST request body does not match the endpoint's schema
   };
 
   std::error_category const& error_category() noexcept;

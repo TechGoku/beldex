@@ -50,6 +50,7 @@
 #include "util/source_location.h"
 #include "wire/crypto.h"
 #include "rpc/light_wallet.h"
+#include "rpc/request_error.h"
 #include "wire/json.h"
 #include "config.h"
 namespace lws
@@ -2769,13 +2770,32 @@ namespace lws
       }
     }; //submit_raw_tx
 
+    /*! Parse a REST request body as `T`. A body that is JSON but does not fit
+        `T` (missing field, malformed address or key, wrong type) is the
+        client's mistake and becomes `lws::error::bad_request`, answered 400;
+        it used to fall through to 500. The schema detail is logged here
+        because the dispatcher only sees the general error. */
+    template<typename T>
+    expect<T> read_request(std::string&& body)
+    {
+      expect<T> req = wire::json::from_bytes<T>(std::move(body));
+      if (!req)
+      {
+        const std::error_code error = rpc::classify_request_error(req.error());
+        if (error != req.error())
+          MINFO("Malformed REST request: " << req.error().message());
+        return error;
+      }
+      return req;
+    }
+
     template<typename E>
     expect<epee::byte_slice> call(std::string&& root, db::storage disk)
     {
       using request = typename E::request;
       using response = typename E::response;
 
-      expect<request> req = wire::json::from_bytes<request>(std::move(root));
+      expect<request> req = read_request<request>(std::move(root));
       if (!req)
         return req.error();
 
@@ -2822,7 +2842,7 @@ namespace lws
       // memory without limit (a single response larger than this is not cached).
       const std::size_t cache_max_bytes = lws::rest_cache_max_bytes;
 
-      expect<E::request> req = wire::json::from_bytes<E::request>(std::move(root));
+      expect<E::request> req = read_request<E::request>(std::move(root));
       if (!req)
         return req.error();
 
@@ -3131,7 +3151,7 @@ namespace lws
     expect<epee::byte_slice> call_admin(std::string&& root, db::storage disk)
     {
       using request = typename E::request;
-      const expect<admin<request>> req = wire::json::from_bytes<admin<request>>(std::move(root));
+      const expect<admin<request>> req = read_request<admin<request>>(std::move(root));
       if (!req)
         return req.error();
 
@@ -3307,7 +3327,7 @@ namespace lws
     expect<epee::byte_slice> call_switch_db(std::string&& root, db::storage disk)
     {
       const expect<admin<switch_db_req>> req =
-        wire::json::from_bytes<admin<switch_db_req>>(std::move(root));
+        read_request<admin<switch_db_req>>(std::move(root));
       if (!req)
         return req.error();
 
@@ -3732,8 +3752,9 @@ namespace lws
           response.m_response_code = 403;
           response.m_response_comment = "Forbidden";
         }
-        else if (body == lws::error::bad_address)
+        else if (body == lws::error::bad_address || body == lws::error::bad_request)
         {
+          // bad_request: the body did not fit the endpoint (see read_request).
           response.m_response_code = 400;
           response.m_response_comment = "Bad Request";
         }
