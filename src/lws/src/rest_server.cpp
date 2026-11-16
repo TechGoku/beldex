@@ -41,6 +41,7 @@
 #include "scanner.h"
 #include "util/http_server.h"
 #include "util/gamma_picker.h"
+#include "util/cache_generation.h"
 #include "util/random_outputs.h"
 #include "util/signup_limit.h"
 #include "util/source_location.h"
@@ -704,6 +705,13 @@ namespace lws
       return std::lower_bound(metas.begin(), metas.end(), id, by_id{});
     }
 
+    /*! Generation of the database the current request is served from.
+
+        Set by `handle_http_request`, on this thread, together with the
+        database handle it gives the handler; see `cache_generation`. 0
+        outside a request, which makes the per-account caches step aside. */
+    thread_local std::uint64_t request_db_generation = 0;
+
     /*! \return Cached output projection for `user`, extended or rebuilt as needed.
 
         Entries are immutable once published, so a caller can hold the returned
@@ -721,6 +729,8 @@ namespace lws
       static std::mutex index_mutex;
       static std::unordered_map<std::uint32_t, index_slot> cache;
       static std::size_t cache_bytes = 0;
+      static cache_generation cache_db;
+      const auto clear_cache = [] { cache.clear(); cache_bytes = 0; };
       // Bound total cached bytes so many distinct large accounts cannot grow memory
       // without limit (a single projection larger than this is never cached).
       const std::size_t cache_max_bytes = lws::rest_cache_max_bytes;
@@ -754,7 +764,7 @@ namespace lws
       if (cacheable)
       {
         const std::lock_guard<std::mutex> lock{index_mutex};
-        const auto it = cache.find(key);
+        const auto it = cache_db.admit(request_db_generation, clear_cache) ? cache.find(key) : cache.end();
         if (it != cache.end())
         {
           it->second.last_access = now;
@@ -888,6 +898,8 @@ namespace lws
       if (cacheable)
       {
         const std::lock_guard<std::mutex> lock{index_mutex};
+        if (!cache_db.admit(request_db_generation, clear_cache))
+          return result; // built from a database that is no longer served
         const auto it = cache.find(key);
         if (it != cache.end())
         {
@@ -2630,6 +2642,8 @@ namespace lws
       static std::mutex cache_mutex;
       static std::unordered_map<std::uint32_t, address_txs_cache_entry> cache;
       static std::size_t cache_bytes = 0;
+      static cache_generation cache_db;
+      const auto clear_cache = [] { cache.clear(); cache_bytes = 0; };
       // Bound total cached bytes so many distinct large accounts can't grow
       // memory without limit (a single response larger than this is not cached).
       const std::size_t cache_max_bytes = lws::rest_cache_max_bytes;
@@ -2656,7 +2670,7 @@ namespace lws
 
       {
         const std::lock_guard<std::mutex> lock{cache_mutex};
-        const auto it = cache.find(key);
+        const auto it = cache_db.admit(request_db_generation, clear_cache) ? cache.find(key) : cache.end();
         if (it != cache.end() && it->second.scan_height == scan_height &&
             it->second.last_block == last_block && it->second.min_height == min_height &&
             it->second.max_count == max_count)
@@ -2677,6 +2691,8 @@ namespace lws
       const std::size_t sz = bytes->size();
       {
         const std::lock_guard<std::mutex> lock{cache_mutex};
+        if (!cache_db.admit(request_db_generation, clear_cache))
+          return bytes; // built from a database that is no longer served
         const auto it = cache.find(key);
         if (it != cache.end())
         {
@@ -2821,6 +2837,10 @@ namespace lws
       unsigned create_queue_max = 0;
       std::uint64_t map_size = 0;
       unsigned max_readers = 0;
+      /*! Raised on every switch, so per-account caches can tell entries built
+          from this database from those built from the one before; see
+          `cache_generation`. Starts at 1: 0 means "unknown". */
+      std::uint64_t generation = 0;
     };
     boost::shared_mutex active_db_mutex;
     active_db_ active_db{};
@@ -2847,10 +2867,14 @@ namespace lws
     boost::shared_mutex creation_latch;
 
     //! \return A handle to the database currently being served.
-    db::storage current_disk()
+    /*! \param generation If given, set to the generation of the returned
+          database, read under the same lock so the two always match. */
+    db::storage current_disk(std::uint64_t* generation = nullptr)
     {
       boost::shared_lock<boost::shared_mutex> lock{active_db_mutex};
       assert(active_db.disk != nullptr);
+      if (generation)
+        *generation = active_db.generation;
       return active_db.disk->clone();
     }
 
@@ -2879,6 +2903,9 @@ namespace lws
       boost::unique_lock<boost::shared_mutex> lock{active_db_mutex};
       active_db.disk = std::move(held);
       active_db.path = std::move(path);
+      /* Account ids are not stable across databases (a rebuild renumbers
+         them), so per-account cache entries must not outlive the switch. */
+      ++active_db.generation;
     }
 
     void init_active_db(db::storage disk, const rest_server::configuration& config)
@@ -2890,6 +2917,7 @@ namespace lws
       active_db.create_queue_max = config.create_queue_max;
       active_db.map_size = config.db_map_size;
       active_db.max_readers = config.db_max_readers;
+      active_db.generation = 1;
     }
 
     /*! \return Success if `auth` belongs to an active account flagged admin. */
@@ -3472,7 +3500,10 @@ namespace lws
         /* Take the database per request rather than from a member, so a
            `/switch_db` between two requests is picked up immediately and this
            handler still finishes against whichever database it started on. */
-        db::storage serving = current_disk();
+        std::uint64_t generation = 0;
+        db::storage serving = current_disk(&generation);
+        // For the per-account caches; see `request_db_generation`.
+        request_db_generation = generation;
 
         // For handlers that need to know who is asking; see `request_client`.
         request_client = ctx.m_remote_address.host_str();

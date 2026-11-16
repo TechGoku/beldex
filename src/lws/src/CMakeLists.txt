@@ -166,6 +166,13 @@ if (BUILD_TESTS)
       Threads::Threads
   )
   add_test(NAME lws-reorg-detect COMMAND lws-reorg-detect-test)
+
+  # Checks the per-account REST caches never serve across a /switch_db; see
+  # ../tests/cache_generation.cpp.
+  add_executable(lws-cache-generation-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/cache_generation.cpp)
+  target_link_libraries(lws-cache-generation-test PRIVATE Threads::Threads)
+  target_include_directories(lws-cache-generation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME lws-cache-generation COMMAND lws-cache-generation-test)
 endif ()
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )
