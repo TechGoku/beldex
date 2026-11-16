@@ -1,6 +1,8 @@
 #include "rest_server.h"
 
 #include <algorithm>
+#include <atomic>
+#include <boost/optional/optional.hpp>
 #include <boost/utility/string_ref.hpp>
 #include <cctype>
 #include <chrono>
@@ -949,12 +951,90 @@ namespace lws
       return {std::make_pair(user->second, std::move(*reader))};
     }
 
+    /*! One of the `public_lookup_slots` REST threads that credential-free
+        endpoints may hold while they wait on the daemon. Refused (false) when
+        all are taken; the endpoint then answers 503 at once instead of tying up
+        yet another thread. Released on destruction. */
+    class public_lookup_slot
+    {
+      static std::atomic<std::size_t>& in_use() noexcept
+      {
+        static std::atomic<std::size_t> count{0};
+        return count;
+      }
+
+      bool held_ = false;
+      bool allowed_ = false;
+
+    public:
+      public_lookup_slot() noexcept
+      {
+        const std::size_t limit = lws::public_lookup_slots;
+        if (!limit)
+        {
+          allowed_ = true;
+          return;
+        }
+        std::size_t current = in_use().load();
+        while (current < limit)
+        {
+          if (in_use().compare_exchange_weak(current, current + 1))
+          {
+            held_ = allowed_ = true;
+            return;
+          }
+        }
+      }
+
+      public_lookup_slot(const public_lookup_slot&) = delete;
+      public_lookup_slot& operator=(const public_lookup_slot&) = delete;
+
+      ~public_lookup_slot() noexcept
+      {
+        if (held_)
+          --in_use();
+      }
+
+      explicit operator bool() const noexcept { return allowed_; }
+    };
+
     struct daemon_status
     {
         using request = rpc::daemon_status_request;
         using response = rpc::daemon_status_response;
     
-        static expect<response> handle(const request&, db::storage)
+        /* The daemon's state moves once a block (about 30 s), and this endpoint
+           needs no credentials, so every caller used to cost a get_info round
+           trip. A few seconds of reuse removes that without changing what
+           anyone sees. */
+        static constexpr std::chrono::seconds cache_ttl{5};
+
+        static expect<response> handle(const request& req, db::storage disk)
+        {
+            static std::mutex cache_mutex;
+            static boost::optional<response> cached;
+            static std::chrono::steady_clock::time_point cached_at{};
+            {
+                const std::lock_guard<std::mutex> lock{cache_mutex};
+                if (cached && std::chrono::steady_clock::now() - cached_at < cache_ttl)
+                    return *cached;
+            }
+
+            const public_lookup_slot slot{};
+            if (!slot)
+                return make_error_code(std::errc::no_lock_available);
+
+            expect<response> fresh = fetch(req, std::move(disk));
+            if (fresh)
+            {
+                const std::lock_guard<std::mutex> lock{cache_mutex};
+                cached = *fresh;
+                cached_at = std::chrono::steady_clock::now();
+            }
+            return fresh;
+        }
+
+        static expect<response> fetch(const request&, db::storage)
         {
             // Build JSON request
             nlohmann::json request_body = {
@@ -1881,7 +1961,7 @@ namespace lws
         \param found set false when the chain has no such token - which is a real
           answer, cached like any other, so a wallet asking about an unmined
           registration on a timer does not re-ask the daemon every few seconds. */
-    expect<rpc::get_token_info_response> token_descriptor(const std::string& requested, bool& found)
+    expect<rpc::get_token_info_response> token_descriptor(const std::string& requested, bool& found, const bool public_caller = false)
     {
       /* One key per token. Hex is case-insensitive, so "AB.." and "ab.." are
          the same token and must not each take a cache slot. */
@@ -1895,6 +1975,15 @@ namespace lws
           found = it->second.found;
           return it->second.value;
         }
+      }
+
+      // A credential-free caller may only reach the daemon through a free slot.
+      boost::optional<public_lookup_slot> slot{};
+      if (public_caller)
+      {
+        slot.emplace();
+        if (!*slot)
+          return make_error_code(std::errc::no_lock_available);
       }
 
       nlohmann::json r;
@@ -2084,27 +2173,16 @@ namespace lws
         if (req.token_id.size() != 64 || !oxenc::is_hex(req.token_id))
           return {lws::error::token_not_found};
 
-        nlohmann::json r;
-        if (const std::error_code err = daemon_token_call("get_token_info", {{"token_id", req.token_id}}, r))
-          return err;
-
-        response resp{};
-        try
-        {
-          resp.token_id         = r.value("token_id", req.token_id);
-          resp.ticker           = r.value("ticker", std::string{});
-          resp.full_name        = r.value("full_name", std::string{});
-          resp.owner            = r.value("owner", std::string{});
-          resp.meta_info        = r.value("meta_info", std::string{});
-          resp.current_supply   = rpc::safe_uint64(r.value("current_supply", std::uint64_t{0}));
-          resp.total_max_supply = rpc::safe_uint64(r.value("total_max_supply", std::uint64_t{0}));
-          resp.decimal_point    = r.value("decimal_point", std::uint32_t{0});
-        }
-        catch (const std::exception& e)
-        {
-          MERROR("Unexpected get_token_info payload: " << e.what());
-          return make_error_code(std::errc::protocol_error);
-        }
+        /* Through the same short-lived cache /get_token_balances uses, so a
+           token asked about repeatedly costs one daemon call per TTL rather
+           than one per request. Anyone can call this, so a cache miss also
+           needs a free public lookup slot. */
+        bool found = false;
+        expect<response> resp = token_descriptor(req.token_id, found, true);
+        if (!resp)
+          return resp.error();
+        if (!found)
+          return {lws::error::token_not_found};
         return resp;
       }
     };
@@ -2120,6 +2198,10 @@ namespace lws
         // an unbounded count would let one request pull the whole table.
         if (1000 < req.count)
           return {lws::error::exceeded_rest_request_limit};
+
+        const public_lookup_slot slot{};
+        if (!slot)
+          return make_error_code(std::errc::no_lock_available);
 
         nlohmann::json r;
         if (const std::error_code err = daemon_token_call(

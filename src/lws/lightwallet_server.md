@@ -456,6 +456,15 @@ database. Two options bound that, both off by default:
 `--create-queue-max` does not apply here: it bounds requests waiting for admin
 approval, and `/login` does not use that queue.
 
+**Lookups anyone can make.** `/daemon_status`, `/get_token_info` and
+`/get_token_list` need no view key and answer by asking `beldexd`, on one of the
+REST threads. By default at most `--rest-threads` minus one of those threads can
+be waiting on the daemon for them at once, so a client looping on them cannot
+stall wallet requests; past that they are answered `503`. Set
+`--public-lookup-threads` to change the ceiling, or to `0` to remove it.
+`/daemon_status` and `/get_token_info` also reuse a recent answer for a few
+seconds instead of asking the daemon every time.
+
 **One writer at a time.** LMDB allows a single writer across the whole
 database. Read-only tools are unaffected, but any read-write admin command
 competes with the scanner for that lock.

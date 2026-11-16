@@ -57,6 +57,18 @@ namespace lws
         proxy every client arrives from the proxy's address and would share
         one allowance, so limit signups at the proxy there instead. */
     inline unsigned signup_rate_limit = 0;
+
+    /*! Most REST threads that may be waiting on the daemon at once for
+        endpoints anyone can call without a view key (`/daemon_status`,
+        `/get_token_info`, `/get_token_list`). `0` means unlimited.
+
+        Each of those makes a live daemon call with a 30-second timeout on a
+        REST worker thread, and there are only a handful of threads. Without
+        a ceiling a few clients looping on them could hold every thread and
+        stall every wallet. `beldex-lws-daemon` sets this to one less than
+        `--rest-threads` unless `--public-lookup-threads` says otherwise, so
+        at least one thread is always left for everything else. */
+    inline std::size_t public_lookup_slots = 0;
     class rest_server
     {
         struct internal;

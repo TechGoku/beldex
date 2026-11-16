@@ -48,6 +48,7 @@ namespace
     const command_line::arg_descriptor<unsigned> create_queue_max;
     const command_line::arg_descriptor<std::uint64_t> max_accounts;
     const command_line::arg_descriptor<unsigned> signup_rate_limit;
+    const command_line::arg_descriptor<std::size_t> public_lookup_threads;
     const command_line::arg_descriptor<std::chrono::minutes::rep> rates_interval;
     const command_line::arg_descriptor<unsigned short> log_level;
     const command_line::arg_descriptor<std::string> config_file;
@@ -98,6 +99,7 @@ namespace
          need without any ceiling - so the two limits below are opt-in. */
       , max_accounts{"max-accounts", "Refuse new accounts past this many; 0 = unlimited", 0}
       , signup_rate_limit{"signup-rate-limit", "New accounts per client address per hour; 0 = unlimited", 0}
+      , public_lookup_threads{"public-lookup-threads", "Max REST threads waiting on the daemon for credential-free lookups; 0 = unlimited (default: --rest-threads minus 1)", 0}
       , rates_interval{"exchange-rate-interval", "Minutes between rate fetches; 0 off", 0}
       , log_level{"log-level", "0-4", 1}
       , config_file{"config-file", "Read options from a file"}
@@ -134,6 +136,7 @@ namespace
       command_line::add_arg(rest, external_bind);
       command_line::add_arg(rest, max_response_bytes);
       command_line::add_arg(rest, rest_cache_bytes);
+      command_line::add_arg(rest, public_lookup_threads);
       description.add(rest);
 
       boost::program_options::options_description scanning{"Scanning and accounts"};
@@ -288,6 +291,11 @@ namespace
     lws::rest_cache_max_bytes = std::size_t(command_line::get_arg(args, opts.rest_cache_bytes));
     lws::max_accounts = command_line::get_arg(args, opts.max_accounts);
     lws::signup_rate_limit = command_line::get_arg(args, opts.signup_rate_limit);
+    /* By default leave one REST thread that credential-free lookups cannot
+       occupy; with a single thread there is nothing to reserve. */
+    lws::public_lookup_slots = command_line::is_arg_defaulted(args, opts.public_lookup_threads)
+      ? (1 < prog.rest_config.threads ? prog.rest_config.threads - 1 : 0)
+      : command_line::get_arg(args, opts.public_lookup_threads);
     prog.daemon_spread = command_line::get_arg(args, opts.daemon_spread);
 
     /* Build the failover endpoint list: primary first, then --daemon-backup.
