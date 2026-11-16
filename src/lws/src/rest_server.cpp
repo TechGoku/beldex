@@ -3705,10 +3705,20 @@ namespace lws
           response.m_response_code = 400;
           response.m_response_comment = "Bad Request";
         }
-        else if (body == lws::error::account_not_found || body == lws::error::duplicate_request)
+        else if (body == lws::error::account_not_found || body == lws::error::duplicate_request ||
+                 body == lws::error::bad_view_key)
         {
+          /* A view key that does not match the address is the client's error,
+             not the server's; it used to fall through to 500, which reads as an
+             outage in monitoring and to wallets. It shares 403 with "no such
+             account" so the two cannot be told apart. */
           response.m_response_code = 403;
           response.m_response_comment = "Forbidden";
+        }
+        else if (body == lws::error::bad_address)
+        {
+          response.m_response_code = 400;
+          response.m_response_comment = "Bad Request";
         }
         else if (body == lws::error::token_not_found)
         {
