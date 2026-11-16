@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 #include <limits>
 #include <memory>
@@ -1857,14 +1858,34 @@ namespace lws
     std::mutex token_cache_mutex;
     std::unordered_map<std::string, cached_descriptor> token_cache;
 
+    /*! Most descriptors held at once.
+
+        The cache was never pruned: the TTL only decided when to refetch, and
+        every id ever asked about - including ids that do not exist, which are
+        cached as a definite "no" - stayed for the life of the process. A
+        caller posting random ids grew it without bound. Real use touches a
+        few hundred tokens at most, so this leaves ample room. */
+    constexpr const std::size_t token_cache_max_entries = 4096;
+
+    //! \return `id` in the one spelling used as a cache key (lower-case hex).
+    std::string token_cache_key(std::string id)
+    {
+      std::transform(id.begin(), id.end(), id.begin(),
+        [] (unsigned char c) { return char(std::tolower(c)); });
+      return id;
+    }
+
     std::error_code daemon_token_call(const char* method, nlohmann::json params, nlohmann::json& out);
 
     /*! \return Descriptor for `id`, from cache when fresh.
         \param found set false when the chain has no such token - which is a real
           answer, cached like any other, so a wallet asking about an unmined
           registration on a timer does not re-ask the daemon every few seconds. */
-    expect<rpc::get_token_info_response> token_descriptor(const std::string& id, bool& found)
+    expect<rpc::get_token_info_response> token_descriptor(const std::string& requested, bool& found)
     {
+      /* One key per token. Hex is case-insensitive, so "AB.." and "ab.." are
+         the same token and must not each take a cache slot. */
+      const std::string id = token_cache_key(requested);
       const auto now = std::chrono::steady_clock::now();
       {
         const std::lock_guard<std::mutex> lock{token_cache_mutex};
@@ -1908,6 +1929,15 @@ namespace lws
 
       {
         const std::lock_guard<std::mutex> lock{token_cache_mutex};
+        if (token_cache_max_entries <= token_cache.size() && !token_cache.count(id))
+        {
+          // Drop what has expired; if that frees nothing, start over. Either
+          // way the worst case is one refetch per token, never unbounded growth.
+          for (auto it = token_cache.begin(); it != token_cache.end();)
+            it = (token_descriptor_ttl <= now - it->second.fetched) ? token_cache.erase(it) : std::next(it);
+          if (token_cache_max_entries <= token_cache.size())
+            token_cache.clear();
+        }
         token_cache[id] = entry;
       }
       found = entry.found;
