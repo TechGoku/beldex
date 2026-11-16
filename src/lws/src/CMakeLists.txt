@@ -154,6 +154,18 @@ if (BUILD_TESTS)
       Threads::Threads
   )
   add_test(NAME lws-signup-limit COMMAND lws-signup-limit-test)
+
+  # Proves update() refuses a batch from a reorganised chain and keeps the
+  # stored chain in step with scanning; see ../tests/reorg_detect.cpp.
+  add_executable(lws-reorg-detect-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/reorg_detect.cpp)
+  target_link_libraries(lws-reorg-detect-test PRIVATE
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-reorg-detect COMMAND lws-reorg-detect-test)
 endif ()
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )

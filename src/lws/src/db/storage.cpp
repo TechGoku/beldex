@@ -2299,41 +2299,71 @@ namespace db
       const std::uint64_t last_update =
         lmdb::to_native(height) + chain.size() - 1;
 
-      // if (get_checkpoints().get_max_height() <= last_update)
-      // {
-      //   cursor::blocks blocks_cur;
-      //   MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
+      /* Check the batch is on the chain we have stored, and keep that chain in
+         step with scanning.
 
-      //   MDB_val key = lmdb::to_val(blocks_version);
-      //   MDB_val value;
-      //   MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET));
-      //   MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+         This check was commented out, leaving reorg detection entirely to
+         `sync_chain`. That only runs between scan passes and only compares the
+         hashes already in the `blocks` table, which then trailed account scan
+         heights by thousands of blocks. A block replaced above the stored tip
+         was never noticed: its outputs and spends stayed in the account, and
+         the block that replaced it was never scanned.
 
-      //   const expect<block_info> last_block = blocks.get_value<block_info>(value);
-      //   if (!last_block)
-      //     return last_block.error();
-      //   if (last_block->id < height)
-      //     return {lws::error::bad_blockchain};
+         Two things restore the guarantee:
 
-      //   const std::uint64_t last_same =
-      //     std::min(lmdb::to_native(last_block->id), last_update);
+           * The batch is compared against the stored hash at the highest
+             height both have. A batch's hashes chain together, so a mismatch
+             anywhere at or below that height shows up there. On a mismatch
+             nothing is written and the scanner is told to reset; its next pass
+             runs `sync`, which finds the fork and rolls the affected accounts
+             back.
+           * Hashes past the stored tip are appended, so the stored chain always
+             reaches every account's scan height and the next batch, from any
+             thread, is checked the same way.
 
-      //   const expect<crypto::hash> hash_check =
-      //     do_get_block_hash(*blocks_cur, block_id(last_same));
-      //   if (!hash_check)
-      //     return hash_check.error();
+         The upstream check was skipped below the compiled-in checkpoints
+         because upstream seeds only checkpoint hashes there. Here `sync_chain`
+         stores every hash from genesis, so the check applies at every height.
 
-      //   const std::uint64_t offset = last_same - lmdb::to_native(height);
-      //   if (*hash_check != *(chain_copy.begin() + offset))
-      //     return {lws::error::blockchain_reorg};
+         A batch starting above the stored tip has nothing to be checked
+         against. That cannot happen once the chain is synced, since both the
+         daemon and the rebuild tool sync before their first scan; if it does,
+         the scanner is told to resync rather than storing unverified data. */
+      {
+        cursor::blocks blocks_cur;
+        MONERO_CHECK(check_cursor(txn, this->db->tables.blocks, blocks_cur));
 
-      //   chain_copy.remove_prefix(offset + 1);
-      //   MONERO_CHECK(
-      //     append_block_hashes(
-      //       *blocks_cur, block_id(lmdb::to_native(height) + offset + 1), chain_copy
-      //     )
-      //   );
-      // }
+        MDB_val key = lmdb::to_val(blocks_version);
+        MDB_val value{};
+        int err = mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_SET);
+        if (err == MDB_NOTFOUND)
+          return {lws::error::bad_blockchain};
+        if (err)
+          return {lmdb::error(err)};
+        MONERO_LMDB_CHECK(mdb_cursor_get(blocks_cur.get(), &key, &value, MDB_LAST_DUP));
+
+        const expect<block_info> last_block = blocks.get_value<block_info>(value);
+        if (!last_block)
+          return last_block.error();
+        if (last_block->id < height)
+          return {lws::error::bad_blockchain};
+
+        const std::uint64_t last_same =
+          std::min(lmdb::to_native(last_block->id), last_update);
+
+        const expect<crypto::hash> stored =
+          do_get_block_hash(*blocks_cur, block_id(last_same));
+        if (!stored)
+          return stored.error();
+
+        const std::uint64_t offset = last_same - lmdb::to_native(height);
+        if (*stored != *(chain_copy.begin() + offset))
+          return {lws::error::blockchain_reorg};
+
+        chain_copy.remove_prefix(offset + 1);
+        if (!chain_copy.empty())
+          MONERO_CHECK(append_block_hashes(*blocks_cur, block_id(last_same + 1), chain_copy));
+      }
 
       cursor::accounts            accounts_cur;
       cursor::accounts_by_address accounts_ba_cur;

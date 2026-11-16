@@ -312,11 +312,16 @@ namespace db
       `height` vs the stored account record is detected, the entire update will
       fail.
 
+      `chain` is checked against the stored block hashes, and hashes past the
+      stored tip are appended, in the same transaction.
+
       \param height The first hash in `chain` is at this height.
       \param chain List of block hashes that `accts` were scanned against.
       \param accts Updated to `height + chain.size()` scan height.
 
-      \return True iff LMDB successfully committed the update.
+      \return Number of accounts updated. `lws::error::blockchain_reorg` if
+        `chain` disagrees with the stored chain, `lws::error::bad_blockchain` if
+        it starts above the stored tip; nothing is written in either case.
     */
     expect<std::size_t> update(block_id height, epee::span<const crypto::hash> chain, epee::span<const lws::account> accts);
 

@@ -912,6 +912,13 @@ namespace lws
               MINFO("Blockchain reorg detected, resetting state");
               return;
             }
+            if (updated == lws::error::bad_blockchain)
+            {
+              // The batch starts above the stored chain, so it cannot be
+              // checked. Resetting makes the next pass resync first.
+              MWARNING("Scan batch is ahead of the stored chain, resyncing");
+              return;
+            }
             MONERO_THROW(updated.error(), "Failed to update accounts on disk");
           }
 
