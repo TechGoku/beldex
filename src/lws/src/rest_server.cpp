@@ -713,6 +713,22 @@ namespace lws
         + self.token_received.capacity() * sizeof(std::pair<crypto::public_key, std::uint64_t>);
     }
 
+    /*! Add `amount` to `total`, stopping at the largest value instead of
+        wrapping. \return `total`.
+
+        For token amounts. A token's supply can sit anywhere up to 2^64 - 1,
+        and the per-account totals here are cumulative - an account that
+        passes the same coins back and forth keeps adding to both received
+        and sent - so they can exceed what any 64-bit sum holds. A wrapped
+        total is small and looks plausible; a saturated one is plainly
+        capped. BDX totals cannot get there and are left as they are. */
+    std::uint64_t& add_saturating(std::uint64_t& total, const std::uint64_t amount) noexcept
+    {
+      total = (std::numeric_limits<std::uint64_t>::max() - total < amount)
+        ? std::numeric_limits<std::uint64_t>::max() : total + amount;
+      return total;
+    }
+
     //! \return Running total for `id` in `totals`, inserting a zero entry if new.
     template<typename Assoc>
     typename Assoc::value_type::second_type& token_slot(Assoc& totals, const crypto::public_key& id)
@@ -909,7 +925,7 @@ namespace lws
           else
             fresh->token_metas.insert(find_token_metadata(fresh->token_metas, meta.id), entry);
 
-          token_slot(fresh->token_received, tid) += meta.amount;
+          add_saturating(token_slot(fresh->token_received, tid), meta.amount);
           continue;
         }
 
@@ -1299,7 +1315,7 @@ namespace lws
             const auto token = find_token_metadata(outputs.token_metas, spend.source);
             if (token != outputs.token_metas.end() && token->meta.id == spend.source)
             {
-              token_slot(token_sent, token->token_id) += token->meta.amount;
+              add_saturating(token_slot(token_sent, token->token_id), token->meta.amount);
               ++returned;
               last_returned_height = spend_height;
               continue;
@@ -1334,7 +1350,7 @@ namespace lws
           {
             if (out.token_id == received.first &&
                 is_locked(out.unlock_time, user->first.scan_height))
-              locked += out.meta.amount;
+              add_saturating(locked, out.meta.amount);
           }
 
           std::uint64_t sent = 0;
@@ -1714,7 +1730,7 @@ namespace lws
                 resp.transactions.push_back({full_out});
                 resp.transactions.back().info.spend_meta.amount = 0; // no BDX moved
               }
-              resp.transactions.back().leg(out_tid).received += full_out.spend_meta.amount;
+              add_saturating(resp.transactions.back().leg(out_tid).received, full_out.spend_meta.amount);
 
               ++output;
               if (!output.is_end())
@@ -1804,7 +1820,7 @@ namespace lws
                   resp.transactions.back().info.unlock_time = full_spend.unlock_time;
                 }
                 auto& leg = resp.transactions.back().leg(token->token_id);
-                leg.sent += token->meta.amount;
+                add_saturating(leg.sent, token->meta.amount);
                 leg.spends.push_back({token->meta, *spend, incremental});
 
                 ++spend;
@@ -2100,7 +2116,7 @@ namespace lws
         {
           const auto token = find_token_metadata(outputs.token_metas, spend.source);
           if (token != outputs.token_metas.end() && token->meta.id == spend.source)
-            token_slot(token_sent, token->token_id) += token->meta.amount;
+            add_saturating(token_slot(token_sent, token->token_id), token->meta.amount);
         }
 
         const expect<db::block_info> last = user->second.get_last_block();
@@ -2150,7 +2166,7 @@ namespace lws
           for (const token_meta& out : outputs.token_metas)
           {
             if (out.token_id == raw && is_locked(out.unlock_time, user->first.scan_height))
-              locked += out.meta.amount;
+              add_saturating(locked, out.meta.amount);
           }
 
           entry.total_received = rpc::safe_uint64(received);
@@ -2160,7 +2176,8 @@ namespace lws
           // this account received, so an underflow would be a bug elsewhere -
           // and reporting a spendable balance near 2^64 would be far worse than
           // reporting zero.
-          const std::uint64_t spent_and_locked = sent + locked;
+          std::uint64_t spent_and_locked = sent;
+          add_saturating(spent_and_locked, locked);
           entry.unlocked_balance =
             rpc::safe_uint64(received > spent_and_locked ? received - spent_and_locked : 0);
 
