@@ -141,6 +141,19 @@ if (BUILD_TESTS)
       Threads::Threads
   )
   add_test(NAME lws-stale-reader COMMAND lws-stale-reader-test)
+
+  # Checks the opt-in signup limits are off by default and bite when set;
+  # see ../tests/signup_limit.cpp.
+  add_executable(lws-signup-limit-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/signup_limit.cpp)
+  target_link_libraries(lws-signup-limit-test PRIVATE
+      beldex-lws-util
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-signup-limit COMMAND lws-signup-limit-test)
 endif ()
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )

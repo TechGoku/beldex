@@ -438,6 +438,24 @@ It is created `0600`; treat it like a key file.
 **Run tools as the daemon's user.** The database files are `0600`, and even a
 read-only LMDB open must write a reader slot into `lock.mdb`.
 
+**Anyone can create an account.** `/login` registers an address the first time
+it is seen, with no approval step, and that is what wallets rely on. It also
+means anyone who can reach the port can create accounts without limit: each one
+is scanned against every transaction from then on, and each takes space in the
+database. Two options bound that, both off by default:
+
+- `--max-accounts N` refuses new accounts once `N` have been created. Existing
+  accounts keep working; a refused signup is answered `503`. Accounts added
+  through the admin interface are not counted against it.
+- `--signup-rate-limit N` lets one client address create at most `N` accounts
+  per hour; further signups are answered `429` until the hour is up. IPv6
+  clients are counted by their /64. Behind a reverse proxy every client arrives
+  from the proxy's address and would share one allowance, so limit signups at
+  the proxy instead.
+
+`--create-queue-max` does not apply here: it bounds requests waiting for admin
+approval, and `/login` does not use that queue.
+
 **One writer at a time.** LMDB allows a single writer across the whole
 database. Read-only tools are unaffected, but any read-write admin command
 competes with the scanner for that lock.

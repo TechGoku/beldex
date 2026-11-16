@@ -39,6 +39,24 @@ namespace lws
         request rebuilds its response from LMDB. Operators sizing a box for a
         large population need this to be a knob (`--rest-cache-bytes`). */
     inline std::size_t rest_cache_max_bytes = 256 * 1024 * 1024;
+
+    /*! Ceiling on the number of accounts `/login` may create (`--max-accounts`).
+        `0`, the default, means no ceiling.
+
+        `/login` with `create_account` registers an address immediately and
+        the request costs the caller nothing, while every account is scanned
+        against every transaction from then on. Without a ceiling, anyone who
+        can reach the port can grow that cost, and the database, without
+        bound. Accounts added by an admin are not subject to it. */
+    inline std::uint64_t max_accounts = 0;
+
+    /*! Accounts one client address may create per hour through `/login`
+        (`--signup-rate-limit`). `0`, the default, means unlimited.
+
+        Counted per connecting address (per /64 for IPv6). Behind a reverse
+        proxy every client arrives from the proxy's address and would share
+        one allowance, so limit signups at the proxy there instead. */
+    inline unsigned signup_rate_limit = 0;
     class rest_server
     {
         struct internal;

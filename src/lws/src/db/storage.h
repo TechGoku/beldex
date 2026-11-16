@@ -276,8 +276,14 @@ namespace db
       change_status(account_status status, epee::span<const account_address> addresses);
 
 
-    //! Add an account, for immediate inclusion in the active list.
-    expect<void> add_account(account_address const& address, crypto::secret_key const& key, account_flags flags =  static_cast<account_flags>(0)) noexcept;
+    /*! Add an account, for immediate inclusion in the active list.
+
+        \param max_accounts If non-zero, fail with `lws::error::account_max`
+          instead of creating an account once that many have been created.
+          Checked inside the write transaction, so concurrent callers cannot
+          both slip under the limit. Account ids are never reused, so this
+          counts accounts ever created in this database. */
+    expect<void> add_account(account_address const& address, crypto::secret_key const& key, account_flags flags =  static_cast<account_flags>(0), std::uint64_t max_accounts = 0) noexcept;
 
     //! Reset `addresses` to `height` for scanning.
     expect<std::vector<account_address>>

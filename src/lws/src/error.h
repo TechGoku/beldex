@@ -33,6 +33,7 @@ namespace lws
     signal_abort_process,       //!< In process ZMQ PUB to abort the process was received
     signal_abort_scan,          //!< In process ZMQ PUB to abort the scan was received
     signal_unknown,             //!< An unknown in process ZMQ PUB was received
+    signup_rate_limited,        //!< Client address created too many accounts recently
     system_clock_invalid_range, //!< System clock is out of range for storage format
     tx_relay_failed,            //!< Daemon failed to relayed tx from REST client
     status_failed,              //!< Daemon failed to approve tx from REST client

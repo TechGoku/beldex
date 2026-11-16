@@ -42,6 +42,7 @@
 #include "util/http_server.h"
 #include "util/gamma_picker.h"
 #include "util/random_outputs.h"
+#include "util/signup_limit.h"
 #include "util/source_location.h"
 #include "wire/crypto.h"
 #include "rpc/light_wallet.h"
@@ -2439,6 +2440,19 @@ namespace lws
       }
     };
 
+    /*! Address of the client whose request this thread is serving.
+
+        Handlers are plain functions of (body, database) and never see the
+        connection. `handle_http_request` sets this immediately before it
+        runs one, on the same thread, so a handler that needs to know who is
+        asking - `login`, to rate-limit signups - can read it. Empty outside
+        a request. */
+    thread_local std::string request_client;
+
+    /*! Counts account creation per client for `--signup-rate-limit`. One
+        instance for the process: the limit is per client, not per listener. */
+    signup_limiter signup_limits;
+
     struct login
     {
       using request = rpc::login_request;
@@ -2481,8 +2495,17 @@ namespace lws
            2. `MONERO_UNWRAP` THROWS on any DB error. That escaped the handler
               (see the try/catch in handle_http_request) instead of becoming a
               clean error response. Return the error code instead. */
+        /* Both limits are opt-in (`--signup-rate-limit`, `--max-accounts`) and
+           off by default, so an unconfigured server behaves as it always has.
+           The rate limit is checked here, after the view key has been verified
+           and the account found missing, so only a request that would really
+           create an account is counted against the client. The account
+           ceiling is enforced inside the write transaction. */
+        if (!signup_limits.allow(request_client, lws::signup_rate_limit))
+          return {lws::error::signup_rate_limited};
+
         const auto flags = req.generated_locally ? db::account_generated_locally : db::default_account;
-        MONERO_CHECK(disk.add_account(req.creds.address, req.creds.key, flags));
+        MONERO_CHECK(disk.add_account(req.creds.address, req.creds.key, flags, lws::max_accounts));
         return response{true, req.generated_locally};
       }
     };//login
@@ -3451,6 +3474,9 @@ namespace lws
            handler still finishes against whichever database it started on. */
         db::storage serving = current_disk();
 
+        // For handlers that need to know who is asking; see `request_client`.
+        request_client = ctx.m_remote_address.host_str();
+
         if (handler->creates_accounts)
         {
           /* Shared, so any number of signups run concurrently; it only ever
@@ -3503,6 +3529,17 @@ namespace lws
           // token" from "no such endpoint".
           response.m_response_code = 400;
           response.m_response_comment = "Bad Request";
+        }
+        else if (body == lws::error::signup_rate_limited)
+        {
+          response.m_response_code = 429;
+          response.m_response_comment = "Too Many Requests";
+        }
+        else if (body == lws::error::account_max)
+        {
+          // The server is full, not broken: say so rather than answering 500.
+          response.m_response_code = 503;
+          response.m_response_comment = "Service Unavailable";
         }
         else if (body.matches(std::errc::timed_out) || body.matches(std::errc::no_lock_available))
         {

@@ -2205,9 +2205,9 @@ namespace db
   }
 
 
-  expect<void> storage::add_account(account_address const& address, crypto::secret_key const& key, const account_flags flags) noexcept   {
+  expect<void> storage::add_account(account_address const& address, crypto::secret_key const& key, const account_flags flags, const std::uint64_t max_accounts) noexcept   {
     MONERO_PRECOND(db != nullptr);
-    return db->try_write([this, &address, &key, flags] (MDB_txn& txn) -> expect<void>
+    return db->try_write([this, &address, &key, flags, max_accounts] (MDB_txn& txn) -> expect<void>
     {
       const expect<db::account_time> current_time = get_account_time();
       if (!current_time)
@@ -2238,7 +2238,14 @@ namespace db
       if (!height)
         return height.error();
 
+      if (max_accounts && max_accounts <= lmdb::to_native(*last_id))
+        return {lws::error::account_max};
+
       const account_id next_id = account_id(lmdb::to_native(*last_id) + 1);
+      // Same guard `create_accounts` has: the id space is finite.
+      if (next_id == account_id::invalid)
+        return {lws::error::account_max};
+
       account user{};
       user.id = next_id;
       user.address = address;

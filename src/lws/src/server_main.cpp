@@ -46,6 +46,8 @@ namespace
     const command_line::arg_descriptor<std::vector<std::string>> access_controls;
     const command_line::arg_descriptor<bool> external_bind;
     const command_line::arg_descriptor<unsigned> create_queue_max;
+    const command_line::arg_descriptor<std::uint64_t> max_accounts;
+    const command_line::arg_descriptor<unsigned> signup_rate_limit;
     const command_line::arg_descriptor<std::chrono::minutes::rep> rates_interval;
     const command_line::arg_descriptor<unsigned short> log_level;
     const command_line::arg_descriptor<std::string> config_file;
@@ -91,6 +93,11 @@ namespace
       , access_controls{"access-control-origin", "Allowed CORS origin; repeatable"}
       , external_bind{"confirm-external-bind", "Needed to bind non-loopback over http", false}
       , create_queue_max{"create-queue-max", "Max requests awaiting approval", 10000}
+      /* Both off by default. /login creates an account on first sight with no
+         approval step, which is what wallets rely on and what some deployments
+         need without any ceiling - so the two limits below are opt-in. */
+      , max_accounts{"max-accounts", "Refuse new accounts past this many; 0 = unlimited", 0}
+      , signup_rate_limit{"signup-rate-limit", "New accounts per client address per hour; 0 = unlimited", 0}
       , rates_interval{"exchange-rate-interval", "Minutes between rate fetches; 0 off", 0}
       , log_level{"log-level", "0-4", 1}
       , config_file{"config-file", "Read options from a file"}
@@ -132,6 +139,8 @@ namespace
       boost::program_options::options_description scanning{"Scanning and accounts"};
       command_line::add_arg(scanning, scan_threads);
       command_line::add_arg(scanning, create_queue_max);
+      command_line::add_arg(scanning, max_accounts);
+      command_line::add_arg(scanning, signup_rate_limit);
       command_line::add_arg(scanning, rates_interval);
       description.add(scanning);
 
@@ -277,6 +286,8 @@ namespace
       lws::daemon_add = prog.daemon_rpc;
 
     lws::rest_cache_max_bytes = std::size_t(command_line::get_arg(args, opts.rest_cache_bytes));
+    lws::max_accounts = command_line::get_arg(args, opts.max_accounts);
+    lws::signup_rate_limit = command_line::get_arg(args, opts.signup_rate_limit);
     prog.daemon_spread = command_line::get_arg(args, opts.daemon_spread);
 
     /* Build the failover endpoint list: primary first, then --daemon-backup.

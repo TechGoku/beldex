@@ -66,6 +66,8 @@ namespace lws
         return "An in-process message was received to abort account scanning";
       case error::signal_unknown:
         return "An unknown in-process message was received";
+      case error::signup_rate_limited:
+        return "Too many accounts created from this address; try again later";
       case error::system_clock_invalid_range:
         return "System clock is out of range for account storage format";
       case error::tx_relay_failed:
