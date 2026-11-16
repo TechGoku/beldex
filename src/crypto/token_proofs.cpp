@@ -931,6 +931,19 @@ bool verify_vector_ug_aggregation_proof(const rct::key&  context_hash,
     for (const auto& e : sig.amount_commitments_for_rp_aggregation)
       if (!rct::isInMainSubgroup(e)) return false;
 
+    // The public inputs must be prime-order too. tags[j] is not hashed into
+    // this proof's transcript (consensus binds it through context_hash =
+    // tx_prefix_hash instead), and it only reaches the check as y0_j*tags[j].
+    // A small-order component t on a tag therefore vanishes whenever
+    // y0_j == 0 mod ord(t) -- 1 in 8 proofs for an order-8 t, and a prover
+    // can grind r0_j to hit it. Honest values are always prime-order
+    // (T = token_id + r*X with token_id a cofactor-cleared hash-to-point;
+    // E = a*T + mask*G), so this rejects nothing valid.
+    for (const auto& e : real_commitments)
+      if (!rct::isInMainSubgroup(e)) return false;
+    for (const auto& t : tags)
+      if (!rct::isInMainSubgroup(t)) return false;
+
     std::vector<uint8_t> buf;
     buf.reserve((1 + 2 * n) * 32);
     auto push = [&](const rct::key& k){ buf.insert(buf.end(), k.bytes, k.bytes + 32); };

@@ -105,7 +105,7 @@ namespace cryptonote
 
   }
   //---------------------------------------------------------------------------------
-  bool tx_memory_pool::have_duplicated_non_standard_tx(transaction const &tx, hf version) const
+  bool tx_memory_pool::have_duplicated_non_standard_tx(transaction const &tx, hf version, std::string *reason) const
   {
     auto &master_node_list = m_blockchain.get_master_node_list();
     if (tx.type == txtype::state_change)
@@ -227,8 +227,18 @@ namespace cryptonote
       }
     }
     else if (tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token ||
-             tx.type == txtype::update_token || tx.type == txtype::burn_token)
+             tx.type == txtype::update_token)
     {
+      // At most one register/mint/update op per token_id may sit in the pool at a
+      // time, regardless of which of those op types either tx is: each op individually
+      // validates against committed DB state (check_tx_inputs never sees the others pending
+      // in the pool), but if two land in the same block they are applied cumulatively
+      // (Blockchain::handle_block_to_main_chain / pending_token_states) and can conflict in
+      // ways no single-tx check catches (e.g. a mint pushing current_supply over
+      // total_max_supply, or a mint going through after an update_token transferred
+      // ownership away from its signer). Same rationale as the BNS branch above. burn_token
+      // is intentionally excluded: it doesn't mutate the descriptor other tokens read
+      // ownership/supply from, so it can safely coexist with a pending op on the same id.
       cryptonote::tx_extra_token_descriptor_operation data{};
       size_t op_index = 0;
       bool saw_token_op = false;
@@ -241,6 +251,8 @@ namespace cryptonote
         {
           LOG_PRINT_L1("New TX: " << get_transaction_hash(tx) << ", has TX: " << holder
               << " from the pool that already carries an operation on the same token_id.");
+          if (reason)
+            *reason = "a token operation for this token_id is already pending in the mempool (tx " + tools::type_to_hex(holder) + ")";
           return true;
         }
       }
@@ -413,10 +425,12 @@ namespace cryptonote
         }
       }
     }
-    if (!opts.kept_by_block && have_duplicated_non_standard_tx(tx, hf_version))
+    std::string duplicate_reason;
+    if (!opts.kept_by_block && have_duplicated_non_standard_tx(tx, hf_version, &duplicate_reason))
     {
       mark_double_spend(tx);
       LOG_PRINT_L1("Transaction with id= "<< id << " already has a duplicate tx for height");
+      tvc.m_verbose_error = duplicate_reason;
       tvc.m_verifivation_failed = true;
       tvc.m_double_spend = true;
       return false;
@@ -1017,7 +1031,7 @@ namespace cryptonote
   static bool tx_carries_token_ops(const transaction_prefix &tx)
   {
     return tx.type == txtype::register_privacy_token || tx.type == txtype::mint_token ||
-           tx.type == txtype::update_token || tx.type == txtype::burn_token;
+           tx.type == txtype::update_token;
   }
   //---------------------------------------------------------------------------------
   void tx_memory_pool::index_token_ops(const transaction_prefix &tx, const crypto::hash &txid)

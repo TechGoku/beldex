@@ -2615,12 +2615,14 @@ This command is only required if the open wallet is one of the owners of a BNS r
   {
     static constexpr auto names() { return NAMES("register_privacy_token"); }
     static constexpr const char* description =
-        "Register a new privacy token. Pass a JSON descriptor containing: "
+        "Register a new privacy token. Pass a JSON descriptor (inline via json_string, or a file "
+        "path via json_filename) containing: "
         "ticker, full_name, total_max_supply, current_supply, decimal_point, meta_info.";
 
     struct request
     {
-      std::string json_string;                // Inline token JSON descriptor
+      std::string json_string;                // Inline token JSON descriptor (preferred)
+      std::string json_filename;              // (Optional) Path to a token JSON descriptor file; used when json_string is empty
       uint32_t account_index = 0;             // Account to use for fees
       uint32_t priority = 0;                  // Transaction priority
       std::set<uint32_t> subaddr_indices;     // (Optional) Subaddresses to use for fees
@@ -2799,7 +2801,6 @@ This command is only required if the open wallet is one of the owners of a BNS r
     struct request
     {
       std::string token_id;        // Hex-encoded token ID
-      std::string json_filename;   // Path to the token JSON descriptor file containing metadata to update
       std::string json_string;     // Inline token JSON descriptor
       uint32_t priority;           // Transaction priority
       uint32_t account_index;      // (Optional) Index of the account to pay for the transaction fees. (defaults to 0)

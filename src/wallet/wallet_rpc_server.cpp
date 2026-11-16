@@ -3982,15 +3982,18 @@ namespace {
     require_open();
     REGISTER_PRIVACY_TOKEN::response res{};
 
-    // 1. Validate request
-    if (req.json_string.empty())
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "json_string is required"};
+    // 1. Validate request: accept either an inline JSON string or a JSON file path.
+    if (req.json_string.empty() && req.json_filename.empty())
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "either json_string or json_filename is required"};
 
-    // 2. Load descriptor from inline JSON
+    // 2. Load descriptor from the inline JSON (preferred) or from the JSON file.
     cryptonote::token_descriptor_base descriptor{};
     std::string error;
-    if (!cryptonote::load_token_descriptor_from_json(req.json_string, descriptor, error))
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error};
+    const bool loaded = !req.json_string.empty()
+        ? cryptonote::load_token_descriptor_from_json(req.json_string, descriptor, error)
+        : cryptonote::load_token_descriptor_from_json_file(fs::u8path(req.json_filename), descriptor, error);
+    if (!loaded)
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error + (req.json_string.empty() ? (": " + req.json_filename) : "")};
 
     // 3. Set owner to wallet's spend key if not provided
     const auto owner = m_wallet->get_account().get_keys().m_account_address.m_spend_public_key;
@@ -4247,8 +4250,8 @@ namespace {
     if (!tools::hex_to_type(req.token_id, token_id))
       throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse token_id"};
 
-    if (req.json_filename.empty() && req.json_string.empty())
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "json_filename or json_string is required"};
+    if (req.json_string.empty())
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "json_string is required"};
 
     nlohmann::json info_res;
     try {
@@ -4274,7 +4277,7 @@ namespace {
     adb.meta_info = info_res.value("meta_info", "");
     tools::hex_to_type(info_res.value("owner", ""), adb.owner);
 
-    // update_token may only change meta_info (consensus rejects changes to
+    // update_token may change meta_info and owner (consensus rejects changes to
     // supply/ticker/full_name/decimal_point). `adb` already holds the LIVE
     // on-chain descriptor; load the JSON file into a copy and adopt ONLY its
     // meta_info, preserving every other field from the chain. This avoids a
@@ -4283,18 +4286,15 @@ namespace {
     // carry the new meta_info, the rest is taken from the current descriptor.
     cryptonote::token_descriptor_base file_adb = adb;
     std::string error;
-    bool loaded = false;
-    if (!req.json_string.empty())
-      loaded = cryptonote::load_token_descriptor_from_json(req.json_string, file_adb, error, cryptonote::token_descriptor_json_mode::update);
-    else
-      loaded = cryptonote::load_token_descriptor_from_json_file(fs::u8path(req.json_filename), file_adb, error, cryptonote::token_descriptor_json_mode::update);
+    if (!cryptonote::load_token_descriptor_from_json(req.json_string, file_adb, error, cryptonote::token_descriptor_json_mode::update))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error};
 
-    if (!loaded)
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, error + (req.json_string.empty() ? (": " + req.json_filename) : "")};
-
-    if (file_adb.meta_info == adb.meta_info)
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "update_token: meta_info is unchanged, nothing to update"};
+    if (file_adb.meta_info == adb.meta_info && file_adb.owner == adb.owner)
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "update_token: meta_info and owner are unchanged, nothing to update"};
     adb.meta_info = file_adb.meta_info;
+
+    if (file_adb.owner != crypto::null_pkey)
+      adb.owner = file_adb.owner;
 
     cryptonote::tx_extra_token_descriptor_operation tdo{};
     tdo.operation_type = cryptonote::token_descriptor_operation_type::update_token;

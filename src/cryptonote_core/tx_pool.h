@@ -601,7 +601,7 @@ namespace cryptonote
      * @return true if it already exists
      *
      */
-    bool have_duplicated_non_standard_tx(transaction const &tx, hf version) const;
+    bool have_duplicated_non_standard_tx(transaction const &tx, hf version, std::string *reason = nullptr) const;
 
     /**
      * @brief check if any spent key image in a transaction is in the pool

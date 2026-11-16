@@ -311,6 +311,25 @@ TEST(TokenProofs, TorsionPointsAreRejected)
       auto t = tags; t[i] = plus(t[i], torsion);
       EXPECT_FALSE(crypto::verify_vector_ug_aggregation_proof(msg, real, t, proof));
     }
+
+    // Deterministic form of the tag case: the tags are outside this proof's
+    // transcript and enter only as y0_j*tags[j], so an order-8 component on
+    // tags[0] cancels exactly when y0_0 == 0 mod 8. Regenerate until that
+    // holds (1 in 8 per try) and require the verifier to still reject it --
+    // without the explicit subgroup check this proof verifies.
+    {
+      crypto::vector_ug_aggregation_proof_s ground{};
+      bool found = false;
+      for (int attempt = 0; attempt < 256 && !found; ++attempt)
+      {
+        ASSERT_TRUE(crypto::generate_vector_ug_aggregation_proof(msg, amounts, masks, aux_masks, real, aux, tags, ground));
+        found = (ground.y0s[0].bytes[0] & 7) == 0; // y0 < l, little-endian
+      }
+      ASSERT_TRUE(found);
+      ASSERT_TRUE(crypto::verify_vector_ug_aggregation_proof(msg, real, tags, ground));
+      auto t = tags; t[0] = plus(t[0], torsion);
+      EXPECT_FALSE(crypto::verify_vector_ug_aggregation_proof(msg, real, t, ground));
+    }
   }
 }
 } // namespace
