@@ -34,9 +34,10 @@ namespace lws
     crypto::secret_key view_key;
   };
 
-  account::account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable) noexcept
+  account::account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable, std::vector<std::uint64_t> key_prints) noexcept
     : immutable_(std::move(immutable))
     , spendable_(std::move(spendable))
+    , key_prints_(std::move(key_prints))
     , spends_()
     , outputs_()
     , height_(height)
@@ -48,10 +49,11 @@ namespace lws
       MONERO_THROW(::common_error::kInvalidArgument, "using moved from account");
   }
 
-  account::account(db::account const& source, std::vector<db::output_id> spendable)
-    : account(std::make_shared<internal>(source), source.scan_height, std::move(spendable))
+  account::account(db::account const& source, std::vector<db::output_id> spendable, std::vector<std::uint64_t> key_prints)
+    : account(std::make_shared<internal>(source), source.scan_height, std::move(spendable), std::move(key_prints))
   {
     std::sort(spendable_.begin(), spendable_.end());
+    std::sort(key_prints_.begin(), key_prints_.end());
   }
 
   account::~account() noexcept
@@ -59,7 +61,7 @@ namespace lws
 
   account account::clone() const
   {
-    account result{immutable_, height_, spendable_};
+    account result{immutable_, height_, spendable_, key_prints_};
     result.outputs_ = outputs_;
     result.spends_ = spends_;
     return result;
@@ -116,18 +118,33 @@ namespace lws
     return std::binary_search(spendable_.begin(), spendable_.end(), id);
   }
 
+  std::uint64_t account::key_fingerprint(crypto::public_key const& key) noexcept
+  {
+    std::uint64_t out = 0;
+    static_assert(sizeof(out) <= sizeof(key), "key too small");
+    std::memcpy(std::addressof(out), std::addressof(key), sizeof(out));
+    return out;
+  }
+
   bool account::add_out(db::output const& out)
   {
-    /* Deduplicate on the global output id rather than the one-time public key.
-       The id IS the output's identity on chain, so this is the same check with
-       a third of the memory - and it matches what the database itself enforces
-       (`bulk_insert` uses MDB_NODUPDATA over the same ordering). */
+    // Same output seen again (e.g. a re-scan of a block): nothing new.
     const auto position =
       std::lower_bound(spendable_.begin(), spendable_.end(), out.spend_meta.id);
     if (position != spendable_.end() && *position == out.spend_meta.id)
       return false;
 
+    /* A different output with a one-time key already received. Both share one
+       key image, so at most one can ever be spent; keep the first. The id
+       check above cannot catch this - the second output has its own id. */
+    const std::uint64_t print = key_fingerprint(out.pub);
+    const auto print_position =
+      std::lower_bound(key_prints_.begin(), key_prints_.end(), print);
+    if (print_position != key_prints_.end() && *print_position == print)
+      return false;
+
     spendable_.insert(position, out.spend_meta.id);
+    key_prints_.insert(print_position, print);
     outputs_.push_back(out);
     return true;
   }

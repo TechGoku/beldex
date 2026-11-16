@@ -16,24 +16,30 @@ class account
     struct internal;
 
     std::shared_ptr<const internal> immutable_;
-    /* Received output ids, sorted. Doubles as the duplicate check for
-       `add_out`: an output's global id is its identity, so a separate vector of
-       one-time public keys (32 bytes each, on top of these 16) was redundant.
-       Dropping it cuts the scanner's resident memory per output by ~2/3 and
-       removes a field from the per-account reload walk - which matters because
-       the whole set is held in RAM for every active account while scanning. */
+    /* Received output ids, sorted. Identifies which ring members are ours when
+       looking for spends. */
     std::vector<db::output_id> spendable_;
+    /* Fingerprints of the one-time public keys of every received output,
+       sorted; see `key_fingerprint`. The duplicate-key check for `add_out`.
+
+       A sender who reuses a transaction key and output index produces a
+       second output with the same one-time key. It has a different global
+       id, so the id check misses it, and both were credited although only
+       one can ever be spent: they share a key image. Keeping the full keys
+       (32 bytes each) would triple the per-output memory this class was
+       slimmed down to avoid, so 8 bytes are kept instead. */
+    std::vector<std::uint64_t> key_prints_;
     std::vector<db::spend> spends_;
     std::vector<db::output> outputs_;
     db::block_id height_;
 
-    explicit account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable) noexcept;
+    explicit account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable, std::vector<std::uint64_t> key_prints) noexcept;
     void null_check() const;
 
   public:
 
     //! Construct an account from `source` and current `spendable` outputs.
-    explicit account(db::account const& source, std::vector<db::output_id> spendable);
+    explicit account(db::account const& source, std::vector<db::output_id> spendable, std::vector<std::uint64_t> key_prints = {});
 
     /*!
       \return False if this is a "moved-from" account (i.e. the internal memory
@@ -83,8 +89,20 @@ class account
     //! \return Spends matched during the latest scan.
     std::vector<db::spend> const& spends() const noexcept { return spends_; }
 
-    //! Track a newly received `out`, \return `false` if its output id is already known.
+    /*! Track a newly received `out`.
+
+        \return `false`, and nothing is recorded, if its output id or its
+          one-time public key is already known. For a repeated key the
+          first output seen is kept, as upstream monero-lws and the core
+          wallet do: crediting both would show a balance that can never be
+          spent. */
     bool add_out(db::output const& out);
+
+    /*! The 8-byte fingerprint `add_out` compares one-time keys by: the
+        key's first 8 bytes. Keys are hash-derived points, so accidental
+        collisions are negligible (about 3e-8 for a million outputs in one
+        account) and finding one on purpose takes about 2^64 work. */
+    static std::uint64_t key_fingerprint(crypto::public_key const& key) noexcept;
 
     //! Track a possible `spend`.
     void add_spend(db::spend const& spend);

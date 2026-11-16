@@ -1389,6 +1389,7 @@ namespace lws
     {
       db::block_id height;
       std::vector<db::output_id> receives;
+      std::vector<std::uint64_t> key_prints; //!< see account::key_fingerprint
     };
     std::map<db::account_id, cached_outputs> output_cache;
     std::size_t cache_entries = 0;
@@ -1466,28 +1467,35 @@ namespace lws
           const auto cached = output_cache.find(user.id);
           if (cached != output_cache.end() && cached->second.height == user.scan_height)
           {
-            users.emplace_back(user, cached->second.receives);
+            users.emplace_back(user, cached->second.receives, cached->second.key_prints);
             ++served_from_cache;
           }
           else
           {
             std::vector<db::output_id> receives{};
+            std::vector<std::uint64_t> key_prints{};
             auto receive_list = MONERO_UNWRAP(reader.get_outputs(user.id));
 
             const std::size_t elems = receive_list.count();
             receives.reserve(elems);
+            key_prints.reserve(elems);
 
-            // Only the output id is needed now (see account::add_out), so the
-            // one-time public key is no longer read back for every output.
+            /* The output id finds our ring members; the key fingerprint stops a
+               later output with an already-received one-time key from being
+               credited twice (see account::add_out). */
             for (auto output = receive_list.make_iterator(); !output.is_end(); ++output)
+            {
               receives.emplace_back(output.get_value<MONERO_FIELD(db::output, spend_meta.id)>());
+              key_prints.emplace_back(
+                account::key_fingerprint(output.get_value<MONERO_FIELD(db::output, pub)>()));
+            }
 
             if (cache_entries + 1 <= max_cached_accounts)
             {
-              output_cache[user.id] = cached_outputs{user.scan_height, receives};
+              output_cache[user.id] = cached_outputs{user.scan_height, receives, key_prints};
               cache_entries = output_cache.size();
             }
-            users.emplace_back(user, std::move(receives));
+            users.emplace_back(user, std::move(receives), std::move(key_prints));
             ++reloaded_from_db;
           }
 

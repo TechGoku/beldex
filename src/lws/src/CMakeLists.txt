@@ -173,6 +173,18 @@ if (BUILD_TESTS)
   target_link_libraries(lws-cache-generation-test PRIVATE Threads::Threads)
   target_include_directories(lws-cache-generation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME lws-cache-generation COMMAND lws-cache-generation-test)
+
+  # Proves an output with an already-received one-time key is not credited
+  # twice; see ../tests/duplicate_key.cpp.
+  add_executable(lws-duplicate-key-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/duplicate_key.cpp)
+  target_link_libraries(lws-duplicate-key-test PRIVATE
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-duplicate-key COMMAND lws-duplicate-key-test)
 endif ()
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )
