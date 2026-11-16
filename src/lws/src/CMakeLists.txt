@@ -185,6 +185,18 @@ if (BUILD_TESTS)
       Threads::Threads
   )
   add_test(NAME lws-duplicate-key COMMAND lws-duplicate-key-test)
+
+  # Proves a reorg removes orphaned records from accounts rescanned below the
+  # fork; see ../tests/rescan_reorg.cpp.
+  add_executable(lws-rescan-reorg-test ${CMAKE_CURRENT_SOURCE_DIR}/../tests/rescan_reorg.cpp)
+  target_link_libraries(lws-rescan-reorg-test PRIVATE
+      beldex-lws-db
+      beldex-lws-common
+      beldex-lws-wire-json
+      Boost::filesystem
+      Threads::Threads
+  )
+  add_test(NAME lws-rescan-reorg COMMAND lws-rescan-reorg-test)
 endif ()
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin )

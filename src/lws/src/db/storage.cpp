@@ -1484,8 +1484,63 @@ namespace db
       return success();
     }
 
+    /*! Remove what accounts whose scan height is BELOW `height` recorded at or
+        above it.
+
+        `rollback_accounts` finds the accounts to roll back through the height
+        index, starting at the fork, so it only reaches accounts scanned to the
+        fork or past it. An account an admin has rescanned sits below the fork
+        but still holds everything it recorded before the rescan - a rescan
+        lowers the scan height and keeps the stored outputs and spends. Records
+        from the orphaned blocks were therefore never removed from it, and they
+        stayed in its balance once it rescanned past the fork. Their scan
+        height is already below the fork, so only the records go. */
+    expect<void> rollback_records_below(storage_internal::tables_ const& tables, MDB_txn& txn, const block_id height,
+                                        MDB_cursor& outputs_cur, MDB_cursor& spends_cur, MDB_cursor& images_cur)
+    {
+      cursor::accounts_by_height cur;
+      MONERO_CHECK(check_cursor(txn, tables.accounts_bh, cur));
+
+      MDB_val key{};
+      MDB_val value{};
+      int err = mdb_cursor_get(cur.get(), &key, &value, MDB_FIRST);
+      for (;;)
+      {
+        if (err == MDB_NOTFOUND)
+          return success();
+        if (err)
+          return {lmdb::error(err)};
+        if (key.mv_size != sizeof(block_id))
+          return {lmdb::error(MDB_CORRUPTED)};
+
+        block_id at{};
+        std::memcpy(std::addressof(at), key.mv_data, sizeof(at));
+        if (height <= at)
+          return success(); // the rest is rollback_accounts' job
+
+        const expect<account_lookup> lookup = accounts_by_height.get_value<account_lookup>(value);
+        if (!lookup)
+          return lookup.error();
+
+        MONERO_CHECK(rollback_outputs(lookup->id, height, outputs_cur));
+        MONERO_CHECK(rollback_spends(lookup->id, height, spends_cur, images_cur));
+
+        err = mdb_cursor_get(cur.get(), &key, &value, MDB_NEXT);
+      }
+    }
+
     expect<void> rollback_accounts(storage_internal::tables_ const& tables, MDB_txn& txn, block_id height)
     {
+      {
+        cursor::outputs outputs_cur;
+        cursor::spends spends_cur;
+        cursor::images images_cur;
+        MONERO_CHECK(check_cursor(txn, tables.outputs, outputs_cur));
+        MONERO_CHECK(check_cursor(txn, tables.spends, spends_cur));
+        MONERO_CHECK(check_cursor(txn, tables.images, images_cur));
+        MONERO_CHECK(rollback_records_below(tables, txn, height, *outputs_cur, *spends_cur, *images_cur));
+      }
+
       cursor::accounts_by_height accounts_bh_cur;
       MONERO_CHECK(check_cursor(txn, tables.accounts_bh, accounts_bh_cur));
 
