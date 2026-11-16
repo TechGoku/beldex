@@ -437,7 +437,6 @@ namespace cryptonote::rpc {
     blocks_res.reserve(blocks.size());
     
     cryptonote::block blk;
-    cryptonote::transaction tx_hash;
     uint64_t block_count = 0;
     for(auto& bd: blocks)
     {
@@ -496,6 +495,13 @@ namespace cryptonote::rpc {
       json tx_hash_block = {};
       for (const auto& blob : bd.second)
       {
+        // A fresh object per transaction. Deserialising into a reused one
+        // carries the previous tx's token_proofs over, and the serializer
+        // reads token proofs whenever that vector is non-empty - so a plain
+        // BDX tx following a token tx in the same batch failed to parse
+        // ("deserialization of varint failed") and was dropped from the
+        // reply, leaving the LWS blind to it.
+        cryptonote::transaction tx_hash;
         tx_hash.pruned = get_blocks_fast_rpc.request.prune;
 
         const bool parsed = get_blocks_fast_rpc.request.prune ?
@@ -531,7 +537,14 @@ namespace cryptonote::rpc {
           //---------------------------------------------------------------------------------------
         }            
         else
-          ++hash_it;
+        {
+          // Never answer with a block that silently lacks one of its
+          // transactions: the LWS would record the block as scanned and miss
+          // that tx's receives and spends for good. Failing makes it retry.
+          MERROR("get_blocks_fast: could not parse tx " << blob.first << " in block " << get_block_height(blk));
+          get_blocks_fast_rpc.response["status"] = "Failed";
+          return;
+        }
       }
 
       block["tx_hashes"] = tx_hash_block;
