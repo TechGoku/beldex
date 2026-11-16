@@ -232,8 +232,32 @@ namespace lws
       return lws::daemon_pool.empty() ? fallback : lws::daemon_pool;
     }
 
-    //! POST `body` to the first daemon that answers. `used` receives its URL.
-    cpr::Response post_to_daemon(const std::string& body, std::string& used)
+    /*! \return True if `response` failed before the request could have reached
+        the daemon: the name did not resolve, nothing accepted the connection,
+        or the URL itself was unusable. Anything later - a timeout, a dropped
+        connection, an HTTP error - means the daemon may have received and
+        acted on the request. */
+    bool never_reached_daemon(const cpr::Response& response) noexcept
+    {
+      switch (response.error.code)
+      {
+      case cpr::ErrorCode::HOST_RESOLUTION_FAILURE:
+      case cpr::ErrorCode::PROXY_RESOLUTION_FAILURE:
+      case cpr::ErrorCode::CONNECTION_FAILURE:
+      case cpr::ErrorCode::INVALID_URL_FORMAT:
+      case cpr::ErrorCode::UNSUPPORTED_PROTOCOL:
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    /*! POST `body` to the first daemon that answers. `used` receives its URL.
+
+        \param retry_if_delivered When false, move on to the next endpoint only
+          if this one was never reached (see `never_reached_daemon`). Set for
+          requests that must not be repeated, such as a broadcast. */
+    cpr::Response post_to_daemon(const std::string& body, std::string& used, const bool retry_if_delivered = true)
     {
       const std::vector<std::string>& endpoints = daemon_endpoints();
       daemon_pool_state& state = get_daemon_pool_state();
@@ -287,6 +311,8 @@ namespace lws
         }
 
         state.benched_until[idx] = std::chrono::steady_clock::now() + daemon_retry_cooldown;
+        if (!retry_if_delivered && !never_reached_daemon(response))
+          return response; // may have been acted on: sending it again is not safe
         if (order.size() > 1)
         {
           MWARNING("daemon endpoint " << used << " failed (HTTP "
@@ -297,7 +323,11 @@ namespace lws
       return response; // last failure; caller logs and maps to an error
     }
 
-    expect<json> post_json_rpc(std::string method, json params = json::object())
+    /*! \param retry_if_delivered See `post_to_daemon`. When false, a request
+          that may have reached the daemon but got no usable answer returns
+          `std::errc::timed_out`, meaning "outcome unknown", instead of the
+          generic `io_error`. */
+    expect<json> post_json_rpc(std::string method, json params = json::object(), const bool retry_if_delivered = true)
     {
       json request_body = {
         {"jsonrpc", "2.0"},
@@ -308,7 +338,7 @@ namespace lws
         request_body["params"] = std::move(params);
 
       std::string used_url{};
-      auto response = post_to_daemon(request_body.dump(), used_url);
+      auto response = post_to_daemon(request_body.dump(), used_url, retry_if_delivered);
 
       if (response.status_code != 200)
       {
@@ -321,6 +351,8 @@ namespace lws
                << response.error.message << ", url=" << used_url
                << ", req_bytes=" << request_body.dump().size()
                << ", elapsed=" << response.elapsed << "s");
+        if (!retry_if_delivered && !never_reached_daemon(response))
+          return make_error_code(std::errc::timed_out);
         return make_error_code(std::errc::io_error);
       }
 
@@ -2660,9 +2692,22 @@ namespace lws
           {"tx", daemon_req.request.tx},
           {"flash", daemon_req.request.flash}
         };
-        auto daemon_data = post_json_rpc("send_raw_transaction", std::move(send_params));
+        /* Never re-sent to another daemon once this one may have received it.
+           The failover used to move on after any failure, including a 30 s
+           timeout on a daemon that had in fact accepted and relayed the
+           transaction. The next daemon then saw its key images as spent and
+           refused it, and the wallet was told the send failed when it had
+           gone through - inviting the user to pay again.
+
+           An unknown outcome is now reported as `timed_out` (HTTP 503), and
+           logged as such; the wallet must check before sending again. */
+        auto daemon_data = post_json_rpc("send_raw_transaction", std::move(send_params), false);
         if (!daemon_data)
+        {
+          if (daemon_data == std::errc::timed_out)
+            MERROR("submit_raw_tx: daemon did not answer after the transaction was sent; outcome unknown");
           return daemon_data.error();
+        }
 
         json daemon_resp = std::move(*daemon_data);
         try
