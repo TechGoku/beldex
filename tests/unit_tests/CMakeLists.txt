@@ -64,6 +64,7 @@ add_executable(unit_tests
   node_server.cpp
   notify.cpp
   output_distribution.cpp
+  output_unlock_times.cpp
   parse_amount.cpp
   parse_address.cpp
   pruning.cpp
